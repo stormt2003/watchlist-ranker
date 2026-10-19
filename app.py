@@ -37,6 +37,8 @@ BADGES = {"BTC-USD": "₿", "ETH-USD": "Ξ", "SOL-USD": "◎", "ADA-USD": "₳"}
 
 CRYPTO_SUFFIXES = ("-USD", "-EUR", "-USDT")
 
+FX_TICKER = "EURUSD=X"  # wisselkoers voor coins zonder EUR-paar
+
 BAR_CAP_PCT = 50  # balk is "vol" bij ±50% afstand tot de MA
 
 st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="wide")
@@ -232,12 +234,19 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     week_ago = daily[daily.index.date <= last_date - timedelta(days=7)]
     ch_7d = _pct(price, float(week_ago.iloc[-1])) if not week_ago.empty else None
 
-    # Euro-prijs: echt het -EUR-handelspaar op Yahoo (bv. BTC-EUR), geen omrekening
-    price_eur = None
-    if crypto and currency != "EUR":
+    # Euro-prijs: bij voorkeur het echte -EUR-handelspaar op Yahoo (bv. BTC-EUR).
+    # Heeft een coin geen EUR-paar, dan omrekenen met de live EUR/USD-koers.
+    price_eur, eur_omgerekend = None, False
+    if crypto and currency == "EUR":
+        price_eur = price
+    elif crypto:
         eur_closes = intraday_map.get(eur_pair(ticker), pd.Series(dtype=float))
-        if not eur_closes.empty:  # leeg = geen EUR-paar voor deze coin
+        fx = intraday_map.get(FX_TICKER, pd.Series(dtype=float))
+        if not eur_closes.empty:
             price_eur = float(eur_closes.iloc[-1])
+        elif currency == "USD" and not fx.empty:
+            price_eur = price / float(fx.iloc[-1])  # EURUSD=X = dollars per euro
+            eur_omgerekend = True
 
     mas = {
         "20w": weekly.rolling(20).mean().iloc[-1],
@@ -261,6 +270,7 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
         "%_24u": ch_24h,
         "%_7d": ch_7d,
         "prijs_eur": price_eur,
+        "eur_omgerekend": eur_omgerekend,
         **{f"%_vs_{k}": p for k, p in pcts.items()},
         "score": round(score, 1),
     }
@@ -270,6 +280,8 @@ def build_ranking(tickers: list, weights: dict):
     batch = list(tickers) + [
         eur_pair(t) for t in tickers if is_crypto(t) and not t.upper().endswith("-EUR")
     ]
+    if any(is_crypto(t) for t in tickers):
+        batch.append(FX_TICKER)  # voor coins zonder eigen EUR-paar
     try:
         intraday_map = fetch_intraday_batch(tuple(batch))
     except Exception:  # noqa: BLE001
@@ -421,10 +433,13 @@ def card_html(rank: int, row: pd.Series) -> str:
         for lbl, col in [("1u", "%_1u"), ("24u" if crypto else "dag", "%_24u"), ("7d", "%_7d")]
     )
     eur = row.get("prijs_eur")
-    eur_txt = (
-        f'{format_price(eur, "EUR")} · '
-        if eur is not None and not pd.isna(eur) else ""
-    )
+    eur_txt = ""
+    if crypto and row["valuta"] != "EUR" and eur is not None and not pd.isna(eur):
+        approx = "≈ " if row.get("eur_omgerekend") else ""
+        eur_txt = (
+            f'<span style="font-weight:500;font-size:0.92rem;opacity:0.7;'
+            f'font-variant-numeric:tabular-nums">{approx}{format_price(eur, "EUR")}</span>'
+        )
     return (
         f'<div style="border:1px solid rgba(128,128,128,0.25);border-radius:10px;'
         f'padding:10px 12px;margin-bottom:10px">'
@@ -436,9 +451,9 @@ def card_html(rank: int, row: pd.Series) -> str:
         f'<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
         f'<span style="font-weight:600">{row["ticker"]}</span>'
         f'<span style="font-weight:700;font-size:1.05rem;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</span></div>'
+        f'{format_price(row["prijs"], row["valuta"])}</span>{eur_txt}</div>'
         f'<div style="font-size:0.72rem;opacity:0.6;font-variant-numeric:tabular-nums">'
-        f'{eur_txt}bijgewerkt {row["bijgewerkt"]}</div></div>'
+        f'bijgewerkt {row["bijgewerkt"]}</div></div>'
         # score groot, helemaal rechts
         f'{score_html(row["score"])}'
         f"</div>"
