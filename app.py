@@ -23,8 +23,11 @@ import yfinance as yf
 # ---------------------------------------------------------------------------
 
 DEFAULT_TICKERS = [
-    "VWRL.AS", "AMZN", "TSLA", "MU",
-    "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD",
+    # Aandelen & ETF's
+    "VWRL.AS", "AMZN", "ACHR", "BESI.AS", "BSX", "MU", "NFLX", "MSTR", "TSLA", "PATH",
+    # Crypto (Yahoo gebruikt bij naamconflicten een nummer, bv. HYPE32196-USD)
+    "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "HYPE32196-USD", "LIGHTER-USD",
+    "NEAR-USD", "AAVE-USD", "ONDO-USD", "INJ-USD", "VIRTUAL-USD",
 ]
 
 DEFAULT_WEIGHTS = {"20w": 1.0, "50w": 1.5, "200w": 2.0, "200d": 1.5}
@@ -100,6 +103,61 @@ def fetch_crypto_fear_greed() -> dict:
     resp.raise_for_status()
     data = resp.json()["data"][0]
     return {"waarde": int(data["value"]), "classificatie": data["value_classification"]}
+
+
+CMC_FNG_URL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/latest"
+
+
+def _cmc_api_key():
+    """API-sleutel uit st.secrets (Streamlit Cloud: Settings → Secrets)."""
+    try:
+        return st.secrets.get("CMC_API_KEY")
+    except Exception:  # noqa: BLE001  (geen secrets-bestand aanwezig)
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cmc_fear_greed(api_key: str) -> dict:
+    resp = requests.get(
+        CMC_FNG_URL,
+        headers={"X-CMC_PRO_API_KEY": api_key, "Accept": "application/json"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()["data"]
+    return {"waarde": int(round(float(data["value"]))),
+            "classificatie": data.get("value_classification", "")}
+
+
+def fetch_crypto_fear_greed_combined() -> dict:
+    """Gemiddelde van alternative.me en CoinMarketCap. Valt één bron weg,
+    dan wordt alleen de andere gebruikt; vallen ze allebei weg, dan een fout."""
+    waardes, delen, fouten = [], [], []
+    try:
+        alt = fetch_crypto_fear_greed()
+        waardes.append(alt["waarde"])
+        delen.append(f"alternative.me {alt['waarde']}")
+    except Exception as e:  # noqa: BLE001
+        fouten.append(f"alternative.me: {e}")
+
+    key = _cmc_api_key()
+    if key:
+        try:
+            cmc = fetch_cmc_fear_greed(key)
+            waardes.append(cmc["waarde"])
+            delen.append(f"CoinMarketCap {cmc['waarde']}")
+        except Exception as e:  # noqa: BLE001
+            fouten.append(f"CoinMarketCap: {e}")
+    else:
+        fouten.append("CoinMarketCap: geen CMC_API_KEY in secrets")
+
+    if not waardes:
+        raise RuntimeError("; ".join(fouten))
+    gemiddeld = int(round(sum(waardes) / len(waardes)))
+    toelichting = ("Gemiddelde van " if len(waardes) > 1 else "Alleen ") + " en ".join(delen)
+    if fouten:
+        toelichting += " (" + "; ".join(fouten) + ")"
+    return {"waarde": gemiddeld, "toelichting": toelichting}
 
 
 CNN_FNG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
@@ -421,6 +479,8 @@ def render_gauge(container, fetch_fn, title: str, fout_prefix: str):
     try:
         fng = fetch_fn()
         container.markdown(gauge_svg(fng["waarde"], title), unsafe_allow_html=True)
+        if fng.get("toelichting"):
+            container.caption(fng["toelichting"])
     except Exception as e:  # noqa: BLE001
         container.markdown(gauge_svg(None, title), unsafe_allow_html=True)
         container.caption(f"{fout_prefix}: {e}")
@@ -451,7 +511,7 @@ def render_live(tickers: list, weights: dict):
         (col_stocks, "Aandelen & ETF's", False,
          fetch_stock_fear_greed, "Aandelen Fear & Greed", "CNN niet bereikbaar"),
         (col_crypto, "Crypto", True,
-         fetch_crypto_fear_greed, "Crypto Fear & Greed", "Niet opgehaald"),
+         fetch_crypto_fear_greed_combined, "Crypto Fear & Greed", "Niet opgehaald"),
     ]
     for col, section, crypto, fetch_fn, gauge_title, fout_prefix in secties:
         with col:
