@@ -107,61 +107,6 @@ def fetch_crypto_fear_greed() -> dict:
     return {"waarde": int(data["value"]), "classificatie": data["value_classification"]}
 
 
-CMC_FNG_URL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/latest"
-
-
-def _cmc_api_key():
-    """API-sleutel uit st.secrets (Streamlit Cloud: Settings → Secrets)."""
-    try:
-        return st.secrets.get("CMC_API_KEY")
-    except Exception:  # noqa: BLE001  (geen secrets-bestand aanwezig)
-        return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_cmc_fear_greed(api_key: str) -> dict:
-    resp = requests.get(
-        CMC_FNG_URL,
-        headers={"X-CMC_PRO_API_KEY": api_key, "Accept": "application/json"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()["data"]
-    return {"waarde": int(round(float(data["value"]))),
-            "classificatie": data.get("value_classification", "")}
-
-
-def fetch_crypto_fear_greed_combined() -> dict:
-    """Gemiddelde van alternative.me en CoinMarketCap. Valt één bron weg,
-    dan wordt alleen de andere gebruikt; vallen ze allebei weg, dan een fout."""
-    waardes, delen, fouten = [], [], []
-    try:
-        alt = fetch_crypto_fear_greed()
-        waardes.append(alt["waarde"])
-        delen.append(f"alternative.me {alt['waarde']}")
-    except Exception as e:  # noqa: BLE001
-        fouten.append(f"alternative.me: {e}")
-
-    key = _cmc_api_key()
-    if key:
-        try:
-            cmc = fetch_cmc_fear_greed(key)
-            waardes.append(cmc["waarde"])
-            delen.append(f"CoinMarketCap {cmc['waarde']}")
-        except Exception as e:  # noqa: BLE001
-            fouten.append(f"CoinMarketCap: {e}")
-    else:
-        fouten.append("CoinMarketCap: geen CMC_API_KEY in secrets")
-
-    if not waardes:
-        raise RuntimeError("; ".join(fouten))
-    gemiddeld = int(round(sum(waardes) / len(waardes)))
-    toelichting = ("Gemiddelde van " if len(waardes) > 1 else "Alleen ") + " en ".join(delen)
-    if fouten:
-        toelichting += " (" + "; ".join(fouten) + ")"
-    return {"waarde": gemiddeld, "toelichting": toelichting}
-
-
 CNN_FNG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CNN_HEADERS = {
     # CNN weigert verzoeken zonder browser-achtige headers
@@ -234,6 +179,10 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     week_ago = daily[daily.index.date <= last_date - timedelta(days=7)]
     ch_7d = _pct(price, float(week_ago.iloc[-1])) if not week_ago.empty else None
 
+    # 30 dagen: slotkoers van (uiterlijk) 30 dagen geleden
+    month_ago = daily[daily.index.date <= last_date - timedelta(days=30)]
+    ch_30d = _pct(price, float(month_ago.iloc[-1])) if not month_ago.empty else None
+
     # Euro-prijs: bij voorkeur het echte -EUR-handelspaar op Yahoo (bv. BTC-EUR).
     # Heeft een coin geen EUR-paar, dan omrekenen met de live EUR/USD-koers.
     price_eur, eur_omgerekend = None, False
@@ -269,6 +218,7 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
         "%_1u": ch_1h,
         "%_24u": ch_24h,
         "%_7d": ch_7d,
+        "%_30d": ch_30d,
         "prijs_eur": price_eur,
         "eur_omgerekend": eur_omgerekend,
         **{f"%_vs_{k}": p for k, p in pcts.items()},
@@ -463,6 +413,62 @@ def card_html(rank: int, row: pd.Series) -> str:
     )
 
 
+MOVER_PERIODES = {"Dag": "%_24u", "7d": "%_7d", "30d": "%_30d"}
+MOVERS_TOP = 3
+
+
+def mover_row_html(rank: int, row: pd.Series, pct: float) -> str:
+    """Compacte regel: rang, badge, ticker, prijs en groot percentage rechts."""
+    crypto = is_crypto(row["ticker"])
+    color = "#2e9e58" if pct >= 0 else "#d64545"
+    pct_txt = f"{pct:+.2f}%".replace(".", ",")
+    return (
+        f'<div style="display:flex;align-items:center;gap:10px;padding:7px 10px;'
+        f'border:1px solid rgba(128,128,128,0.2);border-radius:8px;margin-bottom:6px">'
+        f'<span style="opacity:0.6;width:16px">{rank}</span>'
+        f"{badge_html(row['ticker'], crypto)}"
+        f'<div style="flex:1;min-width:0;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
+        f'<span style="font-weight:600">{row["ticker"]}</span>'
+        f'<span style="opacity:0.8;font-variant-numeric:tabular-nums">'
+        f'{format_price(row["prijs"], row["valuta"])}</span></div>'
+        f'<span style="font-weight:800;font-size:1.15rem;color:{color};'
+        f'font-variant-numeric:tabular-nums">{pct_txt}</span></div>'
+    )
+
+
+def render_mover_list(titel: str, part: pd.DataFrame, col: str, leeg: str):
+    """Top 3 zichtbaar, de rest in een uitklapper."""
+    st.markdown(f"**{titel}**")
+    if part.empty:
+        st.caption(leeg)
+        return
+    rows = [mover_row_html(i + 1, r, r[col]) for i, (_, r) in enumerate(part.iterrows())]
+    st.markdown("".join(rows[:MOVERS_TOP]), unsafe_allow_html=True)
+    if len(rows) > MOVERS_TOP:
+        with st.expander(f"Alle {len(rows)} tonen"):
+            st.markdown("".join(rows[MOVERS_TOP:]), unsafe_allow_html=True)
+
+
+def render_movers(ranking: pd.DataFrame):
+    st.subheader("Hardste stijgers & dalers")
+    periode = st.radio(
+        "Periode", list(MOVER_PERIODES), horizontal=True,
+        key="mover_periode", label_visibility="collapsed",
+    )
+    col = MOVER_PERIODES[periode]
+    if periode == "Dag":
+        st.caption("Crypto: laatste 24 uur. Aandelen: t.o.v. de slotkoers van de vorige handelsdag.")
+    data = ranking[["ticker", "prijs", "valuta", col]].dropna(subset=[col])
+    stijgers = data[data[col] > 0].sort_values(col, ascending=False)
+    dalers = data[data[col] < 0].sort_values(col, ascending=True)
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        render_mover_list(f"Stijgers ({periode})", stijgers, col, "Geen stijgers in deze periode.")
+    with right:
+        render_mover_list(f"Dalers ({periode})", dalers, col, "Geen dalers in deze periode.")
+
+
 # ---------------------------------------------------------------------------
 # PAGINA
 # ---------------------------------------------------------------------------
@@ -494,8 +500,6 @@ def render_gauge(container, fetch_fn, title: str, fout_prefix: str):
     try:
         fng = fetch_fn()
         container.markdown(gauge_svg(fng["waarde"], title), unsafe_allow_html=True)
-        if fng.get("toelichting"):
-            container.caption(fng["toelichting"])
     except Exception as e:  # noqa: BLE001
         container.markdown(gauge_svg(None, title), unsafe_allow_html=True)
         container.caption(f"{fout_prefix}: {e}")
@@ -519,6 +523,10 @@ def render_live(tickers: list, weights: dict):
     else:
         st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers.")
 
+    if not ranking.empty:
+        render_movers(ranking)
+        st.divider()
+
     # Twee kolommen naast elkaar: aandelen links, crypto rechts,
     # elk met de eigen Fear & Greed-gauge bovenaan.
     col_stocks, col_crypto = st.columns(2, gap="large")
@@ -526,7 +534,7 @@ def render_live(tickers: list, weights: dict):
         (col_stocks, "Aandelen & ETF's", False,
          fetch_stock_fear_greed, "Aandelen Fear & Greed", "CNN niet bereikbaar"),
         (col_crypto, "Crypto", True,
-         fetch_crypto_fear_greed_combined, "Crypto Fear & Greed", "Niet opgehaald"),
+         fetch_crypto_fear_greed, "Crypto Fear & Greed", "Niet opgehaald"),
     ]
     for col, section, crypto, fetch_fn, gauge_title, fout_prefix in secties:
         with col:
