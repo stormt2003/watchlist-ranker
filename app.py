@@ -70,7 +70,7 @@ US_CLOSE = 16 * 60             # 16:00 nabeurs begint
 US_POST_END = 20 * 60          # 20:00 nabeurs eindigt
 EXT_MAX_AGE = pd.Timedelta(minutes=60)  # oudere voor-/nabeurskoers = niet meer actief
 
-FX_TICKER = "EURUSD=X"  # wisselkoers voor coins zonder EUR-paar
+FX_TICKER = "EURUSD=X"  # euro/dollar-wisselkoers (dollars per euro) voor het omrekenen
 
 BAR_CAP_PCT = 50  # balk is "vol" bij ±50% afstand tot de MA
 
@@ -174,8 +174,36 @@ def us_session(ts: pd.Timestamp) -> str:
     return "dicht"
 
 
-def eur_pair(ticker: str) -> str:
-    return ticker.rsplit("-", 1)[0] + "-EUR"
+def crypto_pair(ticker: str, valuta: str) -> str:
+    """BTC-USD -> BTC-EUR (of andersom): hetzelfde coin in een andere valuta."""
+    return ticker.upper().rsplit("-", 1)[0] + f"-{valuta}"
+
+
+def fx_rate(van: str, naar: str, intraday_map: dict):
+    """Wisselkoers: 1 `van` = x `naar`. Eerst live (intraday), dan de laatste
+    dagkoers; Yahoo heeft niet elk paar in beide richtingen, dus ook omgekeerd."""
+    if van == naar:
+        return 1.0
+    for paar, omkeren in ((f"{van}{naar}=X", False), (f"{naar}{van}=X", True)):
+        s = intraday_map.get(paar)
+        if s is not None and not s.empty:
+            r = float(s.iloc[-1])
+            return 1 / r if omkeren else r
+    for paar, omkeren in ((f"{van}{naar}=X", False), (f"{naar}{van}=X", True)):
+        try:
+            r = float(fetch_daily_closes(paar).iloc[-1])
+            return 1 / r if omkeren else r
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def convert(prijs: float, valuta: str, naar: str, intraday_map: dict):
+    """Prijs omrekenen naar `naar`; None als er geen wisselkoers is."""
+    if valuta == "GBp":  # Londen noteert in pence
+        prijs, valuta = prijs / 100, "GBP"
+    r = fx_rate(valuta, naar, intraday_map)
+    return prijs * r if r else None
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -315,19 +343,19 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     month_ago = daily[daily.index.date <= last_date - timedelta(days=30)]
     ch_30d = _pct(price, float(month_ago.iloc[-1])) if not month_ago.empty else None
 
-    # Euro-prijs: bij voorkeur het echte -EUR-handelspaar op Yahoo (bv. BTC-EUR).
-    # Heeft een coin geen EUR-paar, dan omrekenen met de live EUR/USD-koers.
-    price_eur, eur_omgerekend = None, False
-    if crypto and currency == "EUR":
-        price_eur = price
-    elif crypto:
-        eur_closes = intraday_map.get(eur_pair(ticker), pd.Series(dtype=float))
-        fx = intraday_map.get(FX_TICKER, pd.Series(dtype=float))
-        if not eur_closes.empty:
-            price_eur = float(eur_closes.iloc[-1])
-        elif currency == "USD" and not fx.empty:
-            price_eur = price / float(fx.iloc[-1])  # EURUSD=X = dollars per euro
-            eur_omgerekend = True
+    # Prijs in euro én dollar. Crypto: bij voorkeur het echte handelspaar op Yahoo
+    # (bv. BTC-EUR naast BTC-USD). Verder omrekenen met de live wisselkoers.
+    omgerekend_prijzen = {}
+    for doel in ("EUR", "USD"):
+        if currency == doel:
+            omgerekend_prijzen[doel] = (price, False)
+            continue
+        paar = intraday_map.get(crypto_pair(ticker, doel)) if crypto else None
+        if paar is not None and not paar.empty:
+            omgerekend_prijzen[doel] = (float(paar.iloc[-1]), False)
+        else:
+            v = convert(price, currency, doel, intraday_map)
+            omgerekend_prijzen[doel] = (v, v is not None)
 
     mas = {
         "20w": weekly.rolling(20).mean().iloc[-1],
@@ -355,19 +383,27 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
         "%_24u": ch_24h,
         "%_7d": ch_7d,
         "%_30d": ch_30d,
-        "prijs_eur": price_eur,
-        "eur_omgerekend": eur_omgerekend,
+        "prijs_eur": omgerekend_prijzen["EUR"][0],
+        "eur_omgerekend": omgerekend_prijzen["EUR"][1],
+        "prijs_usd": omgerekend_prijzen["USD"][0],
+        "usd_omgerekend": omgerekend_prijzen["USD"][1],
         **{f"%_vs_{k}": p for k, p in pcts.items()},
         "score": round(score, 1),
     }
 
 
 def build_ranking(tickers: list, weights: dict):
-    batch = list(tickers) + [
-        eur_pair(t) for t in tickers if is_crypto(t) and not t.upper().endswith("-EUR")
-    ]
-    if any(is_crypto(t) for t in tickers):
-        batch.append(FX_TICKER)  # voor coins zonder eigen EUR-paar
+    # Alles in één verzoek: de tickers zelf, voor crypto het paar in de andere
+    # valuta (BTC-EUR bij BTC-USD), en de wisselkoersen om de rest om te rekenen.
+    batch = list(tickers)
+    for t in tickers:
+        if is_crypto(t):
+            batch += [p for p in (crypto_pair(t, "EUR"), crypto_pair(t, "USD")) if p != t.upper()]
+    batch.append(FX_TICKER)
+    for cur in {fetch_meta(t)["valuta"] for t in tickers} - {"EUR", "USD"}:
+        basis = "GBP" if cur == "GBp" else cur
+        batch += [f"{basis}USD=X", f"{basis}EUR=X"]
+    batch = list(dict.fromkeys(batch))  # dubbele eruit, volgorde behouden
     try:
         intraday_map = fetch_intraday_batch(tuple(batch))
     except Exception:  # noqa: BLE001
@@ -531,6 +567,21 @@ def title_html(row: pd.Series, size: str = "0.95rem", stacked: bool = False) -> 
     )
 
 
+def other_prices(row: pd.Series) -> list:
+    """De prijs in euro en/of dollar naast de eigen valuta.
+    '≈' = omgerekend met de wisselkoers, zonder = echt handelspaar."""
+    out = []
+    for cur in ("EUR", "USD"):
+        if row["valuta"] == cur:
+            continue
+        v = row.get(f"prijs_{cur.lower()}")
+        if v is None or pd.isna(v):
+            continue
+        approx = "≈ " if row.get(f"{cur.lower()}_omgerekend") else ""
+        out.append(f"{approx}{format_price(float(v), cur)}")
+    return out
+
+
 def score_html(score: float) -> str:
     """Score rechts op de kaart. Positief (onder de MA's) = groen."""
     color = "#2e9e58" if score > 0 else "#d64545" if score < 0 else "inherit"
@@ -550,14 +601,10 @@ def card_html(rank: int, row: pd.Series) -> str:
         change_chip(lbl, row[col])
         for lbl, col in [("1u", "%_1u"), ("24u" if crypto else "dag", "%_24u"), ("7d", "%_7d")]
     )
-    eur = row.get("prijs_eur")
-    eur_txt = ""
-    if crypto and row["valuta"] != "EUR" and eur is not None and not pd.isna(eur):
-        approx = "≈ " if row.get("eur_omgerekend") else ""
-        eur_txt = (
-            f'<span style="font-size:0.8rem;opacity:0.6;font-variant-numeric:tabular-nums">'
-            f'{approx}{format_price(eur, "EUR")}</span>'
-        )
+    andere = "".join(
+        f'<span style="font-size:0.8rem;opacity:0.6;font-variant-numeric:tabular-nums">{p}</span>'
+        for p in other_prices(row)
+    )
     return (
         f'<div style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;'
         f'padding:7px 10px 6px;margin-bottom:6px">'
@@ -568,7 +615,7 @@ def card_html(rank: int, row: pd.Series) -> str:
         # prijs met euro-prijs en eventueel voor-/nabeurs ernaast
         f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:1px">'
         f'<span style="font-weight:700;font-size:0.92rem;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</span>{eur_txt}{ext_chip_html(row)}</div></div>'
+        f'{format_price(row["prijs"], row["valuta"])}</span>{andere}{ext_chip_html(row)}</div></div>'
         f'{score_html(row["score"])}'
         f"</div>"
         # wijzigingen + tijdstip op één regel
@@ -598,8 +645,11 @@ def mover_row_html(rank: int, row: pd.Series, pct: float) -> str:
         f'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px">'
         f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rank}</span>'
         f'<div style="flex:1;min-width:0">{title_html(row, "0.88rem", stacked=True)}</div>'
-        f'<span style="opacity:0.7;font-size:0.8rem;white-space:nowrap;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</span>'
+        # eigen valuta met de euro/dollar-prijs eronder
+        f'<div style="text-align:right;line-height:1.2;white-space:nowrap;font-variant-numeric:tabular-nums">'
+        f'<div style="opacity:0.8;font-size:0.8rem">{format_price(row["prijs"], row["valuta"])}</div>'
+        + "".join(f'<div style="opacity:0.5;font-size:0.7rem">{p}</div>' for p in other_prices(row))
+        + '</div>'
         f'<span style="font-weight:800;font-size:0.95rem;min-width:64px;text-align:right;color:{color};'
         f'font-variant-numeric:tabular-nums">{pct_txt}</span></div>'
     )
@@ -635,7 +685,7 @@ def render_movers(ranking: pd.DataFrame, crypto: bool):
     col = perioden[periode]
     if col == "%_24u":
         st.caption("Laatste 24 uur." if crypto else "T.o.v. de slotkoers van de vorige handelsdag.")
-    data = ranking[["ticker", "naam", "prijs", "valuta", col]].dropna(subset=[col])
+    data = ranking.dropna(subset=[col])
     stijgers = data[data[col] > 0].sort_values(col, ascending=False)
     dalers = data[data[col] < 0].sort_values(col, ascending=True)
 
@@ -745,7 +795,7 @@ def render_live(tickers: list, weights: dict, soort: str):
         return
 
     # Bovenaan: sentiment links, stijgers/dalers rechts
-    g, m = st.columns([1, 2.6], gap="large")
+    g, m = st.columns([1, 3.6], gap="medium")
     with g:
         render_gauge(cfg["fetch"], cfg["gauge"], cfg["fout"])
     with m:
@@ -753,7 +803,8 @@ def render_live(tickers: list, weights: dict, soort: str):
 
     st.divider()
     st.subheader("Ranglijst")
-    uitleg = "Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als er niet gehandeld wordt."
+    uitleg = ("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als er niet gehandeld wordt. "
+              "≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
     if not crypto:
         uitleg += (" 'Dag' is de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) "
                    "staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
