@@ -43,17 +43,42 @@ st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="cent
 # DATA
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_intraday(ticker: str):
-    """5-minuten-data van de afgelopen dagen, voor live prijs en 1u/24u-verandering.
-    Geeft ook de valuta terug uit de metadata (geen extra verzoek nodig)."""
-    tk = yf.Ticker(ticker)
-    hist = tk.history(period="5d", interval="5m")
-    meta = getattr(tk, "history_metadata", None) or {}
-    closes = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
-    if not closes.empty and closes.index.tz is None:
-        closes.index = closes.index.tz_localize("UTC")
-    return closes, meta.get("currency", "")
+@st.cache_data(ttl=8, show_spinner=False)
+def fetch_intraday_batch(tickers: tuple) -> dict:
+    """5-minuten-data voor ALLE tickers in één verzoek naar Yahoo.
+    Zo blijft auto-verversen om de 10 sec beperkt tot 1 verzoek per keer,
+    in plaats van één per ticker (anders loop je snel tegen rate limits aan).
+    ttl=8 zodat elke ververs-ronde van 10 sec verse data ophaalt."""
+    df = yf.download(
+        list(tickers), period="5d", interval="5m", group_by="ticker",
+        auto_adjust=True, progress=False, threads=True,
+    )
+    out = {}
+    for t in tickers:
+        try:
+            sub = df[t] if isinstance(df.columns, pd.MultiIndex) else df
+            s = sub["Close"].dropna()
+        except KeyError:
+            s = pd.Series(dtype=float)
+        if not s.empty and s.index.tz is None:
+            s.index = s.index.tz_localize("UTC")
+        out[t] = s
+    return out
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_currency(ticker: str) -> str:
+    try:
+        return yf.Ticker(ticker).fast_info["currency"] or ""
+    except Exception:  # noqa: BLE001
+        # terugval op basis van de tickernaam
+        if ticker.upper().endswith(("-EUR", ".AS", ".PA", ".DE", ".BR")):
+            return "EUR"
+        return "USD"
+
+
+def eur_pair(ticker: str) -> str:
+    return ticker.rsplit("-", 1)[0] + "-EUR"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -114,15 +139,13 @@ def _at_or_before(series: pd.Series, ts):
     return float(s.iloc[-1]) if not s.empty else None
 
 
-def compute_row(ticker: str, weights: dict) -> dict:
+def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     daily = fetch_daily_closes(ticker)
     weekly = daily.resample("W").last().dropna()  # laatste bar = lopende week
     crypto = is_crypto(ticker)
 
-    try:
-        intraday, currency = fetch_intraday(ticker)
-    except Exception:  # noqa: BLE001
-        intraday, currency = pd.Series(dtype=float), ""
+    intraday = intraday_map.get(ticker, pd.Series(dtype=float))
+    currency = fetch_currency(ticker)
 
     if not intraday.empty:
         price = float(intraday.iloc[-1])
@@ -154,12 +177,9 @@ def compute_row(ticker: str, weights: dict) -> dict:
     # Euro-prijs: echt het -EUR-handelspaar op Yahoo (bv. BTC-EUR), geen omrekening
     price_eur = None
     if crypto and currency != "EUR":
-        try:
-            eur_closes, _ = fetch_intraday(ticker.rsplit("-", 1)[0] + "-EUR")
-            if not eur_closes.empty:
-                price_eur = float(eur_closes.iloc[-1])
-        except Exception:  # noqa: BLE001
-            pass  # geen EUR-paar beschikbaar voor deze coin
+        eur_closes = intraday_map.get(eur_pair(ticker), pd.Series(dtype=float))
+        if not eur_closes.empty:  # leeg = geen EUR-paar voor deze coin
+            price_eur = float(eur_closes.iloc[-1])
 
     mas = {
         "20w": weekly.rolling(20).mean().iloc[-1],
@@ -189,10 +209,18 @@ def compute_row(ticker: str, weights: dict) -> dict:
 
 
 def build_ranking(tickers: list, weights: dict):
+    batch = list(tickers) + [
+        eur_pair(t) for t in tickers if is_crypto(t) and not t.upper().endswith("-EUR")
+    ]
+    try:
+        intraday_map = fetch_intraday_batch(tuple(batch))
+    except Exception:  # noqa: BLE001
+        intraday_map = {}  # val terug op dagdata
+
     rows, errors = [], []
     for t in tickers:
         try:
-            rows.append(compute_row(t, weights))
+            rows.append(compute_row(t, weights, intraday_map))
         except Exception as e:  # noqa: BLE001
             errors.append(f"{t}: {e}")
     df = pd.DataFrame(rows)
@@ -359,56 +387,67 @@ with st.sidebar:
     weights = {
         k: st.slider(f"{k} MA", 0.0, 3.0, v, 0.25) for k, v in DEFAULT_WEIGHTS.items()
     }
-    if st.button("Data verversen"):
+    st.subheader("Verversen")
+    auto = st.toggle("Automatisch verversen", value=True)
+    interval = st.select_slider(
+        "Elke … seconden", options=[10, 30, 60], value=10, disabled=not auto
+    )
+    if st.button("Nu verversen"):
         st.cache_data.clear()
 
 tickers = [t.strip().upper() for t in tickers_text.splitlines() if t.strip()]
 
 st.title("Watchlist Ranker")
 
-# Fear & Greed
-col1, col2 = st.columns(2)
-try:
-    fng = fetch_crypto_fear_greed()
-    col1.markdown(gauge_svg(fng["waarde"], "Crypto Fear & Greed"), unsafe_allow_html=True)
-except Exception as e:  # noqa: BLE001
-    col1.markdown(gauge_svg(None, "Crypto Fear & Greed"), unsafe_allow_html=True)
-    col1.caption(f"Niet opgehaald: {e}")
-try:
-    sfng = fetch_stock_fear_greed()
-    col2.markdown(gauge_svg(sfng["waarde"], "Aandelen Fear & Greed"), unsafe_allow_html=True)
-except Exception as e:  # noqa: BLE001
-    col2.markdown(gauge_svg(None, "Aandelen Fear & Greed"), unsafe_allow_html=True)
-    col2.caption(f"CNN niet bereikbaar: {e}")
+def render_live(tickers: list, weights: dict):
+    """Alles wat live ververst: gauges en ranglijst."""
+    now = pd.Timestamp.now(tz="Europe/Amsterdam").strftime("%H:%M:%S")
+    st.caption(f"Laatst ververst om {now}")
+    col1, col2 = st.columns(2)
+    try:
+        fng = fetch_crypto_fear_greed()
+        col1.markdown(gauge_svg(fng["waarde"], "Crypto Fear & Greed"), unsafe_allow_html=True)
+    except Exception as e:  # noqa: BLE001
+        col1.markdown(gauge_svg(None, "Crypto Fear & Greed"), unsafe_allow_html=True)
+        col1.caption(f"Niet opgehaald: {e}")
+    try:
+        sfng = fetch_stock_fear_greed()
+        col2.markdown(gauge_svg(sfng["waarde"], "Aandelen Fear & Greed"), unsafe_allow_html=True)
+    except Exception as e:  # noqa: BLE001
+        col2.markdown(gauge_svg(None, "Aandelen Fear & Greed"), unsafe_allow_html=True)
+        col2.caption(f"CNN niet bereikbaar: {e}")
 
-# Ranglijst
-with st.spinner("Koersen ophalen…"):
+    # Ranglijst
     ranking, errors = build_ranking(tickers, weights)
 
-if errors:
-    st.warning("Niet verwerkt:\n\n" + "\n\n".join(errors))
+    if errors:
+        st.warning("Niet verwerkt:\n\n" + "\n\n".join(errors))
 
-if ranking.empty:
-    st.error(
-        "Geen koersdata opgehaald. Controleer de tickers, of Yahoo Finance "
-        "geblokkeerd wordt door je netwerk (bijv. een bedrijfsproxy)."
-    )
-    st.stop()
+    if ranking.empty:
+        st.error(
+            "Geen koersdata opgehaald. Controleer de tickers, of Yahoo Finance "
+            "geblokkeerd wordt door je netwerk (bijv. een bedrijfsproxy)."
+        )
+        return
 
-st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers.")
+    st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers.")
 
-for section, mask in [
-    ("Crypto", ranking["ticker"].map(is_crypto)),
-    ("Aandelen & ETF's", ~ranking["ticker"].map(is_crypto)),
-]:
-    part = ranking[mask].reset_index(drop=True)
-    if part.empty:
-        continue
-    st.subheader(section)
-    st.markdown(
-        "".join(card_html(i + 1, row) for i, row in part.iterrows()),
-        unsafe_allow_html=True,
-    )
+    for section, mask in [
+        ("Crypto", ranking["ticker"].map(is_crypto)),
+        ("Aandelen & ETF's", ~ranking["ticker"].map(is_crypto)),
+    ]:
+        part = ranking[mask].reset_index(drop=True)
+        if part.empty:
+            continue
+        st.subheader(section)
+        st.markdown(
+            "".join(card_html(i + 1, row) for i, row in part.iterrows()),
+            unsafe_allow_html=True,
+        )
 
-with st.expander("Ruwe tabel"):
-    st.dataframe(ranking, width="stretch", hide_index=True)
+    with st.expander("Ruwe tabel"):
+        st.dataframe(ranking, width="stretch", hide_index=True)
+
+
+# Fragment: alleen dit deel draait opnieuw, om de `interval` seconden
+st.fragment(run_every=interval if auto else None)(render_live)(tickers, weights)
