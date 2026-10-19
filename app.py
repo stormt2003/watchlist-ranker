@@ -11,6 +11,7 @@ Lokaal draaien:
 """
 
 import math
+from datetime import timedelta
 
 import pandas as pd
 import requests
@@ -42,7 +43,20 @@ st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="cent
 # DATA
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday(ticker: str):
+    """5-minuten-data van de afgelopen dagen, voor live prijs en 1u/24u-verandering.
+    Geeft ook de valuta terug uit de metadata (geen extra verzoek nodig)."""
+    tk = yf.Ticker(ticker)
+    hist = tk.history(period="5d", interval="5m")
+    meta = getattr(tk, "history_metadata", None) or {}
+    closes = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
+    if not closes.empty and closes.index.tz is None:
+        closes.index = closes.index.tz_localize("UTC")
+    return closes, meta.get("currency", "")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_daily_closes(ticker: str) -> pd.Series:
     """Dagelijkse closes (5 jaar). Ticker.history geeft altijd platte kolommen,
     in tegenstelling tot yf.download (die recent MultiIndex-kolommen teruggeeft)."""
@@ -67,10 +81,53 @@ def is_crypto(ticker: str) -> bool:
     return ticker.upper().endswith(CRYPTO_SUFFIXES)
 
 
+def _pct(now, ref):
+    if ref is None or pd.isna(ref) or ref == 0:
+        return None
+    return round((now / ref - 1) * 100, 2)
+
+
+def _at_or_before(series: pd.Series, ts):
+    s = series[series.index <= ts]
+    return float(s.iloc[-1]) if not s.empty else None
+
+
 def compute_row(ticker: str, weights: dict) -> dict:
     daily = fetch_daily_closes(ticker)
     weekly = daily.resample("W").last().dropna()  # laatste bar = lopende week
-    price = float(daily.iloc[-1])
+    crypto = is_crypto(ticker)
+
+    try:
+        intraday, currency = fetch_intraday(ticker)
+    except Exception:  # noqa: BLE001
+        intraday, currency = pd.Series(dtype=float), ""
+
+    if not intraday.empty:
+        price = float(intraday.iloc[-1])
+        last_ts = intraday.index[-1]
+        last_date = last_ts.date()  # datum in tijdzone van de beurs
+        updated = last_ts.tz_convert("Europe/Amsterdam").strftime("%d-%m %H:%M")
+        # "Live" = laatste koers is recent (Yahoo vertraagt sommige beurzen ~15 min)
+        live = pd.Timestamp.now(tz="UTC") - last_ts.tz_convert("UTC") < pd.Timedelta(minutes=45)
+    else:
+        price = float(daily.iloc[-1])
+        last_ts, live = None, False
+        last_date = daily.index[-1].date()
+        updated = last_date.strftime("%d-%m")
+
+    # 1 uur: alleen zinvol als er nu gehandeld wordt
+    ch_1h = _pct(price, _at_or_before(intraday, last_ts - pd.Timedelta(hours=1))) if live else None
+
+    # 24 uur: crypto echt 24u terug; aandelen t.o.v. slotkoers vorige handelsdag
+    if crypto and last_ts is not None:
+        ch_24h = _pct(price, _at_or_before(intraday, last_ts - pd.Timedelta(hours=24)))
+    else:
+        prev = daily[daily.index.date < last_date]
+        ch_24h = _pct(price, float(prev.iloc[-1])) if not prev.empty else None
+
+    # 7 dagen: slotkoers van (uiterlijk) een week geleden
+    week_ago = daily[daily.index.date <= last_date - timedelta(days=7)]
+    ch_7d = _pct(price, float(week_ago.iloc[-1])) if not week_ago.empty else None
 
     mas = {
         "20w": weekly.rolling(20).mean().iloc[-1],
@@ -88,7 +145,11 @@ def compute_row(ticker: str, weights: dict) -> dict:
     return {
         "ticker": ticker,
         "prijs": price,
-        "datum": daily.index[-1].date(),
+        "valuta": currency,
+        "bijgewerkt": updated,
+        "%_1u": ch_1h,
+        "%_24u": ch_24h,
+        "%_7d": ch_7d,
         **{f"%_vs_{k}": p for k, p in pcts.items()},
         "score": round(score, 1),
     }
@@ -175,7 +236,7 @@ def badge_html(ticker: str, crypto: bool) -> str:
 
 
 def ma_bar_html(label: str, pct) -> str:
-    if pct is None:
+    if pct is None or pd.isna(pct):
         fill, txt = "", "te weinig historie"
     else:
         width = min(abs(pct), BAR_CAP_PCT) / BAR_CAP_PCT * 50
@@ -197,20 +258,51 @@ def ma_bar_html(label: str, pct) -> str:
     )
 
 
+CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "GBp": "p "}
+
+
+def format_price(price: float, currency: str) -> str:
+    decimals = 2 if price >= 1 else 4  # kleine coins (bv. ADA) meer decimalen
+    sym = CURRENCY_SYMBOLS.get(currency, f"{currency} " if currency else "")
+    # Nederlandse notatie: punt voor duizendtallen, komma voor decimalen
+    txt = f"{price:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return f"{sym}{txt}"
+
+
+def change_chip(label: str, pct) -> str:
+    if pct is None or pd.isna(pct):
+        val, color = "–", "inherit"
+    else:
+        val = f"{pct:+.1f}%".replace(".", ",")
+        color = "#d64545" if pct < 0 else "#2e9e58"
+    return (
+        f'<span style="white-space:nowrap"><span style="opacity:0.6">{label}</span> '
+        f'<span style="color:{color};font-weight:600;font-variant-numeric:tabular-nums">{val}</span></span>'
+    )
+
+
 def card_html(rank: int, row: pd.Series) -> str:
     crypto = is_crypto(row["ticker"])
     bars = "".join(ma_bar_html(k, row[f"%_vs_{k}"]) for k in DEFAULT_WEIGHTS)
+    chips = "".join(
+        change_chip(lbl, row[col])
+        for lbl, col in [("1u", "%_1u"), ("24u" if crypto else "dag", "%_24u"), ("7d", "%_7d")]
+    )
     return (
         f'<div style="border:1px solid rgba(128,128,128,0.25);border-radius:10px;'
         f'padding:10px 12px;margin-bottom:10px">'
-        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+        f'<div style="display:flex;align-items:center;gap:10px">'
         f'<span style="opacity:0.6;width:18px">{rank}</span>'
         f"{badge_html(row['ticker'], crypto)}"
-        f'<div style="flex:1"><div style="font-weight:600">{row["ticker"]}</div>'
-        f'<div style="font-size:0.75rem;opacity:0.65">{row["prijs"]:,.2f} op {row["datum"]}</div></div>'
-        f'<div style="text-align:right"><div style="font-size:0.7rem;opacity:0.65">score</div>'
-        f'<div style="font-weight:700;font-variant-numeric:tabular-nums">{row["score"]:+.1f}</div></div>'
-        f"</div>{bars}</div>"
+        f'<div style="flex:1;min-width:0"><div style="font-weight:600">{row["ticker"]}</div>'
+        f'<div style="font-size:0.72rem;opacity:0.6">score {row["score"]:+.1f}, '
+        f'bijgewerkt {row["bijgewerkt"]}</div></div>'
+        f'<div style="font-weight:700;font-size:1.05rem;font-variant-numeric:tabular-nums">'
+        f'{format_price(row["prijs"], row["valuta"])}</div>'
+        f"</div>"
+        f'<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:0.78rem;margin:6px 0 4px 28px">'
+        f"{chips}</div>"
+        f"{bars}</div>"
     )
 
 
@@ -260,7 +352,7 @@ if ranking.empty:
     )
     st.stop()
 
-st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA.")
+st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers.")
 
 for section, mask in [
     ("Crypto", ranking["ticker"].map(is_crypto)),
