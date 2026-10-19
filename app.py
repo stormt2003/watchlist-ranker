@@ -13,6 +13,7 @@ Lokaal draaien:
 import html
 import math
 import re
+import time
 from datetime import timedelta
 
 import pandas as pd
@@ -306,12 +307,61 @@ def thermo_zone(afstand: float, cfg: dict) -> tuple:
     return cfg["zones"][-1][1], cfg["zones"][-2][0], None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# Crypto Fear & Greed: CoinMarketCap, met alternative.me als terugval.
+# - Met een (gratis) CMC API-sleutel in .streamlit/secrets.toml (CMC_API_KEY = "...")
+#   gebruikt de app de officiële API.
+# - Zonder sleutel: het JSON-endpoint dat de CMC-website zelf gebruikt. Geen
+#   officiële API, dus kan zonder aankondiging veranderen.
+# - Lukt beide niet, dan alternative.me (die werkt maar één keer per dag bij).
+CMC_FNG_LATEST = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/latest"
+CMC_FNG_CHART = "https://api.coinmarketcap.com/data-api/v3/fear-greed/chart"
+ALT_FNG_URL = "https://api.alternative.me/fng/?limit=1"
+
+
+def _cmc_api_key():
+    try:
+        return st.secrets.get("CMC_API_KEY")
+    except Exception:  # noqa: BLE001  (geen secrets.toml)
+        return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_crypto_fear_greed() -> dict:
-    resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+    fouten = []
+    sleutel = _cmc_api_key()
+    if sleutel:
+        try:
+            resp = requests.get(
+                CMC_FNG_LATEST, timeout=10,
+                headers={"X-CMC_PRO_API_KEY": sleutel, "Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            d = resp.json()["data"]
+            return {"waarde": int(round(float(d["value"]))),
+                    "classificatie": d.get("value_classification", ""),
+                    "bron": "CoinMarketCap", "zones": "cmc"}
+        except Exception as e:  # noqa: BLE001
+            fouten.append(f"CMC-API: {e}")
+    try:
+        nu = int(time.time())
+        resp = requests.get(
+            CMC_FNG_CHART, params={"start": nu - 7 * 86400, "end": nu},
+            headers={"User-Agent": CNN_HEADERS["User-Agent"], "Accept": "application/json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        d = resp.json()["data"]
+        laatste = (d.get("historicalValues") or {}).get("now") or d["dataList"][-1]
+        return {"waarde": int(round(float(laatste["score"]))),
+                "classificatie": laatste.get("name", ""),
+                "bron": "CoinMarketCap", "zones": "cmc"}
+    except Exception as e:  # noqa: BLE001
+        fouten.append(f"CMC-website: {e}")
+    resp = requests.get(ALT_FNG_URL, timeout=10)
     resp.raise_for_status()
-    data = resp.json()["data"][0]
-    return {"waarde": int(data["value"]), "classificatie": data["value_classification"]}
+    d = resp.json()["data"][0]
+    return {"waarde": int(d["value"]), "classificatie": d["value_classification"],
+            "bron": "alternative.me", "zones": "standaard", "fouten": fouten}
 
 
 CNN_FNG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
@@ -527,8 +577,22 @@ def _polar(cx, cy, r, value):
 
 
 # Donkerdere tint voor de zonenaam onder het getal (geel/lichtgroen is slecht leesbaar)
+# CoinMarketCap deelt de index in vijf gelijke stukken van 20 in
+CMC_ZONES = [
+    (0, 20, "Extreme Fear", "#d64545"),
+    (20, 40, "Fear", "#ee8a35"),
+    (40, 60, "Neutral", "#e9c440"),
+    (60, 80, "Greed", "#9acd5c"),
+    (80, 100, "Extreme Greed", "#2e9e58"),
+]
+FNG_ZONES = {"standaard": ZONES, "cmc": CMC_ZONES}
+
+
+def _ticks(zones) -> list:
+    return [(g, str(g)) for g in sorted({lo for lo, *_ in zones} | {hi for _, hi, *_ in zones})]
+
+
 FNG_TEKSTKLEUREN = {"Neutral": "#b08a0c", "Greed": "#5f9a2c"}
-FNG_TICKS = [(g, str(g)) for g in sorted({lo for lo, *_ in ZONES} | {hi for _, hi, *_ in ZONES})]
 
 
 def gauge_svg(value, title: str, zones=ZONES, label=None, ticks=None,
@@ -873,25 +937,26 @@ soort = soort or "aandelen"
 
 
 def render_gauge(fetch_fn, title: str, fout_prefix: str):
-    """Fear & Greed-gauge; bij een fout 'n.v.t.' plus melding."""
+    """Fear & Greed-gauge, met de zone-indeling van de bron; bij een fout 'n.v.t.'."""
     try:
         fng = fetch_fn()
         waarde = fng["waarde"]
-        # zone volgens de bron zelf (CNN: "extreme greed", alternative.me: "Extreme Greed"),
-        # met de kleur uit de meter; anders bepaald op basis van de waarde
-        kleuren = {n.lower(): (n, c) for _, _, n, c in ZONES}
+        zones = FNG_ZONES.get(fng.get("zones", "standaard"), ZONES)
+        if fng.get("bron") and fng["bron"] != "CNN":
+            title = f"{title} ({fng['bron']})"
+        # zone volgens de bron zelf ("Extreme fear", "greed", ...), anders op basis van de waarde
+        kleuren = {n.lower(): (n, c) for _, _, n, c in zones}
         naam, kleur = kleuren.get(
             str(fng.get("classificatie", "")).strip().lower(),
-            next(((n, c) for lo, hi, n, c in ZONES if waarde < hi), ZONES[-1][2:]),
+            next(((n, c) for lo, hi, n, c in zones if waarde < hi), zones[-1][2:]),
         )
-        # zonegrenzen (0, 25, 45, 55, 75, 100) langs de buitenkant, net als bij de 200w-MA-meter
         st.markdown(
-            gauge_svg(waarde, title, ticks=FNG_TICKS, sublabel=naam,
+            gauge_svg(waarde, title, zones=zones, ticks=_ticks(zones), sublabel=naam,
                       sublabel_color=FNG_TEKSTKLEUREN.get(naam, kleur)),
             unsafe_allow_html=True,
         )
     except Exception as e:  # noqa: BLE001
-        st.markdown(gauge_svg(None, title, ticks=FNG_TICKS), unsafe_allow_html=True)
+        st.markdown(gauge_svg(None, title, ticks=_ticks(ZONES)), unsafe_allow_html=True)
         st.caption(f"{fout_prefix}: {e}")
 
 
