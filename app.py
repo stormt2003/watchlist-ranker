@@ -10,7 +10,9 @@ Lokaal draaien:
     streamlit run app.py
 """
 
+import html
 import math
+import re
 from datetime import timedelta
 
 import pandas as pd
@@ -35,7 +37,41 @@ DEFAULT_WEIGHTS = {"20w": 1.0, "50w": 1.5, "200w": 2.0, "200d": 1.5}
 # Badge-symbolen (geen externe logo's). Onbekende tickers krijgen een monogram.
 BADGES = {"BTC-USD": "₿", "ETH-USD": "Ξ", "SOL-USD": "◎", "ADA-USD": "₳"}
 
+# Leesbare namen. Tickers die hier niet staan krijgen automatisch de naam
+# van Yahoo Finance; zet een ticker hier om die naam te overschrijven.
+NAMES = {
+    "VWRL.AS": "Vanguard FTSE All-World",
+    "AMZN": "Amazon",
+    "ACHR": "Archer Aviation",
+    "BESI.AS": "BE Semiconductor (Besi)",
+    "BSX": "Boston Scientific",
+    "MU": "Micron Technology",
+    "NFLX": "Netflix",
+    "MSTR": "Strategy (MicroStrategy)",
+    "TSLA": "Tesla",
+    "PATH": "UiPath",
+    "BTC-USD": "Bitcoin",
+    "ETH-USD": "Ethereum",
+    "SOL-USD": "Solana",
+    "ADA-USD": "Cardano",
+    "HYPE32196-USD": "Hyperliquid",
+    "NEAR-USD": "NEAR Protocol",
+    "AAVE-USD": "Aave",
+    "ONDO-USD": "Ondo",
+    "INJ-USD": "Injective",
+    "VIRTUAL-USD": "Virtuals Protocol",
+}
+
 CRYPTO_SUFFIXES = ("-USD", "-EUR", "-USDT")
+
+# Voor- en nabeurs: alleen VS-beurzen hebben die op Yahoo.
+# Handelstijden in Eastern Time, als minuten na middernacht.
+US_TZ = "America/New_York"
+US_PRE_START = 4 * 60          # 04:00 voorbeurs begint
+US_OPEN = 9 * 60 + 30          # 09:30 reguliere handel
+US_CLOSE = 16 * 60             # 16:00 nabeurs begint
+US_POST_END = 20 * 60          # 20:00 nabeurs eindigt
+EXT_MAX_AGE = pd.Timedelta(minutes=60)  # oudere voor-/nabeurskoers = niet meer actief
 
 FX_TICKER = "EURUSD=X"  # wisselkoers voor coins zonder EUR-paar
 
@@ -53,10 +89,12 @@ def fetch_intraday_batch(tickers: tuple) -> dict:
     """5-minuten-data voor ALLE tickers in één verzoek naar Yahoo.
     Zo blijft auto-verversen om de 10 sec beperkt tot 1 verzoek per keer,
     in plaats van één per ticker (anders loop je snel tegen rate limits aan).
-    ttl=8 zodat elke ververs-ronde van 10 sec verse data ophaalt."""
+    ttl=8 zodat elke ververs-ronde van 10 sec verse data ophaalt.
+    prepost=True: ook voor- en nabeurskoersen (VS); die worden in
+    compute_row weer van de reguliere handel gescheiden."""
     df = yf.download(
         list(tickers), period="5d", interval="5m", group_by="ticker",
-        auto_adjust=True, progress=False, threads=True,
+        auto_adjust=True, prepost=True, progress=False, threads=True,
     )
     out = {}
     for t in tickers:
@@ -71,15 +109,67 @@ def fetch_intraday_batch(tickers: tuple) -> dict:
     return out
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_currency(ticker: str) -> str:
+_SUFFIX_RE = re.compile(
+    r"[,\s]+(inc\.?|incorporated|corp\.?|corporation|n\.?v\.?|plc|ltd\.?|limited|"
+    r"s\.a\.?|se|ag|co\.?|company|holdings?)$",
+    re.IGNORECASE,
+)
+
+
+def clean_name(name: str, crypto: bool) -> str:
+    """'Amazon.com, Inc.' -> 'Amazon.com', 'Bitcoin USD' -> 'Bitcoin'."""
+    name = " ".join((name or "").split())
+    if crypto:
+        name = re.sub(r"\s+(USD|EUR|USDT)$", "", name)
+    prev = None
+    while prev != name:  # meerdere achtervoegsels, bv. 'Holdings, Inc.'
+        prev = name
+        name = _SUFFIX_RE.sub("", name).strip().rstrip(",&").strip()
+    return name
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_meta(ticker: str) -> dict:
+    """Naam, valuta en tijdzone van de beurs, 6 uur gecachet.
+    De naam komt uit Ticker.info (zwaar verzoek), dus alleen voor tickers
+    die niet in NAMES staan."""
+    t = ticker.upper()
+    crypto = is_crypto(t)
+    meta = {"naam": NAMES.get(t), "valuta": None, "tz": None}
     try:
-        return yf.Ticker(ticker).fast_info["currency"] or ""
+        fi = yf.Ticker(ticker).fast_info
+        meta["valuta"] = fi["currency"]
+        meta["tz"] = fi["timezone"]
     except Exception:  # noqa: BLE001
-        # terugval op basis van de tickernaam
-        if ticker.upper().endswith(("-EUR", ".AS", ".PA", ".DE", ".BR")):
-            return "EUR"
-        return "USD"
+        pass
+    if not meta["naam"]:
+        try:
+            info = yf.Ticker(ticker).info or {}
+            meta["naam"] = clean_name(info.get("longName") or info.get("shortName") or "", crypto)
+        except Exception:  # noqa: BLE001
+            pass
+    # terugval op basis van de tickernaam
+    if not meta["valuta"]:
+        meta["valuta"] = "EUR" if t.endswith(("-EUR", ".AS", ".PA", ".DE", ".BR")) else "USD"
+    if not meta["tz"] and not crypto and "." not in t:
+        meta["tz"] = US_TZ  # ticker zonder beurs-achtervoegsel = VS
+    meta["naam"] = meta["naam"] or ticker
+    return meta
+
+
+def us_session(ts: pd.Timestamp) -> str:
+    """'pre', 'regulier', 'post' of 'dicht' voor een tijdstip (VS-handelstijden)."""
+    t = ts.tz_convert(US_TZ)
+    if t.weekday() >= 5:
+        return "dicht"
+    m = t.hour * 60 + t.minute
+    if US_PRE_START <= m < US_OPEN:
+        return "pre"
+    if US_OPEN <= m < US_CLOSE:
+        return "regulier"
+    if US_CLOSE <= m < US_POST_END:
+        return "post"
+    return "dicht"
 
 
 def eur_pair(ticker: str) -> str:
@@ -149,21 +239,55 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     weekly = daily.resample("W").last().dropna()  # laatste bar = lopende week
     crypto = is_crypto(ticker)
 
-    intraday = intraday_map.get(ticker, pd.Series(dtype=float))
-    currency = fetch_currency(ticker)
+    meta = fetch_meta(ticker)
+    currency = meta["valuta"]
+    now_utc = pd.Timestamp.now(tz="UTC")
+
+    # Bij VS-aandelen zitten voor- en nabeursbars in de intraday-data.
+    # Die halen we eruit, zodat prijs, score en 1u/dag op de reguliere handel blijven.
+    raw = intraday_map.get(ticker, pd.Series(dtype=float))
+    us_stock = not crypto and meta["tz"] == US_TZ
+    if us_stock and not raw.empty:
+        local = raw.index.tz_convert(US_TZ)
+        mins = local.hour * 60 + local.minute
+        regulier = (local.weekday < 5) & (mins >= US_OPEN) & (mins < US_CLOSE)
+        intraday, ext_bars = raw[regulier], raw[~regulier]
+    else:
+        intraday, ext_bars = raw, pd.Series(dtype=float)
 
     if not intraday.empty:
         price = float(intraday.iloc[-1])
         last_ts = intraday.index[-1]
-        last_date = last_ts.date()  # datum in tijdzone van de beurs
+        # datum in tijdzone van de beurs
+        last_date = (last_ts.tz_convert(meta["tz"]) if meta["tz"] else last_ts).date()
         updated = last_ts.tz_convert("Europe/Amsterdam").strftime("%d-%m %H:%M")
         # "Live" = laatste koers is recent (Yahoo vertraagt sommige beurzen ~15 min)
-        live = pd.Timestamp.now(tz="UTC") - last_ts.tz_convert("UTC") < pd.Timedelta(minutes=45)
+        live = now_utc - last_ts.tz_convert("UTC") < pd.Timedelta(minutes=45)
     else:
         price = float(daily.iloc[-1])
         last_ts, live = None, False
         last_date = daily.index[-1].date()
         updated = last_date.strftime("%d-%m")
+
+    # Beurs dicht: gebruik de officiële slotkoers (incl. slotveiling)
+    # in plaats van de laatste 5-minutenbar.
+    if not crypto and not live and daily.index[-1].date() == last_date:
+        price = float(daily.iloc[-1])
+
+    # Voor-/nabeurs: alleen tonen als die sessie nu loopt en de koers vers is.
+    ext_sessie = ext_prijs = ext_pct = None
+    if us_stock and not ext_bars.empty:
+        nu_sessie = us_session(now_utc)
+        ext_ts = ext_bars.index[-1]
+        if (
+            nu_sessie in ("pre", "post")
+            and us_session(ext_ts) == nu_sessie
+            and now_utc - ext_ts.tz_convert("UTC") < EXT_MAX_AGE
+        ):
+            ext_sessie = nu_sessie
+            ext_prijs = float(ext_bars.iloc[-1])
+            ext_pct = _pct(ext_prijs, price)  # t.o.v. de laatste slotkoers
+            updated = ext_ts.tz_convert("Europe/Amsterdam").strftime("%d-%m %H:%M")
 
     # 1 uur: alleen zinvol als er nu gehandeld wordt
     ch_1h = _pct(price, _at_or_before(intraday, last_ts - pd.Timedelta(hours=1))) if live else None
@@ -212,7 +336,11 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
 
     return {
         "ticker": ticker,
+        "naam": meta["naam"],
         "prijs": price,
+        "ext_sessie": ext_sessie,
+        "ext_prijs": ext_prijs,
+        "%_ext": ext_pct,
         "valuta": currency,
         "bijgewerkt": updated,
         "%_1u": ch_1h,
@@ -362,6 +490,37 @@ def change_chip(label: str, pct) -> str:
     )
 
 
+EXT_LABELS = {
+    "pre": ("Voorbeurs", "Koers in de voorbeurs (04:00–09:30 New Yorkse tijd), t.o.v. de vorige slotkoers"),
+    "post": ("Nabeurs", "Koers in de nabeurs (16:00–20:00 New Yorkse tijd), t.o.v. de slotkoers van vandaag"),
+}
+
+
+def ext_chip_html(row: pd.Series) -> str:
+    """Klein, gedempt label naast de prijs, alleen als voor-/nabeurs actief is."""
+    sessie = row.get("ext_sessie")
+    if not isinstance(sessie, str) or sessie not in EXT_LABELS:
+        return ""
+    label, uitleg = EXT_LABELS[sessie]
+    pct = row.get("%_ext")
+    if pct is None or pd.isna(pct):
+        pct_html = ""
+    else:
+        color = "#d64545" if pct < 0 else "#2e9e58"
+        pct_html = (
+            f'<span style="color:{color};font-weight:600">'
+            f'{f"{pct:+.2f}%".replace(".", ",")}</span>'
+        )
+    return (
+        f'<span title="{uitleg}" style="display:inline-flex;align-items:baseline;gap:5px;'
+        f'padding:1px 8px;border-radius:999px;background:rgba(128,128,128,0.14);'
+        f'font-size:0.74rem;font-variant-numeric:tabular-nums;white-space:nowrap">'
+        f'<span style="opacity:0.65">{label}</span>'
+        f'<span style="opacity:0.85">{format_price(row["ext_prijs"], row["valuta"])}</span>'
+        f"{pct_html}</span>"
+    )
+
+
 def score_html(score: float) -> str:
     """Grote score rechts op de kaart. Positief (onder de MA's) = groen."""
     color = "#2e9e58" if score > 0 else "#d64545" if score < 0 else "inherit"
@@ -401,8 +560,10 @@ def card_html(rank: int, row: pd.Series) -> str:
         f'<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
         f'<span style="font-weight:600">{row["ticker"]}</span>'
         f'<span style="font-weight:700;font-size:1.05rem;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</span>{eur_txt}</div>'
-        f'<div style="font-size:0.72rem;opacity:0.6;font-variant-numeric:tabular-nums">'
+        f'{format_price(row["prijs"], row["valuta"])}</span>{eur_txt}{ext_chip_html(row)}</div>'
+        f'<div style="font-size:0.82rem;opacity:0.8;white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis">{html.escape(str(row.get("naam") or ""))}</div>'
+        f'<div style="font-size:0.72rem;opacity:0.55;font-variant-numeric:tabular-nums">'
         f'bijgewerkt {row["bijgewerkt"]}</div></div>'
         # score groot, helemaal rechts
         f'{score_html(row["score"])}'
@@ -430,7 +591,9 @@ def mover_row_html(rank: int, row: pd.Series, pct: float) -> str:
         f'<div style="flex:1;min-width:0;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
         f'<span style="font-weight:600">{row["ticker"]}</span>'
         f'<span style="opacity:0.8;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</span></div>'
+        f'{format_price(row["prijs"], row["valuta"])}</span>'
+        f'<span style="flex-basis:100%;font-size:0.78rem;opacity:0.65;white-space:nowrap;'
+        f'overflow:hidden;text-overflow:ellipsis">{html.escape(str(row.get("naam") or ""))}</span></div>'
         f'<span style="font-weight:800;font-size:1.15rem;color:{color};'
         f'font-variant-numeric:tabular-nums">{pct_txt}</span></div>'
     )
@@ -464,7 +627,7 @@ def render_movers(ranking: pd.DataFrame):
     col = MOVER_PERIODES[periode]
     if periode == "Dag":
         st.caption("Crypto: laatste 24 uur. Aandelen: t.o.v. de slotkoers van de vorige handelsdag.")
-    data = ranking[["ticker", "prijs", "valuta", col]].dropna(subset=[col])
+    data = ranking[["ticker", "naam", "prijs", "valuta", col]].dropna(subset=[col])
     stijgers = data[data[col] > 0].sort_values(col, ascending=False)
     dalers = data[data[col] < 0].sort_values(col, ascending=True)
 
@@ -529,7 +692,7 @@ def render_live(tickers: list, weights: dict):
             "geblokkeerd wordt door je netwerk (bijv. een bedrijfsproxy)."
         )
     else:
-        st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers.")
+        st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
 
     if not ranking.empty:
         render_movers(ranking)
