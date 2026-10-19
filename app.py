@@ -84,6 +84,7 @@ THERMO_MA_WEKEN = 200
 THERMO = {
     "aandelen": dict(
         ticker="VWRL.AS", min=-10, max=60,
+        valuta={"EUR": "VWRL.AS"},  # koers en MA tonen in deze valuta('s), via deze ticker
         zones=[
             (0, "Spotgoedkoop"),     # op of onder de 200w-MA
             (10, "Zeer goedkoop"),
@@ -95,6 +96,7 @@ THERMO = {
     ),
     "crypto": dict(
         ticker="BTC-USD", min=-50, max=200,
+        valuta={"EUR": "BTC-EUR", "USD": "BTC-USD"},
         zones=[
             (0, "Zeer goedkoop"),    # op of onder de 200w-MA
             (50, "Goedkoop"),
@@ -934,11 +936,23 @@ def render_thermometer(soort: str, ranking: pd.DataFrame):
                   sublabel_color=ZONE_TEKSTKLEUREN.get(naam, ZONE_KLEUREN.get(naam, "currentColor"))),
         unsafe_allow_html=True,
     )
-    valuta = fetch_meta(ticker)["valuta"]
-    st.caption(
-        f"Koers {format_price(t['prijs'], valuta)}, "
-        f"200w-MA {format_price(t['ma'], valuta)}"
-    )
+    # Koers en 200w-MA per valuta. Elke valuta heeft een eigen handelspaar
+    # (BTC-EUR / BTC-USD), zodat de MA echt in die valuta berekend is.
+    koersen, mas = [], []
+    for cur, tk in cfg["valuta"].items():
+        if tk == ticker:
+            tc = t
+        else:
+            live_c = ranking.loc[ranking["ticker"] == ticker, f"prijs_{cur.lower()}"]
+            live_c = float(live_c.iloc[0]) if not live_c.empty and pd.notna(live_c.iloc[0]) else None
+            try:
+                tc = thermometer(tk, live_c)
+            except Exception:  # noqa: BLE001
+                continue
+        koersen.append(format_price(tc["prijs"], cur))
+        mas.append(format_price(tc["ma"], cur))
+    if koersen:
+        st.caption(f"Koers {' / '.join(koersen)}  \n200w-MA {' / '.join(mas)}")
 
 
 def render_live(tickers: list, weights: dict, soort: str):
