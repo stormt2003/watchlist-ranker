@@ -127,30 +127,35 @@ def clean_name(name: str, crypto: bool) -> str:
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch_meta(ticker: str) -> dict:
-    """Naam, valuta en tijdzone van de beurs, 6 uur gecachet.
+    """Soort (crypto of aandeel/ETF), naam, valuta en beurs-tijdzone, 6 uur gecachet.
+    De soort komt van Yahoo zelf (quoteType), zodat ook nieuwe tickers goed
+    worden ingedeeld; alleen als Yahoo niet antwoordt kijken we naar de tickernaam.
     De naam komt uit Ticker.info (zwaar verzoek), dus alleen voor tickers
     die niet in NAMES staan."""
     t = ticker.upper()
-    crypto = is_crypto(t)
-    meta = {"naam": NAMES.get(t), "valuta": None, "tz": None}
+    meta = {"naam": NAMES.get(t), "valuta": None, "tz": None, "soort": None}
     try:
         fi = yf.Ticker(ticker).fast_info
         meta["valuta"] = fi["currency"]
         meta["tz"] = fi["timezone"]
+        meta["soort"] = fi["quoteType"]
     except Exception:  # noqa: BLE001
         pass
     if not meta["naam"]:
         try:
             info = yf.Ticker(ticker).info or {}
-            meta["naam"] = clean_name(info.get("longName") or info.get("shortName") or "", crypto)
+            meta["soort"] = meta["soort"] or info.get("quoteType")
+            meta["naam"] = info.get("longName") or info.get("shortName")
         except Exception:  # noqa: BLE001
             pass
+    soort = str(meta["soort"] or "").upper()
+    meta["crypto"] = soort == "CRYPTOCURRENCY" if soort else looks_like_crypto(t)
+    meta["naam"] = clean_name(meta["naam"] or "", meta["crypto"]) or ticker
     # terugval op basis van de tickernaam
     if not meta["valuta"]:
         meta["valuta"] = "EUR" if t.endswith(("-EUR", ".AS", ".PA", ".DE", ".BR")) else "USD"
-    if not meta["tz"] and not crypto and "." not in t:
+    if not meta["tz"] and not meta["crypto"] and "." not in t:
         meta["tz"] = US_TZ  # ticker zonder beurs-achtervoegsel = VS
-    meta["naam"] = meta["naam"] or ticker
     return meta
 
 
@@ -216,8 +221,14 @@ def fetch_stock_fear_greed() -> dict:
     return {"waarde": int(round(float(data["score"]))), "classificatie": data["rating"]}
 
 
-def is_crypto(ticker: str) -> bool:
+def looks_like_crypto(ticker: str) -> bool:
+    """Gok op basis van de tickernaam (BTC-USD, ETH-EUR, ...)."""
     return ticker.upper().endswith(CRYPTO_SUFFIXES)
+
+
+def is_crypto(ticker: str) -> bool:
+    """Crypto volgens Yahoo (zie fetch_meta), met de tickernaam als terugval."""
+    return fetch_meta(ticker)["crypto"]
 
 
 def _pct(now, ref):
@@ -508,11 +519,12 @@ def ext_chip_html(row: pd.Series) -> str:
     )
 
 
-def title_html(row: pd.Series, size: str = "0.95rem") -> str:
-    """Naam als hoofdtekst, de ticker klein en gedempt erachter."""
+def title_html(row: pd.Series, size: str = "0.95rem", stacked: bool = False) -> str:
+    """Naam als hoofdtekst, de ticker klein en gedempt erachter (of eronder)."""
     naam = html.escape(str(row.get("naam") or row["ticker"]))
+    richting = "flex-direction:column;gap:0;line-height:1.2" if stacked else "align-items:baseline;gap:6px"
     return (
-        f'<div style="display:flex;align-items:baseline;gap:6px;min-width:0">'
+        f'<div style="display:flex;{richting};min-width:0">'
         f'<span style="font-weight:650;font-size:{size};white-space:nowrap;overflow:hidden;'
         f'text-overflow:ellipsis">{naam}</span>'
         f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap">{row["ticker"]}</span></div>'
@@ -568,7 +580,12 @@ def card_html(rank: int, row: pd.Series) -> str:
     )
 
 
-MOVER_PERIODES = {"Dag": "%_24u", "7d": "%_7d", "30d": "%_30d"}
+# Per soort een eigen label voor de korte periode: crypto handelt 24/7,
+# aandelen vergelijken we met de vorige slotkoers.
+MOVER_PERIODES = {
+    False: {"Dag": "%_24u", "7d": "%_7d", "30d": "%_30d"},
+    True: {"24u": "%_24u", "7d": "%_7d", "30d": "%_30d"},
+}
 MOVERS_TOP = 3
 
 
@@ -580,7 +597,7 @@ def mover_row_html(rank: int, row: pd.Series, pct: float) -> str:
         f'<div style="display:flex;align-items:center;gap:8px;padding:5px 9px;'
         f'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px">'
         f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rank}</span>'
-        f'<div style="flex:1;min-width:0">{title_html(row, "0.88rem")}</div>'
+        f'<div style="flex:1;min-width:0">{title_html(row, "0.88rem", stacked=True)}</div>'
         f'<span style="opacity:0.7;font-size:0.8rem;white-space:nowrap;font-variant-numeric:tabular-nums">'
         f'{format_price(row["prijs"], row["valuta"])}</span>'
         f'<span style="font-weight:800;font-size:0.95rem;min-width:64px;text-align:right;color:{color};'
@@ -598,29 +615,31 @@ def render_mover_list(titel: str, part: pd.DataFrame, col: str, leeg: str, alles
     zichtbaar = rows if alles else rows[:MOVERS_TOP]
     st.markdown("".join(zichtbaar), unsafe_allow_html=True)
     if not alles and len(rows) > MOVERS_TOP:
-        st.caption(f"+ {len(rows) - MOVERS_TOP} meer")
+        st.caption(f"Nog {len(rows) - MOVERS_TOP} meer, zet 'Toon alle' aan om ze te zien.")
 
 
-def render_movers(ranking: pd.DataFrame):
+def render_movers(ranking: pd.DataFrame, crypto: bool):
+    perioden = MOVER_PERIODES[crypto]
     st.subheader("Hardste stijgers & dalers")
     c1, c2 = st.columns([3, 1], vertical_alignment="center")
     with c1:
         periode = st.radio(
-            "Periode", list(MOVER_PERIODES), horizontal=True,
-            key="mover_periode", label_visibility="collapsed",
+            "Periode", list(perioden), horizontal=True,
+            key=f"mover_periode_{'crypto' if crypto else 'aandelen'}",
+            label_visibility="collapsed",
         )
     with c2:
         # Een schakelaar i.p.v. een uitklapper: de lijst loopt zo gewoon door,
         # en de stand blijft bewaard bij het automatisch verversen.
         alles = st.toggle("Toon alle", key="mover_alles")
-    col = MOVER_PERIODES[periode]
-    if periode == "Dag":
-        st.caption("Crypto: laatste 24 uur. Aandelen: t.o.v. de slotkoers van de vorige handelsdag.")
+    col = perioden[periode]
+    if col == "%_24u":
+        st.caption("Laatste 24 uur." if crypto else "T.o.v. de slotkoers van de vorige handelsdag.")
     data = ranking[["ticker", "naam", "prijs", "valuta", col]].dropna(subset=[col])
     stijgers = data[data[col] > 0].sort_values(col, ascending=False)
     dalers = data[data[col] < 0].sort_values(col, ascending=True)
 
-    left, right = st.columns(2, gap="large")
+    left, right = st.columns(2, gap="medium")
     with left:
         render_mover_list(f"Stijgers ({periode})", stijgers, col,
                           "Geen stijgers in deze periode.", alles)
@@ -633,12 +652,23 @@ def render_movers(ranking: pd.DataFrame):
 # PAGINA
 # ---------------------------------------------------------------------------
 
+SOORTEN = {
+    "aandelen": dict(crypto=False, titel="Aandelen & ETF's", fetch=lambda: fetch_stock_fear_greed(),
+                     gauge="Aandelen Fear & Greed", fout="CNN niet bereikbaar"),
+    "crypto": dict(crypto=True, titel="Crypto", fetch=lambda: fetch_crypto_fear_greed(),
+                   gauge="Crypto Fear & Greed", fout="Niet opgehaald"),
+}
+
 with st.sidebar:
     st.header("Instellingen")
     tickers_text = st.text_area(
         "Tickers (één per regel)", "\n".join(DEFAULT_TICKERS), height=200
     )
-    st.caption("Crypto in yfinance-formaat, bv. BTC-USD.")
+    st.caption(
+        "Tickers worden automatisch ingedeeld als aandeel/ETF of crypto, "
+        "op basis van wat Yahoo Finance over de ticker zegt. Crypto in "
+        "yfinance-formaat, bv. BTC-USD."
+    )
     st.subheader("Gewichten")
     weights = {
         k: st.slider(f"{k} MA", 0.0, 3.0, v, 0.25) for k, v in DEFAULT_WEIGHTS.items()
@@ -651,24 +681,55 @@ with st.sidebar:
     if st.button("Nu verversen"):
         st.cache_data.clear()
 
-tickers = [t.strip().upper() for t in tickers_text.splitlines() if t.strip()]
+tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.splitlines() if t.strip()))
+
+with st.spinner("Tickers indelen…"):
+    indeling = {t: ("crypto" if is_crypto(t) else "aandelen") for t in tickers}
+per_soort = {k: [t for t in tickers if indeling[t] == k] for k in SOORTEN}
 
 st.title("Watchlist Ranker")
 
-def render_gauge(container, fetch_fn, title: str, fout_prefix: str):
-    """Fear & Greed-gauge in een kolom; bij een fout 'n.v.t.' plus melding."""
+# De grote schakelaar: alles hieronder (gauge, stijgers/dalers, scores,
+# tabel) gaat alleen over de gekozen soort.
+st.markdown(
+    """<style>
+    .st-key-soort button { min-height: 3rem; font-size: 1.05rem; font-weight: 600; }
+    .st-key-soort button p { font-size: 1.05rem; }
+    </style>""",
+    unsafe_allow_html=True,
+)
+soort_kwargs = dict(
+    label="Soort", options=list(SOORTEN), default="aandelen", required=True,
+    key="soort", label_visibility="collapsed",
+    format_func=lambda k: f"{SOORTEN[k]['titel']}  ({len(per_soort[k])})",
+)
+try:
+    soort = st.segmented_control(**soort_kwargs, width="stretch")
+except TypeError:  # oudere Streamlit zonder width-parameter
+    soort = st.segmented_control(**soort_kwargs)
+soort = soort or "aandelen"
+
+
+def render_gauge(fetch_fn, title: str, fout_prefix: str):
+    """Fear & Greed-gauge; bij een fout 'n.v.t.' plus melding."""
     try:
         fng = fetch_fn()
-        container.markdown(gauge_svg(fng["waarde"], title), unsafe_allow_html=True)
+        st.markdown(gauge_svg(fng["waarde"], title), unsafe_allow_html=True)
     except Exception as e:  # noqa: BLE001
-        container.markdown(gauge_svg(None, title), unsafe_allow_html=True)
-        container.caption(f"{fout_prefix}: {e}")
+        st.markdown(gauge_svg(None, title), unsafe_allow_html=True)
+        st.caption(f"{fout_prefix}: {e}")
 
 
-def render_live(tickers: list, weights: dict):
-    """Alles wat live ververst: gauges en ranglijst."""
+def render_live(tickers: list, weights: dict, soort: str):
+    """Alles wat live ververst, voor één soort: gauge, stijgers/dalers en ranglijst."""
+    cfg = SOORTEN[soort]
+    crypto = cfg["crypto"]
     now = pd.Timestamp.now(tz="Europe/Amsterdam").strftime("%H:%M:%S")
     st.caption(f"Laatst ververst om {now}")
+
+    if not tickers:
+        st.info(f"Er staan geen {cfg['titel'].lower()} in je lijst. Voeg tickers toe in de zijbalk.")
+        return
 
     ranking, errors = build_ranking(tickers, weights)
 
@@ -680,41 +741,36 @@ def render_live(tickers: list, weights: dict):
             "Geen koersdata opgehaald. Controleer de tickers, of Yahoo Finance "
             "geblokkeerd wordt door je netwerk (bijv. een bedrijfsproxy)."
         )
-    else:
-        st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
+        render_gauge(cfg["fetch"], cfg["gauge"], cfg["fout"])
+        return
 
-    if not ranking.empty:
-        render_movers(ranking)
-        st.divider()
+    # Bovenaan: sentiment links, stijgers/dalers rechts
+    g, m = st.columns([1, 2.6], gap="large")
+    with g:
+        render_gauge(cfg["fetch"], cfg["gauge"], cfg["fout"])
+    with m:
+        render_movers(ranking, crypto)
 
-    # Twee kolommen naast elkaar: aandelen links, crypto rechts,
-    # elk met de eigen Fear & Greed-gauge bovenaan.
-    col_stocks, col_crypto = st.columns(2, gap="large")
-    secties = [
-        (col_stocks, "Aandelen & ETF's", False,
-         fetch_stock_fear_greed, "Aandelen Fear & Greed", "CNN niet bereikbaar"),
-        (col_crypto, "Crypto", True,
-         fetch_crypto_fear_greed, "Crypto Fear & Greed", "Niet opgehaald"),
-    ]
-    for col, section, crypto, fetch_fn, gauge_title, fout_prefix in secties:
-        with col:
-            render_gauge(st, fetch_fn, gauge_title, fout_prefix)
-            st.subheader(section)
-            if ranking.empty:
-                continue
-            part = ranking[ranking["ticker"].map(is_crypto) == crypto].reset_index(drop=True)
-            if part.empty:
-                st.caption("Geen tickers in deze groep.")
-                continue
-            st.markdown(
-                "".join(card_html(i + 1, row) for i, row in part.iterrows()),
-                unsafe_allow_html=True,
-            )
+    st.divider()
+    st.subheader("Ranglijst")
+    uitleg = "Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als er niet gehandeld wordt."
+    if not crypto:
+        uitleg += (" 'Dag' is de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) "
+                   "staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
+    st.caption(uitleg)
+    # Kaartjes in een raster dat zich aanpast aan de schermbreedte
+    st.markdown(
+        '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));'
+        'column-gap:10px">'
+        + "".join(card_html(i + 1, row) for i, row in ranking.iterrows())
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 
-    if not ranking.empty:
-        with st.expander("Ruwe tabel"):
-            st.dataframe(ranking, width="stretch", hide_index=True)
+    with st.expander("Ruwe tabel"):
+        st.dataframe(ranking, width="stretch", hide_index=True)
 
 
-# Fragment: alleen dit deel draait opnieuw, om de `interval` seconden
-st.fragment(run_every=interval if auto else None)(render_live)(tickers, weights)
+# Fragment: alleen dit deel draait opnieuw, om de `interval` seconden.
+# Alleen de tickers van de gekozen soort worden opgehaald.
+st.fragment(run_every=interval if auto else None)(render_live)(per_soort[soort], weights, soort)
