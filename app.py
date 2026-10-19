@@ -34,9 +34,6 @@ DEFAULT_TICKERS = [
 
 DEFAULT_WEIGHTS = {"20w": 1.0, "50w": 1.5, "200w": 2.0, "200d": 1.5}
 
-# Badge-symbolen (geen externe logo's). Onbekende tickers krijgen een monogram.
-BADGES = {"BTC-USD": "₿", "ETH-USD": "Ξ", "SOL-USD": "◎", "ADA-USD": "₳"}
-
 # Leesbare namen. Tickers die hier niet staan krijgen automatisch de naam
 # van Yahoo Finance; zet een ticker hier om die naam te overschrijven.
 NAMES = {
@@ -429,40 +426,30 @@ def gauge_svg(value, title: str) -> str:
     return (
         f'<div style="text-align:center">'
         f'<div style="font-size:0.9rem;opacity:0.8">{title}</div>'
-        f'<svg viewBox="0 0 220 135" style="width:100%;max-width:280px">'
+        f'<svg viewBox="0 0 220 135" style="width:100%;max-width:220px">'
         f'{"".join(parts)}</svg></div>'
-    )
-
-
-def badge_html(ticker: str, crypto: bool) -> str:
-    sym = BADGES.get(ticker.upper(), ticker.split("-")[0].split(".")[0][:2].upper())
-    bg = "#7b5cd6" if crypto else "#3a7bd5"
-    return (
-        f'<span style="display:inline-flex;align-items:center;justify-content:center;'
-        f'width:30px;height:30px;border-radius:50%;background:{bg};color:#fff;'
-        f'font-weight:700;font-size:0.8rem;flex-shrink:0">{sym}</span>'
     )
 
 
 def ma_bar_html(label: str, pct) -> str:
     if pct is None or pd.isna(pct):
-        fill, txt = "", "te weinig historie"
+        fill, txt = "", '<span title="te weinig historie voor dit gemiddelde" style="opacity:0.5">–</span>'
     else:
         width = min(abs(pct), BAR_CAP_PCT) / BAR_CAP_PCT * 50
-        side = f"right:50%" if pct < 0 else "left:50%"
+        side = "right:50%" if pct < 0 else "left:50%"
         color = "#d64545" if pct < 0 else "#2e9e58"
         fill = (
             f'<div style="position:absolute;top:0;bottom:0;{side};width:{width:.1f}%;'
-            f'background:{color};border-radius:3px"></div>'
+            f'background:{color};border-radius:2px"></div>'
         )
-        txt = f"{pct:+.1f}%"
+        txt = f"{pct:+.1f}%".replace(".", ",")
     return (
-        f'<div style="display:flex;align-items:center;gap:8px;font-size:0.78rem;margin:3px 0">'
-        f'<span style="width:34px;opacity:0.75">{label}</span>'
-        f'<div style="position:relative;flex:1;height:8px;background:rgba(128,128,128,0.18);border-radius:3px">'
+        f'<div style="display:flex;align-items:center;gap:6px;font-size:0.7rem;margin:1px 0">'
+        f'<span style="width:30px;opacity:0.6">{label}</span>'
+        f'<div style="position:relative;flex:1;height:5px;background:rgba(128,128,128,0.16);border-radius:2px">'
         f'{fill}<div style="position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;'
-        f'background:currentColor;opacity:0.5"></div></div>'
-        f'<span style="width:64px;text-align:right;font-variant-numeric:tabular-nums">{txt}</span>'
+        f'background:currentColor;opacity:0.4"></div></div>'
+        f'<span style="width:56px;text-align:right;opacity:0.85;font-variant-numeric:tabular-nums">{txt}</span>'
         f"</div>"
     )
 
@@ -521,16 +508,26 @@ def ext_chip_html(row: pd.Series) -> str:
     )
 
 
+def title_html(row: pd.Series, size: str = "0.95rem") -> str:
+    """Naam als hoofdtekst, de ticker klein en gedempt erachter."""
+    naam = html.escape(str(row.get("naam") or row["ticker"]))
+    return (
+        f'<div style="display:flex;align-items:baseline;gap:6px;min-width:0">'
+        f'<span style="font-weight:650;font-size:{size};white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis">{naam}</span>'
+        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap">{row["ticker"]}</span></div>'
+    )
+
+
 def score_html(score: float) -> str:
-    """Grote score rechts op de kaart. Positief (onder de MA's) = groen."""
+    """Score rechts op de kaart. Positief (onder de MA's) = groen."""
     color = "#2e9e58" if score > 0 else "#d64545" if score < 0 else "inherit"
     txt = f"{score:+.1f}".replace(".", ",")
     return (
-        f'<div style="text-align:right;min-width:72px">'
-        f'<div style="font-size:1.7rem;font-weight:800;line-height:1.1;color:{color};'
+        f'<div style="text-align:right;flex-shrink:0;line-height:1">'
+        f'<div style="font-size:1.3rem;font-weight:800;color:{color};'
         f'font-variant-numeric:tabular-nums">{txt}</div>'
-        f'<div style="font-size:0.68rem;opacity:0.6;text-transform:uppercase;'
-        f'letter-spacing:0.05em">score</div></div>'
+        f'<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">score</div></div>'
     )
 
 
@@ -546,31 +543,28 @@ def card_html(rank: int, row: pd.Series) -> str:
     if crypto and row["valuta"] != "EUR" and eur is not None and not pd.isna(eur):
         approx = "≈ " if row.get("eur_omgerekend") else ""
         eur_txt = (
-            f'<span style="font-weight:500;font-size:0.92rem;opacity:0.7;'
-            f'font-variant-numeric:tabular-nums">{approx}{format_price(eur, "EUR")}</span>'
+            f'<span style="font-size:0.8rem;opacity:0.6;font-variant-numeric:tabular-nums">'
+            f'{approx}{format_price(eur, "EUR")}</span>'
         )
     return (
-        f'<div style="border:1px solid rgba(128,128,128,0.25);border-radius:10px;'
-        f'padding:10px 12px;margin-bottom:10px">'
-        f'<div style="display:flex;align-items:center;gap:10px">'
-        f'<span style="opacity:0.6;width:18px">{rank}</span>'
-        f"{badge_html(row['ticker'], crypto)}"
-        # ticker met de prijs ernaast
-        f'<div style="flex:1;min-width:0">'
-        f'<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
-        f'<span style="font-weight:600">{row["ticker"]}</span>'
-        f'<span style="font-weight:700;font-size:1.05rem;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</span>{eur_txt}{ext_chip_html(row)}</div>'
-        f'<div style="font-size:0.82rem;opacity:0.8;white-space:nowrap;overflow:hidden;'
-        f'text-overflow:ellipsis">{html.escape(str(row.get("naam") or ""))}</div>'
-        f'<div style="font-size:0.72rem;opacity:0.55;font-variant-numeric:tabular-nums">'
-        f'bijgewerkt {row["bijgewerkt"]}</div></div>'
-        # score groot, helemaal rechts
+        f'<div style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;'
+        f'padding:7px 10px 6px;margin-bottom:6px">'
+        # kop: rang, naam (ticker klein), score rechts
+        f'<div style="display:flex;align-items:center;gap:8px">'
+        f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rank}</span>'
+        f'<div style="flex:1;min-width:0">{title_html(row)}'
+        # prijs met euro-prijs en eventueel voor-/nabeurs ernaast
+        f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:1px">'
+        f'<span style="font-weight:700;font-size:0.92rem;font-variant-numeric:tabular-nums">'
+        f'{format_price(row["prijs"], row["valuta"])}</span>{eur_txt}{ext_chip_html(row)}</div></div>'
         f'{score_html(row["score"])}'
         f"</div>"
-        f'<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:0.78rem;margin:6px 0 4px 28px">'
-        f"{chips}</div>"
-        f"{bars}</div>"
+        # wijzigingen + tijdstip op één regel
+        f'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;font-size:0.72rem;'
+        f'margin:4px 0 3px 22px">{chips}'
+        f'<span style="margin-left:auto;opacity:0.45;font-variant-numeric:tabular-nums">'
+        f'{row["bijgewerkt"]}</span></div>'
+        f'<div style="margin-left:22px">{bars}</div></div>'
     )
 
 
@@ -579,22 +573,17 @@ MOVERS_TOP = 3
 
 
 def mover_row_html(rank: int, row: pd.Series, pct: float) -> str:
-    """Compacte regel: rang, badge, ticker, prijs en groot percentage rechts."""
-    crypto = is_crypto(row["ticker"])
+    """Compacte regel: rang, naam (ticker klein), prijs en percentage rechts."""
     color = "#2e9e58" if pct >= 0 else "#d64545"
     pct_txt = f"{pct:+.2f}%".replace(".", ",")
     return (
-        f'<div style="display:flex;align-items:center;gap:10px;padding:7px 10px;'
-        f'border:1px solid rgba(128,128,128,0.2);border-radius:8px;margin-bottom:6px">'
-        f'<span style="opacity:0.6;width:16px">{rank}</span>'
-        f"{badge_html(row['ticker'], crypto)}"
-        f'<div style="flex:1;min-width:0;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
-        f'<span style="font-weight:600">{row["ticker"]}</span>'
-        f'<span style="opacity:0.8;font-variant-numeric:tabular-nums">'
+        f'<div style="display:flex;align-items:center;gap:8px;padding:5px 9px;'
+        f'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px">'
+        f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rank}</span>'
+        f'<div style="flex:1;min-width:0">{title_html(row, "0.88rem")}</div>'
+        f'<span style="opacity:0.7;font-size:0.8rem;white-space:nowrap;font-variant-numeric:tabular-nums">'
         f'{format_price(row["prijs"], row["valuta"])}</span>'
-        f'<span style="flex-basis:100%;font-size:0.78rem;opacity:0.65;white-space:nowrap;'
-        f'overflow:hidden;text-overflow:ellipsis">{html.escape(str(row.get("naam") or ""))}</span></div>'
-        f'<span style="font-weight:800;font-size:1.15rem;color:{color};'
+        f'<span style="font-weight:800;font-size:0.95rem;min-width:64px;text-align:right;color:{color};'
         f'font-variant-numeric:tabular-nums">{pct_txt}</span></div>'
     )
 
