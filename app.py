@@ -2,8 +2,8 @@
 Watchlist Ranker — Streamlit-app
 --------------------------------
 Live koersdata via yfinance, MA's (20w/50w/200w/200d) lokaal berekend,
-score-ranglijst gesplitst in Crypto en Aandelen/ETF's, plus de
-Crypto Fear & Greed-gauge.
+score-ranglijst gesplitst in Aandelen/ETF's (links) en Crypto (rechts),
+elk met de bijbehorende Fear & Greed-gauge erboven.
 
 Lokaal draaien:
     pip install -r requirements.txt
@@ -36,7 +36,7 @@ CRYPTO_SUFFIXES = ("-USD", "-EUR", "-USDT")
 
 BAR_CAP_PCT = 50  # balk is "vol" bij ±50% afstand tot de MA
 
-st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="centered")
+st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="wide")
 
 
 # ---------------------------------------------------------------------------
@@ -399,25 +399,21 @@ tickers = [t.strip().upper() for t in tickers_text.splitlines() if t.strip()]
 
 st.title("Watchlist Ranker")
 
+def render_gauge(container, fetch_fn, title: str, fout_prefix: str):
+    """Fear & Greed-gauge in een kolom; bij een fout 'n.v.t.' plus melding."""
+    try:
+        fng = fetch_fn()
+        container.markdown(gauge_svg(fng["waarde"], title), unsafe_allow_html=True)
+    except Exception as e:  # noqa: BLE001
+        container.markdown(gauge_svg(None, title), unsafe_allow_html=True)
+        container.caption(f"{fout_prefix}: {e}")
+
+
 def render_live(tickers: list, weights: dict):
     """Alles wat live ververst: gauges en ranglijst."""
     now = pd.Timestamp.now(tz="Europe/Amsterdam").strftime("%H:%M:%S")
     st.caption(f"Laatst ververst om {now}")
-    col1, col2 = st.columns(2)
-    try:
-        fng = fetch_crypto_fear_greed()
-        col1.markdown(gauge_svg(fng["waarde"], "Crypto Fear & Greed"), unsafe_allow_html=True)
-    except Exception as e:  # noqa: BLE001
-        col1.markdown(gauge_svg(None, "Crypto Fear & Greed"), unsafe_allow_html=True)
-        col1.caption(f"Niet opgehaald: {e}")
-    try:
-        sfng = fetch_stock_fear_greed()
-        col2.markdown(gauge_svg(sfng["waarde"], "Aandelen Fear & Greed"), unsafe_allow_html=True)
-    except Exception as e:  # noqa: BLE001
-        col2.markdown(gauge_svg(None, "Aandelen Fear & Greed"), unsafe_allow_html=True)
-        col2.caption(f"CNN niet bereikbaar: {e}")
 
-    # Ranglijst
     ranking, errors = build_ranking(tickers, weights)
 
     if errors:
@@ -428,25 +424,36 @@ def render_live(tickers: list, weights: dict):
             "Geen koersdata opgehaald. Controleer de tickers, of Yahoo Finance "
             "geblokkeerd wordt door je netwerk (bijv. een bedrijfsproxy)."
         )
-        return
+    else:
+        st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers.")
 
-    st.caption("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als de beurs dicht is. Bij aandelen is 'dag' de verandering t.o.v. de vorige slotkoers.")
+    # Twee kolommen naast elkaar: aandelen links, crypto rechts,
+    # elk met de eigen Fear & Greed-gauge bovenaan.
+    col_stocks, col_crypto = st.columns(2, gap="large")
+    secties = [
+        (col_stocks, "Aandelen & ETF's", False,
+         fetch_stock_fear_greed, "Aandelen Fear & Greed", "CNN niet bereikbaar"),
+        (col_crypto, "Crypto", True,
+         fetch_crypto_fear_greed, "Crypto Fear & Greed", "Niet opgehaald"),
+    ]
+    for col, section, crypto, fetch_fn, gauge_title, fout_prefix in secties:
+        with col:
+            render_gauge(st, fetch_fn, gauge_title, fout_prefix)
+            st.subheader(section)
+            if ranking.empty:
+                continue
+            part = ranking[ranking["ticker"].map(is_crypto) == crypto].reset_index(drop=True)
+            if part.empty:
+                st.caption("Geen tickers in deze groep.")
+                continue
+            st.markdown(
+                "".join(card_html(i + 1, row) for i, row in part.iterrows()),
+                unsafe_allow_html=True,
+            )
 
-    for section, mask in [
-        ("Crypto", ranking["ticker"].map(is_crypto)),
-        ("Aandelen & ETF's", ~ranking["ticker"].map(is_crypto)),
-    ]:
-        part = ranking[mask].reset_index(drop=True)
-        if part.empty:
-            continue
-        st.subheader(section)
-        st.markdown(
-            "".join(card_html(i + 1, row) for i, row in part.iterrows()),
-            unsafe_allow_html=True,
-        )
-
-    with st.expander("Ruwe tabel"):
-        st.dataframe(ranking, width="stretch", hide_index=True)
+    if not ranking.empty:
+        with st.expander("Ruwe tabel"):
+            st.dataframe(ranking, width="stretch", hide_index=True)
 
 
 # Fragment: alleen dit deel draait opnieuw, om de `interval` seconden
