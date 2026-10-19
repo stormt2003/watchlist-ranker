@@ -83,7 +83,7 @@ BAR_CAP_PCT = 50  # balk is "vol" bij ±50% afstand tot de MA
 THERMO_MA_WEKEN = 200
 THERMO = {
     "aandelen": dict(
-        ticker="VWRL.AS", min=-10, max=60,
+        ticker="VWRL.AS", min=-10, max=50,
         valuta={"EUR": "VWRL.AS"},  # koers en MA tonen in deze valuta('s), via deze ticker
         zones=[
             (0, "Spotgoedkoop"),     # op of onder de 200w-MA
@@ -91,7 +91,7 @@ THERMO = {
             (20, "Goedkoop"),
             (30, "Redelijk"),
             (40, "Duur"),
-            (60, "Zeer duur"),       # en alles daarboven
+            (50, "Zeer duur"),       # en alles daarboven
         ],
     ),
     "crypto": dict(
@@ -528,6 +528,7 @@ def _polar(cx, cy, r, value):
 
 # Donkerdere tint voor de zonenaam onder het getal (geel/lichtgroen is slecht leesbaar)
 FNG_TEKSTKLEUREN = {"Neutral": "#b08a0c", "Greed": "#5f9a2c"}
+FNG_TICKS = [(g, str(g)) for g in sorted({lo for lo, *_ in ZONES} | {hi for _, hi, *_ in ZONES})]
 
 
 def gauge_svg(value, title: str, zones=ZONES, label=None, ticks=None,
@@ -883,12 +884,14 @@ def render_gauge(fetch_fn, title: str, fout_prefix: str):
             str(fng.get("classificatie", "")).strip().lower(),
             next(((n, c) for lo, hi, n, c in ZONES if waarde < hi), ZONES[-1][2:]),
         )
+        # zonegrenzen (0, 25, 45, 55, 75, 100) langs de buitenkant, net als bij de 200w-MA-meter
         st.markdown(
-            gauge_svg(waarde, title, sublabel=naam, sublabel_color=FNG_TEKSTKLEUREN.get(naam, kleur)),
+            gauge_svg(waarde, title, ticks=FNG_TICKS, sublabel=naam,
+                      sublabel_color=FNG_TEKSTKLEUREN.get(naam, kleur)),
             unsafe_allow_html=True,
         )
     except Exception as e:  # noqa: BLE001
-        st.markdown(gauge_svg(None, title), unsafe_allow_html=True)
+        st.markdown(gauge_svg(None, title, ticks=FNG_TICKS), unsafe_allow_html=True)
         st.caption(f"{fout_prefix}: {e}")
 
 
