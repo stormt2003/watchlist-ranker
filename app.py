@@ -524,6 +524,10 @@ def _polar(cx, cy, r, value):
     return cx + r * math.cos(angle), cy - r * math.sin(angle)
 
 
+# Donkerdere tint voor de zonenaam onder het getal (geel/lichtgroen is slecht leesbaar)
+FNG_TEKSTKLEUREN = {"Neutral": "#b08a0c", "Greed": "#5f9a2c"}
+
+
 def gauge_svg(value, title: str, zones=ZONES, label=None, ticks=None,
               sublabel=None, sublabel_color="currentColor") -> str:
     """Halve-cirkelmeter. `value` (0-100) = stand van de naald, `zones` in
@@ -869,9 +873,18 @@ def render_gauge(fetch_fn, title: str, fout_prefix: str):
     """Fear & Greed-gauge; bij een fout 'n.v.t.' plus melding."""
     try:
         fng = fetch_fn()
-        st.markdown(gauge_svg(fng["waarde"], title), unsafe_allow_html=True)
-        st.caption(f"Sentiment vandaag: {str(fng['classificatie']).capitalize()}. "
-                   "0 = extreme angst, 100 = extreme hebzucht.")
+        waarde = fng["waarde"]
+        # zone volgens de bron zelf (CNN: "extreme greed", alternative.me: "Extreme Greed"),
+        # met de kleur uit de meter; anders bepaald op basis van de waarde
+        kleuren = {n.lower(): (n, c) for _, _, n, c in ZONES}
+        naam, kleur = kleuren.get(
+            str(fng.get("classificatie", "")).strip().lower(),
+            next(((n, c) for lo, hi, n, c in ZONES if waarde < hi), ZONES[-1][2:]),
+        )
+        st.markdown(
+            gauge_svg(waarde, title, sublabel=naam, sublabel_color=FNG_TEKSTKLEUREN.get(naam, kleur)),
+            unsafe_allow_html=True,
+        )
     except Exception as e:  # noqa: BLE001
         st.markdown(gauge_svg(None, title), unsafe_allow_html=True)
         st.caption(f"{fout_prefix}: {e}")
