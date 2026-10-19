@@ -72,7 +72,12 @@ EXT_MAX_AGE = pd.Timedelta(minutes=60)  # oudere voor-/nabeurskoers = niet meer 
 
 FX_TICKER = "EURUSD=X"  # euro/dollar-wisselkoers (dollars per euro) voor het omrekenen
 
-BAR_CAP_PCT = 50  # balk is "vol" bij ±50% afstand tot de MA
+BAR_CAP_PCT = 50
+
+# Marktthermometer: afstand tot de 200-weeks MA van een graadmeter,
+# vergeleken met de eigen geschiedenis van die graadmeter.
+THERMO_TICKERS = {"aandelen": "VWRL.AS", "crypto": "BTC-USD"}
+THERMO_MA_WEKEN = 200  # balk is "vol" bij ±50% afstand tot de MA
 
 st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="wide")
 
@@ -217,6 +222,44 @@ def fetch_daily_closes(ticker: str) -> pd.Series:
     if closes.index.tz is not None:
         closes.index = closes.index.tz_localize(None)
     return closes
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_weekly_max(ticker: str) -> pd.Series:
+    """Weekslotkoersen over de hele beschikbare historie (voor de thermometer)."""
+    hist = yf.Ticker(ticker).history(period="max", interval="1d", auto_adjust=True)
+    if hist.empty:
+        raise ValueError("geen historie")
+    closes = hist["Close"].dropna()
+    if closes.index.tz is not None:
+        closes.index = closes.index.tz_localize(None)
+    return closes.resample("W").last().dropna()
+
+
+def thermometer(ticker: str, live_price=None) -> dict:
+    """Hoe ver staat de koers boven/onder de 200w-MA, en hoe uitzonderlijk is dat?
+
+    1. Voor elke afgelopen week: afstand = slotkoers / 200w-MA van dat moment - 1.
+    2. Nu: afstand = actuele koers / huidige 200w-MA - 1.
+    3. Percentiel = in hoeveel procent van alle afgelopen weken de afstand
+       lager of gelijk was aan nu. 90 betekent: hoger dan in 90% van de weken."""
+    weekly = fetch_weekly_max(ticker)
+    ma = weekly.rolling(THERMO_MA_WEKEN).mean()
+    afstand = (weekly / ma - 1).dropna() * 100
+    if len(afstand) < 20:
+        raise ValueError("te weinig historie voor een 200w-MA")
+    # de lopende week telt niet mee als 'verleden'
+    verleden = afstand.iloc[:-1]
+    prijs = live_price if live_price is not None else float(weekly.iloc[-1])
+    nu = (prijs / float(ma.iloc[-1]) - 1) * 100
+    return {
+        "afstand": nu,
+        "percentiel": float((verleden <= nu).mean() * 100),
+        "laagste": (float(verleden.min()), verleden.idxmin()),
+        "hoogste": (float(verleden.max()), verleden.idxmax()),
+        "sinds": verleden.index[0],
+        "weken": len(verleden),
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -439,11 +482,23 @@ def _polar(cx, cy, r, value):
     return cx + r * math.cos(angle), cy - r * math.sin(angle)
 
 
-def gauge_svg(value, title: str) -> str:
+# Thermometer: links = laag t.o.v. de eigen historie (goedkoop), rechts = oververhit.
+# Kleuren andersom dan Fear & Greed, zodat groen = aantrekkelijk instapmoment.
+THERMO_ZONES = [
+    (0, 10, "Zeer laag", "#2e9e58"),
+    (10, 35, "Laag", "#9acd5c"),
+    (35, 65, "Normaal", "#e9c440"),
+    (65, 90, "Hoog", "#ee8a35"),
+    (90, 100, "Oververhit", "#d64545"),
+]
+
+
+def gauge_svg(value, title: str, zones=ZONES, label=None) -> str:
+    """Halve-cirkelmeter. `value` (0-100) bepaalt de naald, `label` de tekst eronder."""
     cx, cy, r, w = 110, 105, 85, 20
     gap = 0.8
     parts = []
-    for lo, hi, name, color in ZONES:
+    for lo, hi, name, color in zones:
         a0, a1 = lo + (gap if lo > 0 else 0), hi - (gap if hi < 100 else 0)
         x0, y0 = _polar(cx, cy, r, a0)
         x1, y1 = _polar(cx, cy, r, a1)
@@ -463,7 +518,7 @@ def gauge_svg(value, title: str) -> str:
             f'stroke="currentColor" stroke-width="3" stroke-linecap="round"/>'
         )
         parts.append(f'<circle cx="{cx}" cy="{cy}" r="5" fill="currentColor"/>')
-        label = f"{value}"
+        label = label if label is not None else f"{value}"
     else:
         label = "n.v.t."
     parts.append(
@@ -765,9 +820,46 @@ def render_gauge(fetch_fn, title: str, fout_prefix: str):
     try:
         fng = fetch_fn()
         st.markdown(gauge_svg(fng["waarde"], title), unsafe_allow_html=True)
+        st.caption(f"Sentiment vandaag: {str(fng['classificatie']).capitalize()}. "
+                   "0 = extreme angst, 100 = extreme hebzucht.")
     except Exception as e:  # noqa: BLE001
         st.markdown(gauge_svg(None, title), unsafe_allow_html=True)
         st.caption(f"{fout_prefix}: {e}")
+
+
+MAANDEN = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"]
+
+
+def _maand(ts) -> str:
+    return f"{MAANDEN[ts.month - 1]} {ts.year}"
+
+
+def _pct_nl(v: float, dec: int = 0) -> str:
+    return f"{v:+.{dec}f}%".replace(".", ",")
+
+
+def render_thermometer(ticker: str, ranking: pd.DataFrame):
+    """Afstand tot de 200w-MA, met de naald op het historische percentiel."""
+    naam = NAMES.get(ticker, ticker)
+    titel = f"{naam} t.o.v. 200w-MA"
+    # liefst de live prijs uit de ranglijst (als de ticker daarin staat)
+    live = ranking.loc[ranking["ticker"] == ticker, "prijs"]
+    try:
+        t = thermometer(ticker, float(live.iloc[0]) if not live.empty else None)
+    except Exception as e:  # noqa: BLE001
+        st.markdown(gauge_svg(None, titel, THERMO_ZONES), unsafe_allow_html=True)
+        st.caption(f"Niet berekend: {e}")
+        return
+    st.markdown(
+        gauge_svg(round(t["percentiel"]), titel, THERMO_ZONES, label=_pct_nl(t["afstand"])),
+        unsafe_allow_html=True,
+    )
+    lo, lo_ts = t["laagste"]
+    hi, hi_ts = t["hoogste"]
+    st.caption(
+        f"Hoger dan in {t['percentiel']:.0f}% van de {t['weken']} weken sinds {_maand(t['sinds'])}. "
+        f"Laagste {_pct_nl(lo)} ({_maand(lo_ts)}), hoogste {_pct_nl(hi)} ({_maand(hi_ts)})."
+    )
 
 
 def render_live(tickers: list, weights: dict, soort: str):
@@ -794,12 +886,15 @@ def render_live(tickers: list, weights: dict, soort: str):
         render_gauge(cfg["fetch"], cfg["gauge"], cfg["fout"])
         return
 
-    # Bovenaan: sentiment links, stijgers/dalers rechts
-    g, m = st.columns([1, 3.6], gap="medium")
-    with g:
+    # Bovenaan: de twee graadmeters naast elkaar
+    g1, g2 = st.columns(2, gap="large")
+    with g1:
         render_gauge(cfg["fetch"], cfg["gauge"], cfg["fout"])
-    with m:
-        render_movers(ranking, crypto)
+    with g2:
+        render_thermometer(THERMO_TICKERS[soort], ranking)
+
+    st.divider()
+    render_movers(ranking, crypto)
 
     st.divider()
     st.subheader("Ranglijst")
