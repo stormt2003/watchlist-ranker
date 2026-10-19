@@ -342,6 +342,19 @@ def change_chip(label: str, pct) -> str:
     )
 
 
+def score_html(score: float) -> str:
+    """Grote score rechts op de kaart. Positief (onder de MA's) = groen."""
+    color = "#2e9e58" if score > 0 else "#d64545" if score < 0 else "inherit"
+    txt = f"{score:+.1f}".replace(".", ",")
+    return (
+        f'<div style="text-align:right;min-width:72px">'
+        f'<div style="font-size:1.7rem;font-weight:800;line-height:1.1;color:{color};'
+        f'font-variant-numeric:tabular-nums">{txt}</div>'
+        f'<div style="font-size:0.68rem;opacity:0.6;text-transform:uppercase;'
+        f'letter-spacing:0.05em">score</div></div>'
+    )
+
+
 def card_html(rank: int, row: pd.Series) -> str:
     crypto = is_crypto(row["ticker"])
     bars = "".join(ma_bar_html(k, row[f"%_vs_{k}"]) for k in DEFAULT_WEIGHTS)
@@ -350,8 +363,8 @@ def card_html(rank: int, row: pd.Series) -> str:
         for lbl, col in [("1u", "%_1u"), ("24u" if crypto else "dag", "%_24u"), ("7d", "%_7d")]
     )
     eur = row.get("prijs_eur")
-    eur_line = (
-        f'<div style="font-size:0.8rem;opacity:0.75">{format_price(eur, "EUR")}</div>'
+    eur_txt = (
+        f'{format_price(eur, "EUR")} · '
         if eur is not None and not pd.isna(eur) else ""
     )
     return (
@@ -360,12 +373,16 @@ def card_html(rank: int, row: pd.Series) -> str:
         f'<div style="display:flex;align-items:center;gap:10px">'
         f'<span style="opacity:0.6;width:18px">{rank}</span>'
         f"{badge_html(row['ticker'], crypto)}"
-        f'<div style="flex:1;min-width:0"><div style="font-weight:600">{row["ticker"]}</div>'
-        f'<div style="font-size:0.72rem;opacity:0.6">score {row["score"]:+.1f}, '
-        f'bijgewerkt {row["bijgewerkt"]}</div></div>'
-        f'<div style="text-align:right;font-variant-numeric:tabular-nums">'
-        f'<div style="font-weight:700;font-size:1.05rem">{format_price(row["prijs"], row["valuta"])}</div>'
-        f"{eur_line}</div>"
+        # ticker met de prijs ernaast
+        f'<div style="flex:1;min-width:0">'
+        f'<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
+        f'<span style="font-weight:600">{row["ticker"]}</span>'
+        f'<span style="font-weight:700;font-size:1.05rem;font-variant-numeric:tabular-nums">'
+        f'{format_price(row["prijs"], row["valuta"])}</span></div>'
+        f'<div style="font-size:0.72rem;opacity:0.6;font-variant-numeric:tabular-nums">'
+        f'{eur_txt}bijgewerkt {row["bijgewerkt"]}</div></div>'
+        # score groot, helemaal rechts
+        f'{score_html(row["score"])}'
         f"</div>"
         f'<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:0.78rem;margin:6px 0 4px 28px">'
         f"{chips}</div>"
