@@ -72,12 +72,50 @@ EXT_MAX_AGE = pd.Timedelta(minutes=60)  # oudere voor-/nabeurskoers = niet meer 
 
 FX_TICKER = "EURUSD=X"  # euro/dollar-wisselkoers (dollars per euro) voor het omrekenen
 
-BAR_CAP_PCT = 50
+BAR_CAP_PCT = 50  # balk is "vol" bij ±50% afstand tot de MA
 
-# Marktthermometer: afstand tot de 200-weeks MA van een graadmeter,
-# vergeleken met de eigen geschiedenis van die graadmeter.
-THERMO_TICKERS = {"aandelen": "VWRL.AS", "crypto": "BTC-USD"}
-THERMO_MA_WEKEN = 200  # balk is "vol" bij ±50% afstand tot de MA
+# ---------------------------------------------------------------------------
+# MARKTTHERMOMETER: waardering op basis van de afstand tot de 200-weeks MA
+# ---------------------------------------------------------------------------
+# Per zone: (tot en met dit % boven de 200w-MA, naam). Alles boven de laatste
+# grens valt in de laatste zone. "min"/"max" = bereik van de meter.
+# Pas de grenzen hier aan als de markt verandert (bv. minder BTC-uitschieters).
+THERMO_MA_WEKEN = 200
+THERMO = {
+    "aandelen": dict(
+        ticker="VWRL.AS", min=-10, max=60,
+        zones=[
+            (0, "Spotgoedkoop"),     # op of onder de 200w-MA
+            (10, "Zeer goedkoop"),
+            (20, "Goedkoop"),
+            (30, "Redelijk"),
+            (40, "Duur"),
+            (60, "Zeer duur"),       # en alles daarboven
+        ],
+    ),
+    "crypto": dict(
+        ticker="BTC-USD", min=-50, max=200,
+        zones=[
+            (0, "Zeer goedkoop"),    # op of onder de 200w-MA
+            (50, "Goedkoop"),
+            (100, "Redelijk"),
+            (150, "Duur"),
+            (200, "Zeer duur"),      # en alles daarboven
+        ],
+    ),
+}
+ZONE_KLEUREN = {
+    "Spotgoedkoop": "#1b7a43",
+    "Zeer goedkoop": "#2e9e58",
+    "Goedkoop": "#9acd5c",
+    "Redelijk": "#e9c440",
+    "Duur": "#ee8a35",
+    "Zeer duur": "#d64545",
+}
+# Donkerdere tint voor de zonenaam onder het getal (geel/lichtgroen is slecht leesbaar)
+ZONE_TEKSTKLEUREN = {"Goedkoop": "#5f9a2c", "Redelijk": "#b08a0c"}
+# Afbreken van lange namen in de meter
+ZONE_AFBREKEN = {"Spotgoedkoop": "Spot- goedkoop"}
 
 st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="wide")
 
@@ -237,29 +275,32 @@ def fetch_weekly_max(ticker: str) -> pd.Series:
 
 
 def thermometer(ticker: str, live_price=None) -> dict:
-    """Hoe ver staat de koers boven/onder de 200w-MA, en hoe uitzonderlijk is dat?
-
-    1. Voor elke afgelopen week: afstand = slotkoers / 200w-MA van dat moment - 1.
-    2. Nu: afstand = actuele koers / huidige 200w-MA - 1.
-    3. Percentiel = in hoeveel procent van alle afgelopen weken de afstand
-       lager of gelijk was aan nu. 90 betekent: hoger dan in 90% van de weken."""
+    """Afstand van de koers tot de 200w-MA, plus de historische uitersten als context."""
     weekly = fetch_weekly_max(ticker)
     ma = weekly.rolling(THERMO_MA_WEKEN).mean()
     afstand = (weekly / ma - 1).dropna() * 100
-    if len(afstand) < 20:
+    if afstand.empty:
         raise ValueError("te weinig historie voor een 200w-MA")
-    # de lopende week telt niet mee als 'verleden'
-    verleden = afstand.iloc[:-1]
+    verleden = afstand.iloc[:-1] if len(afstand) > 1 else afstand  # lopende week niet
     prijs = live_price if live_price is not None else float(weekly.iloc[-1])
-    nu = (prijs / float(ma.iloc[-1]) - 1) * 100
+    ma_nu = float(ma.iloc[-1])
     return {
-        "afstand": nu,
-        "percentiel": float((verleden <= nu).mean() * 100),
+        "afstand": (prijs / ma_nu - 1) * 100,
+        "ma": ma_nu,
         "laagste": (float(verleden.min()), verleden.idxmin()),
         "hoogste": (float(verleden.max()), verleden.idxmax()),
         "sinds": verleden.index[0],
-        "weken": len(verleden),
     }
+
+
+def thermo_zone(afstand: float, cfg: dict) -> tuple:
+    """(naam, ondergrens, bovengrens) van de zone waar de afstand in valt."""
+    onder = None
+    for tot, naam in cfg["zones"]:
+        if afstand <= tot:
+            return naam, onder, tot
+        onder = tot
+    return cfg["zones"][-1][1], cfg["zones"][-2][0], None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -482,19 +523,10 @@ def _polar(cx, cy, r, value):
     return cx + r * math.cos(angle), cy - r * math.sin(angle)
 
 
-# Thermometer: links = laag t.o.v. de eigen historie (goedkoop), rechts = oververhit.
-# Kleuren andersom dan Fear & Greed, zodat groen = aantrekkelijk instapmoment.
-THERMO_ZONES = [
-    (0, 10, "Zeer laag", "#2e9e58"),
-    (10, 35, "Laag", "#9acd5c"),
-    (35, 65, "Normaal", "#e9c440"),
-    (65, 90, "Hoog", "#ee8a35"),
-    (90, 100, "Oververhit", "#d64545"),
-]
-
-
-def gauge_svg(value, title: str, zones=ZONES, label=None) -> str:
-    """Halve-cirkelmeter. `value` (0-100) bepaalt de naald, `label` de tekst eronder."""
+def gauge_svg(value, title: str, zones=ZONES, label=None, ticks=None,
+              sublabel=None, sublabel_color="currentColor") -> str:
+    """Halve-cirkelmeter. `value` (0-100) = stand van de naald, `zones` in
+    dezelfde 0-100-schaal, `ticks` = [(positie, tekst)] langs de buitenkant."""
     cx, cy, r, w = 110, 105, 85, 20
     gap = 0.8
     parts = []
@@ -506,13 +538,25 @@ def gauge_svg(value, title: str, zones=ZONES, label=None) -> str:
             f'<path d="M{x0:.1f},{y0:.1f} A{r},{r} 0 0 1 {x1:.1f},{y1:.1f}" '
             f'stroke="{color}" stroke-width="{w}" fill="none"/>'
         )
-        tx, ty = _polar(cx, cy, r - w - 6, (lo + hi) / 2)
+        # naam binnen de boog, bij twee woorden op twee regels
+        tx, ty = _polar(cx, cy, r - w - 8, (lo + hi) / 2)
+        woorden = ZONE_AFBREKEN.get(name, name).split(" ", 1)
+        regels = "".join(
+            f'<tspan x="{tx:.1f}" dy="{0 if i == 0 else 6.5}">{wd}</tspan>'
+            for i, wd in enumerate(woorden)
+        )
         parts.append(
-            f'<text x="{tx:.1f}" y="{ty:.1f}" font-size="6.5" text-anchor="middle" '
-            f'fill="currentColor" opacity="0.7">{name}</text>'
+            f'<text x="{tx:.1f}" y="{ty - (3 if len(woorden) > 1 else 0):.1f}" font-size="6" '
+            f'text-anchor="middle" fill="currentColor" opacity="0.7">{regels}</text>'
+        )
+    for p, txt in ticks or []:
+        tx, ty = _polar(cx, cy, r + w / 2 + 7, p)
+        parts.append(
+            f'<text x="{tx:.1f}" y="{ty + 2:.1f}" font-size="6" text-anchor="middle" '
+            f'fill="currentColor" opacity="0.55">{txt}</text>'
         )
     if value is not None:
-        nx, ny = _polar(cx, cy, r - 4, value)
+        nx, ny = _polar(cx, cy, r - 4, max(0, min(100, value)))
         parts.append(
             f'<line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" '
             f'stroke="currentColor" stroke-width="3" stroke-linecap="round"/>'
@@ -525,10 +569,15 @@ def gauge_svg(value, title: str, zones=ZONES, label=None) -> str:
         f'<text x="{cx}" y="{cy + 22}" font-size="18" font-weight="600" '
         f'text-anchor="middle" fill="currentColor">{label}</text>'
     )
+    if sublabel:
+        parts.append(
+            f'<text x="{cx}" y="{cy + 36}" font-size="10" font-weight="700" '
+            f'text-anchor="middle" fill="{sublabel_color}">{sublabel}</text>'
+        )
     return (
         f'<div style="text-align:center">'
         f'<div style="font-size:0.9rem;opacity:0.8">{title}</div>'
-        f'<svg viewBox="0 0 220 135" style="width:100%;max-width:220px">'
+        f'<svg viewBox="0 -6 220 150" style="width:100%;max-width:240px">'
         f'{"".join(parts)}</svg></div>'
     )
 
@@ -838,27 +887,52 @@ def _pct_nl(v: float, dec: int = 0) -> str:
     return f"{v:+.{dec}f}%".replace(".", ",")
 
 
-def render_thermometer(ticker: str, ranking: pd.DataFrame):
-    """Afstand tot de 200w-MA, met de naald op het historische percentiel."""
-    naam = NAMES.get(ticker, ticker)
-    titel = f"{naam} t.o.v. 200w-MA"
-    # liefst de live prijs uit de ranglijst (als de ticker daarin staat)
+def render_thermometer(soort: str, ranking: pd.DataFrame):
+    """Waarderingsmeter: afstand tot de 200w-MA, ingedeeld in vaste zones (zie THERMO)."""
+    cfg = THERMO[soort]
+    ticker = cfg["ticker"]
+    titel = f"{NAMES.get(ticker, ticker)} t.o.v. 200w-MA"
+    lo_m, hi_m = cfg["min"], cfg["max"]
+
+    def pos(pct):  # % boven MA -> positie 0-100 op de meter
+        return (max(lo_m, min(hi_m, pct)) - lo_m) / (hi_m - lo_m) * 100
+
+    grenzen = [lo_m] + [tot for tot, _ in cfg["zones"]]
+    grenzen[-1] = hi_m
+    zones = [
+        (pos(grenzen[i]), pos(grenzen[i + 1]), naam, ZONE_KLEUREN.get(naam, "#999"))
+        for i, (_, naam) in enumerate(cfg["zones"])
+    ]
+    ticks = [(pos(g), f"{g:+d}%".replace("+0%", "0%")) for g in grenzen]
+
     live = ranking.loc[ranking["ticker"] == ticker, "prijs"]
     try:
         t = thermometer(ticker, float(live.iloc[0]) if not live.empty else None)
     except Exception as e:  # noqa: BLE001
-        st.markdown(gauge_svg(None, titel, THERMO_ZONES), unsafe_allow_html=True)
+        st.markdown(gauge_svg(None, titel, zones, ticks=ticks), unsafe_allow_html=True)
         st.caption(f"Niet berekend: {e}")
         return
+
+    naam, onder, boven = thermo_zone(t["afstand"], cfg)
     st.markdown(
-        gauge_svg(round(t["percentiel"]), titel, THERMO_ZONES, label=_pct_nl(t["afstand"])),
+        gauge_svg(pos(t["afstand"]), titel, zones, label=_pct_nl(t["afstand"]), ticks=ticks,
+                  sublabel=naam,
+                  sublabel_color=ZONE_TEKSTKLEUREN.get(naam, ZONE_KLEUREN.get(naam, "currentColor"))),
         unsafe_allow_html=True,
     )
+    if onder is None:
+        bereik = "op of onder de 200w-MA"
+    elif boven is None:
+        bereik = f"meer dan {onder}% erboven"
+    else:
+        bereik = f"{onder} tot {boven}% erboven"
     lo, lo_ts = t["laagste"]
     hi, hi_ts = t["hoogste"]
+    valuta = fetch_meta(ticker)["valuta"]
     st.caption(
-        f"Hoger dan in {t['percentiel']:.0f}% van de {t['weken']} weken sinds {_maand(t['sinds'])}. "
-        f"Laagste {_pct_nl(lo)} ({_maand(lo_ts)}), hoogste {_pct_nl(hi)} ({_maand(hi_ts)})."
+        f"200w-MA: {format_price(t['ma'], valuta)}. Zone {naam.lower()} = {bereik}. "
+        f"Sinds {_maand(t['sinds'])} varieerde de afstand van {_pct_nl(lo)} ({_maand(lo_ts)}) "
+        f"tot {_pct_nl(hi)} ({_maand(hi_ts)})."
     )
 
 
@@ -891,7 +965,7 @@ def render_live(tickers: list, weights: dict, soort: str):
     with g1:
         render_gauge(cfg["fetch"], cfg["gauge"], cfg["fout"])
     with g2:
-        render_thermometer(THERMO_TICKERS[soort], ranking)
+        render_thermometer(soort, ranking)
 
     st.divider()
     render_movers(ranking, crypto)
