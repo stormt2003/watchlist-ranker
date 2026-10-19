@@ -286,6 +286,7 @@ def thermometer(ticker: str, live_price=None) -> dict:
     ma_nu = float(ma.iloc[-1])
     return {
         "afstand": (prijs / ma_nu - 1) * 100,
+        "prijs": prijs,
         "ma": ma_nu,
         "laagste": (float(verleden.min()), verleden.idxmin()),
         "hoogste": (float(verleden.max()), verleden.idxmax()),
@@ -920,19 +921,10 @@ def render_thermometer(soort: str, ranking: pd.DataFrame):
                   sublabel_color=ZONE_TEKSTKLEUREN.get(naam, ZONE_KLEUREN.get(naam, "currentColor"))),
         unsafe_allow_html=True,
     )
-    if onder is None:
-        bereik = "op of onder de 200w-MA"
-    elif boven is None:
-        bereik = f"meer dan {onder}% erboven"
-    else:
-        bereik = f"{onder} tot {boven}% erboven"
-    lo, lo_ts = t["laagste"]
-    hi, hi_ts = t["hoogste"]
     valuta = fetch_meta(ticker)["valuta"]
     st.caption(
-        f"200w-MA: {format_price(t['ma'], valuta)}. Zone {naam.lower()} = {bereik}. "
-        f"Sinds {_maand(t['sinds'])} varieerde de afstand van {_pct_nl(lo)} ({_maand(lo_ts)}) "
-        f"tot {_pct_nl(hi)} ({_maand(hi_ts)})."
+        f"Koers {format_price(t['prijs'], valuta)}, "
+        f"200w-MA {format_price(t['ma'], valuta)}"
     )
 
 
