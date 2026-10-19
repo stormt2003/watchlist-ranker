@@ -952,7 +952,16 @@ def render_thermometer(soort: str, ranking: pd.DataFrame):
         koersen.append(format_price(tc["prijs"], cur))
         mas.append(format_price(tc["ma"], cur))
     if koersen:
-        st.caption(f"Koers {' / '.join(koersen)}  \n200w-MA {' / '.join(mas)}")
+        # Als HTML i.p.v. st.caption: Streamlit leest twee $-tekens in een
+        # bijschrift als een formule (ander lettertype/kleur). &#36; = $.
+        regels = [f"Koers {' / '.join(koersen)}", f"200w-MA {' / '.join(mas)}"]
+        st.markdown(
+            '<div style="text-align:center;font-size:0.85rem;opacity:0.6;line-height:1.5;'
+            'font-variant-numeric:tabular-nums">'
+            + "<br>".join(html.escape(r).replace("$", "&#36;") for r in regels)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_live(tickers: list, weights: dict, soort: str):
