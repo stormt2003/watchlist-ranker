@@ -77,6 +77,28 @@ def fetch_crypto_fear_greed() -> dict:
     return {"waarde": int(data["value"]), "classificatie": data["value_classification"]}
 
 
+CNN_FNG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+CNN_HEADERS = {
+    # CNN weigert verzoeken zonder browser-achtige headers
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stock_fear_greed() -> dict:
+    """CNN Fear & Greed (aandelen). Geen officiële API: dit is het JSON-endpoint
+    dat CNN's eigen pagina gebruikt. Kan zonder aankondiging veranderen."""
+    resp = requests.get(CNN_FNG_URL, headers=CNN_HEADERS, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()["fear_and_greed"]
+    return {"waarde": int(round(float(data["score"]))), "classificatie": data["rating"]}
+
+
 def is_crypto(ticker: str) -> bool:
     return ticker.upper().endswith(CRYPTO_SUFFIXES)
 
@@ -129,6 +151,16 @@ def compute_row(ticker: str, weights: dict) -> dict:
     week_ago = daily[daily.index.date <= last_date - timedelta(days=7)]
     ch_7d = _pct(price, float(week_ago.iloc[-1])) if not week_ago.empty else None
 
+    # Euro-prijs: echt het -EUR-handelspaar op Yahoo (bv. BTC-EUR), geen omrekening
+    price_eur = None
+    if crypto and currency != "EUR":
+        try:
+            eur_closes, _ = fetch_intraday(ticker.rsplit("-", 1)[0] + "-EUR")
+            if not eur_closes.empty:
+                price_eur = float(eur_closes.iloc[-1])
+        except Exception:  # noqa: BLE001
+            pass  # geen EUR-paar beschikbaar voor deze coin
+
     mas = {
         "20w": weekly.rolling(20).mean().iloc[-1],
         "50w": weekly.rolling(50).mean().iloc[-1],
@@ -150,6 +182,7 @@ def compute_row(ticker: str, weights: dict) -> dict:
         "%_1u": ch_1h,
         "%_24u": ch_24h,
         "%_7d": ch_7d,
+        "prijs_eur": price_eur,
         **{f"%_vs_{k}": p for k, p in pcts.items()},
         "score": round(score, 1),
     }
@@ -288,6 +321,11 @@ def card_html(rank: int, row: pd.Series) -> str:
         change_chip(lbl, row[col])
         for lbl, col in [("1u", "%_1u"), ("24u" if crypto else "dag", "%_24u"), ("7d", "%_7d")]
     )
+    eur = row.get("prijs_eur")
+    eur_line = (
+        f'<div style="font-size:0.8rem;opacity:0.75">{format_price(eur, "EUR")}</div>'
+        if eur is not None and not pd.isna(eur) else ""
+    )
     return (
         f'<div style="border:1px solid rgba(128,128,128,0.25);border-radius:10px;'
         f'padding:10px 12px;margin-bottom:10px">'
@@ -297,8 +335,9 @@ def card_html(rank: int, row: pd.Series) -> str:
         f'<div style="flex:1;min-width:0"><div style="font-weight:600">{row["ticker"]}</div>'
         f'<div style="font-size:0.72rem;opacity:0.6">score {row["score"]:+.1f}, '
         f'bijgewerkt {row["bijgewerkt"]}</div></div>'
-        f'<div style="font-weight:700;font-size:1.05rem;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</div>'
+        f'<div style="text-align:right;font-variant-numeric:tabular-nums">'
+        f'<div style="font-weight:700;font-size:1.05rem">{format_price(row["prijs"], row["valuta"])}</div>'
+        f"{eur_line}</div>"
         f"</div>"
         f'<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:0.78rem;margin:6px 0 4px 28px">'
         f"{chips}</div>"
@@ -335,8 +374,12 @@ try:
 except Exception as e:  # noqa: BLE001
     col1.markdown(gauge_svg(None, "Crypto Fear & Greed"), unsafe_allow_html=True)
     col1.caption(f"Niet opgehaald: {e}")
-col2.markdown(gauge_svg(None, "Aandelen Fear & Greed"), unsafe_allow_html=True)
-col2.caption("Nog niet gekoppeld (scraping nodig).")
+try:
+    sfng = fetch_stock_fear_greed()
+    col2.markdown(gauge_svg(sfng["waarde"], "Aandelen Fear & Greed"), unsafe_allow_html=True)
+except Exception as e:  # noqa: BLE001
+    col2.markdown(gauge_svg(None, "Aandelen Fear & Greed"), unsafe_allow_html=True)
+    col2.caption(f"CNN niet bereikbaar: {e}")
 
 # Ranglijst
 with st.spinner("Koersen ophalen…"):
