@@ -436,25 +436,31 @@ def mover_row_html(rank: int, row: pd.Series, pct: float) -> str:
     )
 
 
-def render_mover_list(titel: str, part: pd.DataFrame, col: str, leeg: str):
-    """Top 3 zichtbaar, de rest in een uitklapper."""
+def render_mover_list(titel: str, part: pd.DataFrame, col: str, leeg: str, alles: bool):
+    """Top 3, of met 'alles' de hele lijst als één doorlopende rij kaartjes."""
     st.markdown(f"**{titel}**")
     if part.empty:
         st.caption(leeg)
         return
     rows = [mover_row_html(i + 1, r, r[col]) for i, (_, r) in enumerate(part.iterrows())]
-    st.markdown("".join(rows[:MOVERS_TOP]), unsafe_allow_html=True)
-    if len(rows) > MOVERS_TOP:
-        with st.expander(f"Alle {len(rows)} tonen"):
-            st.markdown("".join(rows[MOVERS_TOP:]), unsafe_allow_html=True)
+    zichtbaar = rows if alles else rows[:MOVERS_TOP]
+    st.markdown("".join(zichtbaar), unsafe_allow_html=True)
+    if not alles and len(rows) > MOVERS_TOP:
+        st.caption(f"+ {len(rows) - MOVERS_TOP} meer")
 
 
 def render_movers(ranking: pd.DataFrame):
     st.subheader("Hardste stijgers & dalers")
-    periode = st.radio(
-        "Periode", list(MOVER_PERIODES), horizontal=True,
-        key="mover_periode", label_visibility="collapsed",
-    )
+    c1, c2 = st.columns([3, 1], vertical_alignment="center")
+    with c1:
+        periode = st.radio(
+            "Periode", list(MOVER_PERIODES), horizontal=True,
+            key="mover_periode", label_visibility="collapsed",
+        )
+    with c2:
+        # Een schakelaar i.p.v. een uitklapper: de lijst loopt zo gewoon door,
+        # en de stand blijft bewaard bij het automatisch verversen.
+        alles = st.toggle("Toon alle", key="mover_alles")
     col = MOVER_PERIODES[periode]
     if periode == "Dag":
         st.caption("Crypto: laatste 24 uur. Aandelen: t.o.v. de slotkoers van de vorige handelsdag.")
@@ -464,9 +470,11 @@ def render_movers(ranking: pd.DataFrame):
 
     left, right = st.columns(2, gap="large")
     with left:
-        render_mover_list(f"Stijgers ({periode})", stijgers, col, "Geen stijgers in deze periode.")
+        render_mover_list(f"Stijgers ({periode})", stijgers, col,
+                          "Geen stijgers in deze periode.", alles)
     with right:
-        render_mover_list(f"Dalers ({periode})", dalers, col, "Geen dalers in deze periode.")
+        render_mover_list(f"Dalers ({periode})", dalers, col,
+                          "Geen dalers in deze periode.", alles)
 
 
 # ---------------------------------------------------------------------------
