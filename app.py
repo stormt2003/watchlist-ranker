@@ -731,15 +731,21 @@ def ext_chip_html(row: pd.Series) -> str:
     )
 
 
-def title_html(row: pd.Series, size: str = "0.95rem", stacked: bool = False) -> str:
+def title_html(row: pd.Series, size: str = "0.95rem", stacked: bool = False, tag: str = "") -> str:
     """Naam als hoofdtekst, de ticker klein en gedempt erachter (of eronder)."""
     naam = html.escape(str(row.get("naam") or row["ticker"]))
     richting = "flex-direction:column;gap:0;line-height:1.2" if stacked else "align-items:baseline;gap:6px"
+    tag_html = (
+        f'<span style="font-size:0.62rem;padding:0 6px;border-radius:999px;white-space:nowrap;'
+        f'background:rgba(46,158,88,0.14);color:#2e9e58;font-weight:600">{tag}</span>'
+        if tag else ""
+    )
     return (
         f'<div style="display:flex;{richting};min-width:0">'
         f'<span style="font-weight:650;font-size:{size};white-space:nowrap;overflow:hidden;'
         f'text-overflow:ellipsis">{naam}</span>'
-        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap">{row["ticker"]}</span></div>'
+        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap">{row["ticker"]}</span>'
+        f"{tag_html}</div>"
     )
 
 
@@ -770,7 +776,7 @@ def score_html(score: float) -> str:
     )
 
 
-def card_html(rank: int, row: pd.Series) -> str:
+def card_html(rank: int, row: pd.Series, in_bezit: bool = False) -> str:
     crypto = is_crypto(row["ticker"])
     bars = "".join(ma_bar_html(k, row[f"%_vs_{k}"]) for k in DEFAULT_WEIGHTS)
     chips = "".join(
@@ -787,7 +793,7 @@ def card_html(rank: int, row: pd.Series) -> str:
         # kop: rang, naam (ticker klein), score rechts
         f'<div style="display:flex;align-items:center;gap:8px">'
         f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rank}</span>'
-        f'<div style="flex:1;min-width:0">{title_html(row)}'
+        f'<div style="flex:1;min-width:0">{title_html(row, tag="in bezit" if in_bezit else "")}'
         # prijs met euro-prijs en eventueel voor-/nabeurs ernaast
         f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:1px">'
         f'<span style="font-weight:700;font-size:0.92rem;font-variant-numeric:tabular-nums">'
@@ -803,6 +809,42 @@ def card_html(rank: int, row: pd.Series) -> str:
     )
 
 
+def holding_card_html(row: pd.Series) -> str:
+    """Kaartje voor een positie in de portefeuille: prijs en koersverloop, geen score."""
+    crypto = is_crypto(row["ticker"])
+    dag = row["%_24u"]
+    if dag is None or pd.isna(dag):
+        dag_txt, kleur = "–", "inherit"
+    else:
+        dag_txt = f"{dag:+.2f}%".replace(".", ",")
+        kleur = "#2e9e58" if dag >= 0 else "#d64545"
+    chips = "".join(
+        change_chip(lbl, row[col]) for lbl, col in [("1u", "%_1u"), ("7d", "%_7d"), ("30d", "%_30d")]
+    )
+    andere = "".join(
+        f'<span style="font-size:0.8rem;opacity:0.6;font-variant-numeric:tabular-nums">{p}</span>'
+        for p in other_prices(row)
+    )
+    return (
+        f'<div style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;'
+        f'padding:7px 10px 6px;margin-bottom:6px">'
+        f'<div style="display:flex;align-items:center;gap:8px">'
+        f'<div style="flex:1;min-width:0">{title_html(row)}'
+        f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:1px">'
+        f'<span style="font-weight:700;font-size:0.92rem;font-variant-numeric:tabular-nums">'
+        f'{format_price(row["prijs"], row["valuta"])}</span>{andere}{ext_chip_html(row)}</div></div>'
+        # dagverandering groot rechts
+        f'<div style="text-align:right;flex-shrink:0;line-height:1">'
+        f'<div style="font-size:1.2rem;font-weight:800;color:{kleur};font-variant-numeric:tabular-nums">{dag_txt}</div>'
+        f'<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">{"24u" if crypto else "dag"}</div></div>'
+        f"</div>"
+        f'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;font-size:0.72rem;'
+        f'margin-top:5px">{chips}'
+        f'<span style="margin-left:auto;opacity:0.45;font-variant-numeric:tabular-nums">'
+        f'{row["bijgewerkt"]}</span></div></div>'
+    )
+
+
 # Per soort een eigen label voor de korte periode: crypto handelt 24/7,
 # aandelen vergelijken we met de vorige slotkoers.
 MOVER_PERIODES = {
@@ -812,10 +854,21 @@ MOVER_PERIODES = {
 MOVERS_TOP = 3
 
 
-def mover_row_html(rank: int, row: pd.Series, pct: float) -> str:
-    """Compacte regel: rang, naam (ticker klein), prijs en percentage rechts."""
+def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False) -> str:
+    """Compacte regel: rang, naam (ticker klein), prijs en percentage rechts.
+    Met `toon_ext` staat een actieve voor-/nabeursbeweging los onder het percentage."""
     color = "#2e9e58" if pct >= 0 else "#d64545"
     pct_txt = f"{pct:+.2f}%".replace(".", ",")
+    ext_html = ""
+    sessie, e = row.get("ext_sessie"), row.get("%_ext")
+    if toon_ext and isinstance(sessie, str) and e is not None and pd.notna(e):
+        e_kleur = "#2e9e58" if e >= 0 else "#d64545"
+        naam = "voorbeurs" if sessie == "pre" else "nabeurs"
+        ext_html = (
+            f'<div style="font-size:0.68rem;white-space:nowrap;font-variant-numeric:tabular-nums">'
+            f'<span style="opacity:0.55">{naam} </span>'
+            f'<span style="color:{e_kleur};font-weight:600">{f"{e:+.2f}%".replace(".", ",")}</span></div>'
+        )
     return (
         f'<div style="display:flex;align-items:center;gap:8px;padding:5px 9px;'
         f'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px">'
@@ -826,8 +879,9 @@ def mover_row_html(rank: int, row: pd.Series, pct: float) -> str:
         f'<div style="opacity:0.8;font-size:0.8rem">{format_price(row["prijs"], row["valuta"])}</div>'
         + "".join(f'<div style="opacity:0.5;font-size:0.7rem">{p}</div>' for p in other_prices(row))
         + '</div>'
-        f'<span style="font-weight:800;font-size:0.95rem;min-width:64px;text-align:right;color:{color};'
-        f'font-variant-numeric:tabular-nums">{pct_txt}</span></div>'
+        f'<div style="min-width:64px;text-align:right;line-height:1.15">'
+        f'<div style="font-weight:800;font-size:0.95rem;color:{color};'
+        f'font-variant-numeric:tabular-nums">{pct_txt}</div>{ext_html}</div></div>'
     )
 
 
@@ -837,7 +891,8 @@ def render_mover_list(titel: str, part: pd.DataFrame, col: str, leeg: str, alles
     if part.empty:
         st.caption(leeg)
         return
-    rows = [mover_row_html(i + 1, r, r[col]) for i, (_, r) in enumerate(part.iterrows())]
+    rows = [mover_row_html(i + 1, r, r[col], toon_ext=(col == "%_24u"))
+            for i, (_, r) in enumerate(part.iterrows())]
     zichtbaar = rows if alles else rows[:MOVERS_TOP]
     st.markdown("".join(zichtbaar), unsafe_allow_html=True)
     if not alles and len(rows) > MOVERS_TOP:
@@ -860,7 +915,9 @@ def render_movers(ranking: pd.DataFrame, crypto: bool):
         alles = st.toggle("Toon alle", key="mover_alles")
     col = perioden[periode]
     if col == "%_24u":
-        st.caption("Laatste 24 uur." if crypto else "T.o.v. de slotkoers van de vorige handelsdag.")
+        st.caption("Laatste 24 uur." if crypto else
+                   "Reguliere handel t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (VS) "
+                   "staat die beweging er los onder.")
     data = ranking.dropna(subset=[col])
     stijgers = data[data[col] > 0].sort_values(col, ascending=False)
     dalers = data[data[col] < 0].sort_values(col, ascending=True)
@@ -885,20 +942,39 @@ SOORTEN = {
                    gauge="Crypto Fear & Greed", fout="Niet opgehaald"),
 }
 
+def parse_tickers(text: str) -> list:
+    """Eén ticker per regel (komma's mogen ook), hoofdletters, zonder dubbele."""
+    return list(dict.fromkeys(
+        t.strip().upper() for t in text.replace(",", "\n").splitlines() if t.strip()
+    ))
+
+
 with st.sidebar:
-    st.header("Instellingen")
-    tickers_text = st.text_area(
-        "Tickers (één per regel)", "\n".join(DEFAULT_TICKERS), height=200
+    st.header("Tickers")
+    port_text = st.text_area(
+        "Mijn portefeuille", "\n".join(DEFAULT_TICKERS), height=190, key="port_tickers",
+        help="Wat je nu bezit. Eén ticker per regel; crypto in yfinance-formaat, bv. BTC-USD.",
     )
+    wl_text = st.text_area(
+        "Watchlist (extra)", "", height=120, key="wl_tickers",
+        placeholder="bv.\nNVDA\nASML.AS\nLINK-USD",
+        help="Tickers die je volgt maar niet bezit.",
+    )
+    portefeuille = parse_tickers(port_text)
+    extra_ingevuld = parse_tickers(wl_text)
+    dubbel = [t for t in extra_ingevuld if t in portefeuille]
+    extra = [t for t in extra_ingevuld if t not in portefeuille]
     st.caption(
-        "Tickers worden automatisch ingedeeld als aandeel/ETF of crypto, "
-        "op basis van wat Yahoo Finance over de ticker zegt. Crypto in "
-        "yfinance-formaat, bv. BTC-USD."
+        "Je portefeuille staat automatisch ook in de watchlist, dus die hoef je "
+        "daar niet nog eens in te vullen. Aandelen en crypto worden automatisch herkend."
     )
-    st.subheader("Gewichten")
-    weights = {
-        k: st.slider(f"{k} MA", 0.0, 3.0, v, 0.25) for k, v in DEFAULT_WEIGHTS.items()
-    }
+    if dubbel:
+        st.caption(f"Al in je portefeuille, dus overgeslagen: {', '.join(dubbel)}")
+
+    with st.expander("Watchlist-score: gewichten"):
+        weights = {
+            k: st.slider(f"{k} MA", 0.0, 3.0, v, 0.25) for k, v in DEFAULT_WEIGHTS.items()
+        }
     st.subheader("Verversen")
     auto = st.toggle("Automatisch verversen", value=True)
     interval = st.select_slider(
@@ -907,33 +983,65 @@ with st.sidebar:
     if st.button("Nu verversen"):
         st.cache_data.clear()
 
-tickers = list(dict.fromkeys(t.strip().upper() for t in tickers_text.splitlines() if t.strip()))
-
+watchlist = portefeuille + extra
 with st.spinner("Tickers indelen…"):
-    indeling = {t: ("crypto" if is_crypto(t) else "aandelen") for t in tickers}
-per_soort = {k: [t for t in tickers if indeling[t] == k] for k in SOORTEN}
+    indeling = {t: ("crypto" if is_crypto(t) else "aandelen") for t in watchlist}
+
+
+def per_soort(tickers: list) -> dict:
+    return {k: [t for t in tickers if indeling[t] == k] for k in SOORTEN}
+
+
+port_per_soort = per_soort(portefeuille)
+wl_per_soort = per_soort(watchlist)
+
+# Drie tabbladen. De portefeuille is per soort gesplitst; de watchlist
+# krijgt een eigen, kleinere schakelaar voor aandelen/crypto.
+WEERGAVEN = {
+    "port_aandelen": ("Mijn aandelen & ETF's", lambda: len(port_per_soort["aandelen"])),
+    "port_crypto": ("Mijn crypto", lambda: len(port_per_soort["crypto"])),
+    "watchlist": ("Watchlist", lambda: len(watchlist)),
+}
 
 st.title("Watchlist Ranker")
 
-# De grote schakelaar: alles hieronder (gauge, stijgers/dalers, scores,
-# tabel) gaat alleen over de gekozen soort.
 st.markdown(
     """<style>
-    .st-key-soort button { min-height: 3rem; font-size: 1.05rem; font-weight: 600; }
-    .st-key-soort button p { font-size: 1.05rem; }
+    .st-key-weergave button { min-height: 3rem; font-weight: 600; }
+    .st-key-weergave button p { font-size: 1.05rem; }
     </style>""",
     unsafe_allow_html=True,
 )
-soort_kwargs = dict(
-    label="Soort", options=list(SOORTEN), default="aandelen", required=True,
-    key="soort", label_visibility="collapsed",
-    format_func=lambda k: f"{SOORTEN[k]['titel']}  ({len(per_soort[k])})",
+
+
+def schakelaar(key: str, opties: dict, default: str):
+    """Segmented control over de volle breedte (met terugval voor oudere Streamlit)."""
+    kwargs = dict(
+        label=key, options=list(opties), default=default, required=True, key=key,
+        label_visibility="collapsed", format_func=lambda k: opties[k],
+    )
+    try:
+        keuze = st.segmented_control(**kwargs, width="stretch")
+    except TypeError:
+        keuze = st.segmented_control(**kwargs)
+    return keuze or default
+
+
+weergave = schakelaar(
+    "weergave", {k: f"{titel}  ({n()})" for k, (titel, n) in WEERGAVEN.items()}, "port_aandelen"
 )
-try:
-    soort = st.segmented_control(**soort_kwargs, width="stretch")
-except TypeError:  # oudere Streamlit zonder width-parameter
-    soort = st.segmented_control(**soort_kwargs)
-soort = soort or "aandelen"
+if weergave == "watchlist":
+    modus = "watchlist"
+    soort = schakelaar(
+        "wl_soort",
+        {k: f"{SOORTEN[k]['titel']}  ({len(wl_per_soort[k])})" for k in SOORTEN},
+        "aandelen",
+    )
+    lijst = wl_per_soort[soort]
+else:
+    modus = "portefeuille"
+    soort = "aandelen" if weergave == "port_aandelen" else "crypto"
+    lijst = port_per_soort[soort]
 
 
 def render_gauge(fetch_fn, title: str, fout_prefix: str):
@@ -1032,15 +1140,16 @@ def render_thermometer(soort: str, ranking: pd.DataFrame):
         )
 
 
-def render_live(tickers: list, weights: dict, soort: str):
-    """Alles wat live ververst, voor één soort: gauge, stijgers/dalers en ranglijst."""
+def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: tuple):
+    """Alles wat live ververst, voor één soort en één modus (portefeuille of watchlist)."""
     cfg = SOORTEN[soort]
     crypto = cfg["crypto"]
     now = pd.Timestamp.now(tz="Europe/Amsterdam").strftime("%H:%M:%S")
     st.caption(f"Laatst ververst om {now}")
 
     if not tickers:
-        st.info(f"Er staan geen {cfg['titel'].lower()} in je lijst. Voeg tickers toe in de zijbalk.")
+        waar = "je portefeuille" if modus == "portefeuille" else "je watchlist"
+        st.info(f"Er staan geen {cfg['titel'].lower()} in {waar}. Voeg tickers toe in de zijbalk.")
         return
 
     ranking, errors = build_ranking(tickers, weights)
@@ -1065,28 +1174,36 @@ def render_live(tickers: list, weights: dict, soort: str):
 
     st.divider()
     render_movers(ranking, crypto)
-
     st.divider()
-    st.subheader("Ranglijst")
-    uitleg = ("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. 1u toont – als er niet gehandeld wordt. "
-              "≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
-    if not crypto:
-        uitleg += (" 'Dag' is de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) "
-                   "staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
-    st.caption(uitleg)
-    # Kaartjes in een raster dat zich aanpast aan de schermbreedte
-    st.markdown(
-        '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));'
-        'column-gap:10px">'
-        + "".join(card_html(i + 1, row) for i, row in ranking.iterrows())
-        + "</div>",
-        unsafe_allow_html=True,
-    )
+
+    raster = ('<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));'
+              'column-gap:10px">{}</div>')
+    if modus == "portefeuille":
+        st.subheader("Mijn posities")
+        st.caption("≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
+        posities = ranking.sort_values("naam", key=lambda s: s.str.lower())
+        st.markdown(raster.format("".join(holding_card_html(r) for _, r in posities.iterrows())),
+                    unsafe_allow_html=True)
+    else:
+        st.subheader("Ranglijst")
+        uitleg = ("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. "
+                  "1u toont – als er niet gehandeld wordt. "
+                  "≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
+        if not crypto:
+            uitleg += (" 'Dag' is de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) "
+                       "staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
+        st.caption(uitleg)
+        st.markdown(
+            raster.format("".join(card_html(i + 1, r, r["ticker"] in in_bezit) for i, r in ranking.iterrows())),
+            unsafe_allow_html=True,
+        )
 
     with st.expander("Ruwe tabel"):
         st.dataframe(ranking, width="stretch", hide_index=True)
 
 
 # Fragment: alleen dit deel draait opnieuw, om de `interval` seconden.
-# Alleen de tickers van de gekozen soort worden opgehaald.
-st.fragment(run_every=interval if auto else None)(render_live)(per_soort[soort], weights, soort)
+# Alleen de tickers van het gekozen tabblad worden opgehaald.
+st.fragment(run_every=interval if auto else None)(render_live)(
+    lijst, weights, soort, modus, tuple(portefeuille)
+)
