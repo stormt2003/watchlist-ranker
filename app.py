@@ -13,13 +13,20 @@ Lokaal draaien:
 import html
 import math
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+
+try:  # om threads aan de Streamlit-sessie te koppelen (voorkomt waarschuwingen)
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except ImportError:  # pragma: no cover
+    add_script_run_ctx = get_script_run_ctx = None
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -46,7 +53,41 @@ DEFAULT_WATCHLIST = [
     "0700.HK", "XOM", "MA", "JNJ",
     # Uit je TradingView-lijst
     "ASM.AS", "HIMS", "LMND", "CRM", "AMD", "NOW", "PLTR", "LTC-USD",
+    # AI, chips & datacenters
+    "000660.KS", "005930.KS", "8035.T", "6857.T", "AMAT", "LRCX", "ANET", "VRT", "SU.PA", "MOD",
+    # Kernenergie & stroom voor AI
+    "CEG", "VST", "GEV", "CCJ", "ENR.DE", "RR.L", "OKLO", "SMR",
+    # Quantum, ruimtevaart, drones & robotica
+    "IONQ", "RGTI", "QBTS", "RKLB", "ASTS", "RHM.DE", "AVAV", "SYM", "ISRG", "JOBY",
 ]
+
+# Sector- en thema-ETF's: altijd bovenaan de stijgers & dalers in de watchlist
+# (aandelen). Amerikaanse fondsen: ideaal om te volgen, voor NL-beleggers vaak
+# niet te koop (daar bestaan Europese varianten van).
+SECTOR_ETFS = [
+    # (ticker, naam, uitleg)
+    ("SPY", "S&P 500", "De 500 grootste Amerikaanse bedrijven. Dé graadmeter voor de Amerikaanse beurs; vergelijk de sectoren hiermee."),
+    ("QQQ", "Nasdaq 100", "De 100 grootste niet-financiële bedrijven op de Nasdaq, vooral tech. Laat zien hoe het met de groeiaandelen gaat."),
+    ("XLK", "Technologie", "Software, hardware en chips, zoals Apple, Microsoft en NVIDIA."),
+    ("XLC", "Communicatie", "Internet, media en telecom, zoals Meta, Alphabet en Netflix."),
+    ("XLY", "Luxe consumptie", "Wat mensen kopen als het goed gaat: Amazon, Tesla, McDonald's, Nike. Stijgt vaak als consumenten vertrouwen hebben."),
+    ("XLP", "Basisconsumptie", "Dagelijkse benodigdheden die altijd verkocht worden: Procter & Gamble, Coca-Cola, Costco. Defensief: doet het relatief goed als de markt bang is."),
+    ("XLE", "Energie", "Olie- en gasbedrijven, zoals ExxonMobil en Chevron. Beweegt sterk mee met de olieprijs."),
+    ("XLF", "Financials", "Banken, verzekeraars en betaalbedrijven, zoals Berkshire Hathaway, JPMorgan en Visa."),
+    ("XLV", "Gezondheidszorg", "Farmacie, biotech, medische apparatuur en zorgverzekeraars, zoals Eli Lilly en Johnson & Johnson."),
+    ("XLI", "Industrie", "Luchtvaart, defensie, machines en transport, zoals GE Aerospace, Caterpillar en Uber."),
+    ("XLB", "Grondstoffen", "Chemie, metalen, mijnbouw en verpakkingen, zoals Linde."),
+    ("XLU", "Nutsbedrijven", "Stroom-, gas- en waterbedrijven. Normaal defensief, maar door de stroomhonger van AI-datacenters ook een AI-speler."),
+    ("XLRE", "Vastgoed", "Vastgoedfondsen: kantoren, winkels, woningen, maar ook datacenters en zendmasten. Gevoelig voor de rente."),
+    ("SMH", "Halfgeleiders", "De grootste chipbedrijven ter wereld, zoals NVIDIA, TSMC, Broadcom en ASML. Dé AI-chip-graadmeter."),
+    ("URA", "Uranium & kernenergie", "Uraniummijnen en kernenergiebedrijven, zoals Cameco. Profiteert van de vraag naar kernstroom voor AI."),
+    ("QTUM", "Quantum & AI", "Bedrijven in quantumcomputing en machine learning; breed gespreid, ook over grote techbedrijven."),
+    ("UFO", "Ruimtevaart", "Satellieten, raketten en ruimtevaartdiensten, zoals Rocket Lab en AST SpaceMobile."),
+    ("BOTZ", "Robotica & AI", "Robot- en automatiseringsbedrijven, zoals NVIDIA, ABB en Intuitive Surgical."),
+    ("ITA", "Defensie & luchtvaart", "Amerikaanse defensie- en luchtvaartbedrijven, zoals GE Aerospace, RTX en Boeing."),
+]
+SECTOR_TICKERS = [t for t, _, _ in SECTOR_ETFS]
+ETF_UITLEG = {t: u for t, _, u in SECTOR_ETFS}
 
 DEFAULT_WEIGHTS = {"20w": 1.0, "50w": 1.5, "200w": 2.0, "200d": 1.5}
 
@@ -103,7 +144,37 @@ NAMES = {
     "NOW": "ServiceNow",
     "PLTR": "Palantir",
     "LTC-USD": "Litecoin",
+    "000660.KS": "SK Hynix",
+    "005930.KS": "Samsung Electronics",
+    "8035.T": "Tokyo Electron",
+    "6857.T": "Advantest",
+    "AMAT": "Applied Materials",
+    "LRCX": "Lam Research",
+    "ANET": "Arista Networks",
+    "VRT": "Vertiv",
+    "SU.PA": "Schneider Electric",
+    "MOD": "Modine",
+    "CEG": "Constellation Energy",
+    "VST": "Vistra",
+    "GEV": "GE Vernova",
+    "CCJ": "Cameco",
+    "ENR.DE": "Siemens Energy",
+    "RR.L": "Rolls-Royce",
+    "OKLO": "Oklo",
+    "SMR": "NuScale Power",
+    "IONQ": "IonQ",
+    "RGTI": "Rigetti Computing",
+    "QBTS": "D-Wave Quantum",
+    "RKLB": "Rocket Lab",
+    "ASTS": "AST SpaceMobile",
+    "RHM.DE": "Rheinmetall",
+    "AVAV": "AeroVironment",
+    "SYM": "Symbotic",
+    "ISRG": "Intuitive Surgical",
+    "JOBY": "Joby Aviation",
 }
+
+NAMES.update({t: naam for t, naam, _ in SECTOR_ETFS})
 
 CRYPTO_SUFFIXES = ("-USD", "-EUR", "-USDT")
 
@@ -263,6 +334,26 @@ def us_session(ts: pd.Timestamp) -> str:
     if US_CLOSE <= m < US_POST_END:
         return "post"
     return "dicht"
+
+
+def vooraf_ophalen(fn, items, workers: int = 6):
+    """Roept een gecachte functie voor veel tickers tegelijk aan, zodat de cache
+    gevuld is. Fouten worden genegeerd: die komen later per ticker netjes terug."""
+    items = list(items)
+    if len(items) < 2:
+        return
+    ctx = get_script_run_ctx() if get_script_run_ctx else None
+
+    def taak(x):
+        if ctx is not None:
+            add_script_run_ctx(threading.current_thread(), ctx)
+        try:
+            fn(x)
+        except Exception:  # noqa: BLE001
+            pass
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(taak, items))
 
 
 def crypto_pair(ticker: str, valuta: str) -> str:
@@ -575,6 +666,7 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
 
 
 def build_ranking(tickers: list, weights: dict):
+    vooraf_ophalen(fetch_meta, tickers)
     # Alles in één verzoek: de tickers zelf, voor crypto het paar in de andere
     # valuta (BTC-EUR bij BTC-USD), en de wisselkoersen om de rest om te rekenen.
     batch = list(tickers)
@@ -591,6 +683,7 @@ def build_ranking(tickers: list, weights: dict):
     except Exception:  # noqa: BLE001
         intraday_map = {}  # val terug op dagdata
 
+    vooraf_ophalen(fetch_daily_closes, tickers)  # 5 jaar historie, gelijktijdig
     rows, errors = [], []
     for t in tickers:
         try:
@@ -914,11 +1007,18 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
             f'<span style="opacity:0.55">{naam} </span>'
             f'<span style="color:{e_kleur};font-weight:600">{f"{e:+.2f}%".replace(".", ",")}</span></div>'
         )
-    return (
-        f'<div style="display:flex;align-items:center;gap:8px;padding:5px 9px;'
-        f'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px">'
+    uitleg = ETF_UITLEG.get(row["ticker"])
+    info = (
+        '<span title="Klik voor uitleg" style="display:inline-flex;align-items:center;justify-content:center;'
+        'width:14px;height:14px;border-radius:50%;border:1px solid currentColor;font-size:0.6rem;'
+        'font-weight:700;opacity:0.5;margin-left:5px;flex-shrink:0;cursor:pointer">i</span>'
+        if uitleg else ""
+    )
+    regel = (
+        f'<div style="display:flex;align-items:center;gap:8px;padding:5px 9px">'
         f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rank}</span>'
-        f'<div style="flex:1;min-width:0">{title_html(row, "0.88rem", stacked=True)}</div>'
+        f'<div style="flex:1;min-width:0;display:flex;align-items:center">'
+        f'<div style="min-width:0">{title_html(row, "0.88rem", stacked=True)}</div>{info}</div>'
         # eigen valuta met de euro/dollar-prijs eronder
         f'<div style="text-align:right;line-height:1.2;white-space:nowrap;font-variant-numeric:tabular-nums">'
         f'<div style="opacity:0.8;font-size:0.8rem">{format_price(row["prijs"], row["valuta"])}</div>'
@@ -927,6 +1027,15 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
         f'<div style="min-width:64px;text-align:right;line-height:1.15">'
         f'<div style="font-weight:800;font-size:0.95rem;color:{color};'
         f'font-variant-numeric:tabular-nums">{pct_txt}</div>{ext_html}</div></div>'
+    )
+    kader = 'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px'
+    if not uitleg:
+        return f'<div style="{kader}">{regel}</div>'
+    # <details>: klik op de regel klapt de uitleg open, zonder JavaScript
+    return (
+        f'<details class="etf-info" style="{kader}"><summary style="list-style:none;cursor:pointer">{regel}</summary>'
+        f'<div style="padding:0 10px 7px 31px;font-size:0.78rem;opacity:0.75;line-height:1.4">'
+        f"{html.escape(uitleg)}</div></details>"
     )
 
 
@@ -939,12 +1048,29 @@ def render_mover_list(titel: str, part: pd.DataFrame, col: str, leeg: str, alles
     rows = [mover_row_html(i + 1, r, r[col], toon_ext=(col == "%_24u"))
             for i, (_, r) in enumerate(part.iterrows())]
     zichtbaar = rows if alles else rows[:MOVERS_TOP]
-    st.markdown("".join(zichtbaar), unsafe_allow_html=True)
+    stijl = "<style>details.etf-info summary::-webkit-details-marker{display:none}</style>"
+    st.markdown(stijl + "".join(zichtbaar), unsafe_allow_html=True)
     if not alles and len(rows) > MOVERS_TOP:
         st.caption(f"Nog {len(rows) - MOVERS_TOP} meer, zet 'Toon alle' aan om ze te zien.")
 
 
-def render_movers(ranking: pd.DataFrame, crypto: bool):
+def _mover_blok(data: pd.DataFrame, col: str, periode: str, alles: bool):
+    """Stijgers links, dalers rechts, gesorteerd op de gekozen periode."""
+    data = data.dropna(subset=[col])
+    stijgers = data[data[col] > 0].sort_values(col, ascending=False)
+    dalers = data[data[col] < 0].sort_values(col, ascending=True)
+    left, right = st.columns(2, gap="medium")
+    with left:
+        render_mover_list(f"Stijgers ({periode})", stijgers, col,
+                          "Geen stijgers in deze periode.", alles)
+    with right:
+        render_mover_list(f"Dalers ({periode})", dalers, col,
+                          "Geen dalers in deze periode.", alles)
+
+
+def render_movers(ranking: pd.DataFrame, crypto: bool, etfs=None):
+    """Hardste stijgers & dalers. Met `etfs` eerst een blok sector-/thema-ETF's,
+    daarna de rest; beide volgen dezelfde periodeknop en 'Toon alle'."""
     perioden = MOVER_PERIODES[crypto]
     st.subheader("Hardste stijgers & dalers")
     c1, c2 = st.columns([3, 1], vertical_alignment="center")
@@ -963,17 +1089,13 @@ def render_movers(ranking: pd.DataFrame, crypto: bool):
         st.caption("Laatste 24 uur." if crypto else
                    "Reguliere handel t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (VS) "
                    "staat die beweging er los onder.")
-    data = ranking.dropna(subset=[col])
-    stijgers = data[data[col] > 0].sort_values(col, ascending=False)
-    dalers = data[data[col] < 0].sort_values(col, ascending=True)
 
-    left, right = st.columns(2, gap="medium")
-    with left:
-        render_mover_list(f"Stijgers ({periode})", stijgers, col,
-                          "Geen stijgers in deze periode.", alles)
-    with right:
-        render_mover_list(f"Dalers ({periode})", dalers, col,
-                          "Geen dalers in deze periode.", alles)
+    if etfs is not None and not etfs.empty:
+        st.markdown("##### Sectoren & thema's")
+        st.caption("Amerikaanse sector- en thema-ETF's. Klik op een regel met ⓘ voor uitleg.")
+        _mover_blok(etfs, col, periode, alles)
+        st.markdown("##### Aandelen")
+    _mover_blok(ranking, col, periode, alles)
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1152,7 @@ with st.sidebar:
 
 watchlist = portefeuille + extra
 with st.spinner("Tickers indelen…"):
+    vooraf_ophalen(fetch_meta, watchlist)
     indeling = {t: ("crypto" if is_crypto(t) else "aandelen") for t in watchlist}
 
 
@@ -1197,7 +1320,13 @@ def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: 
         st.info(f"Er staan geen {cfg['titel'].lower()} in {waar}. Voeg tickers toe in de zijbalk.")
         return
 
-    ranking, errors = build_ranking(tickers, weights)
+    met_etfs = modus == "watchlist" and not crypto
+    alles_tickers = list(dict.fromkeys(tickers + (SECTOR_TICKERS if met_etfs else [])))
+    ranking, errors = build_ranking(alles_tickers, weights)
+    etfs = None
+    if met_etfs and not ranking.empty:
+        is_etf = ranking["ticker"].isin(SECTOR_TICKERS) & ~ranking["ticker"].isin(tickers)
+        etfs, ranking = ranking[is_etf], ranking[~is_etf].reset_index(drop=True)
 
     if errors:
         st.warning("Niet verwerkt:\n\n" + "\n\n".join(errors))
@@ -1218,7 +1347,7 @@ def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: 
         render_thermometer(soort, ranking)
 
     st.divider()
-    render_movers(ranking, crypto)
+    render_movers(ranking, crypto, etfs)
     st.divider()
 
     raster = ('<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));'
