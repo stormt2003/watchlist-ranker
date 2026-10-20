@@ -243,7 +243,7 @@ st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="wide
 # DATA
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=12, show_spinner=False)
 def fetch_intraday_batch(tickers: tuple) -> dict:
     """5-minuten-data voor ALLE tickers in één verzoek naar Yahoo.
     Zo blijft auto-verversen om de 10 sec beperkt tot 1 verzoek per keer,
@@ -252,7 +252,7 @@ def fetch_intraday_batch(tickers: tuple) -> dict:
     prepost=True: ook voor- en nabeurskoersen (VS); die worden in
     compute_row weer van de reguliere handel gescheiden."""
     df = yf.download(
-        list(tickers), period="5d", interval="5m", group_by="ticker",
+        list(tickers), period="2d", interval="5m", group_by="ticker",
         auto_adjust=True, prepost=True, progress=False, threads=True,
     )
     out = {}
@@ -543,9 +543,26 @@ def _at_or_before(series: pd.Series, ts):
     return float(s.iloc[-1]) if not s.empty else None
 
 
-def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
+@st.cache_data(ttl=900, show_spinner=False)
+def daily_stats(ticker: str) -> dict:
+    """Alles wat alleen van de dagdata afhangt (5 jaar historie, MA's), 15 min
+    bewaard. Scheelt bij elke verversing het opnieuw doorrekenen van de MA's."""
     daily = fetch_daily_closes(ticker)
     weekly = daily.resample("W").last().dropna()  # laatste bar = lopende week
+    return {
+        "daily": daily,
+        "mas": {
+            "20w": weekly.rolling(20).mean().iloc[-1],
+            "50w": weekly.rolling(50).mean().iloc[-1],
+            "200w": weekly.rolling(200).mean().iloc[-1],
+            "200d": daily.rolling(200).mean().iloc[-1],
+        },
+    }
+
+
+def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
+    stats = daily_stats(ticker)
+    daily = stats["daily"]
     crypto = is_crypto(ticker)
 
     meta = fetch_meta(ticker)
@@ -630,12 +647,7 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
             v = convert(price, currency, doel, intraday_map)
             omgerekend_prijzen[doel] = (v, v is not None)
 
-    mas = {
-        "20w": weekly.rolling(20).mean().iloc[-1],
-        "50w": weekly.rolling(50).mean().iloc[-1],
-        "200w": weekly.rolling(200).mean().iloc[-1],
-        "200d": daily.rolling(200).mean().iloc[-1],
-    }
+    mas = stats["mas"]
     pcts = {
         k: None if pd.isna(v) else round((price - float(v)) / float(v) * 100, 2)
         for k, v in mas.items()
@@ -683,7 +695,7 @@ def build_ranking(tickers: list, weights: dict):
     except Exception:  # noqa: BLE001
         intraday_map = {}  # val terug op dagdata
 
-    vooraf_ophalen(fetch_daily_closes, tickers)  # 5 jaar historie, gelijktijdig
+    vooraf_ophalen(daily_stats, tickers)  # 5 jaar historie + MA's, gelijktijdig
     rows, errors = [], []
     for t in tickers:
         try:
@@ -1145,7 +1157,13 @@ with st.sidebar:
     st.subheader("Verversen")
     auto = st.toggle("Automatisch verversen", value=True)
     interval = st.select_slider(
-        "Elke … seconden", options=[10, 30, 60], value=10, disabled=not auto
+        "Koersen en stijgers/dalers: elke … seconden", options=[15, 30, 60], value=15,
+        disabled=not auto,
+    )
+    rang_interval = st.select_slider(
+        "Watchlist-ranglijst: elke … seconden", options=[30, 60, 120], value=30,
+        disabled=not auto,
+        help="De ranglijst is het zwaarste deel van de pagina, dus die ververst rustiger.",
     )
     if st.button("Nu verversen"):
         st.cache_data.clear()
@@ -1308,8 +1326,30 @@ def render_thermometer(soort: str, ranking: pd.DataFrame):
         )
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def _ranking_cached(tickers: tuple, gewichten: tuple):
+    return build_ranking(list(tickers), dict(gewichten))
+
+
+def laad_ranking(tickers: list, weights: dict, met_etfs: bool):
+    """Koersen + berekening voor een lijst tickers, kort bewaard zodat het snelle
+    en het rustige deel van de pagina dezelfde data delen. Met `met_etfs` komen
+    de sector-ETF's mee en worden ze apart teruggegeven."""
+    alles = tuple(dict.fromkeys(list(tickers) + (SECTOR_TICKERS if met_etfs else [])))
+    ranking, errors = _ranking_cached(alles, tuple(sorted(weights.items())))
+    etfs = None
+    if met_etfs and not ranking.empty:
+        is_etf = ranking["ticker"].isin(SECTOR_TICKERS) & ~ranking["ticker"].isin(tickers)
+        etfs, ranking = ranking[is_etf], ranking[~is_etf].reset_index(drop=True)
+    return ranking, etfs, errors
+
+
+RASTER = ('<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));'
+          'column-gap:10px">{}</div>')
+
+
 def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: tuple):
-    """Alles wat live ververst, voor één soort en één modus (portefeuille of watchlist)."""
+    """Het snelle deel: graadmeters, stijgers/dalers en (portefeuille) de posities."""
     cfg = SOORTEN[soort]
     crypto = cfg["crypto"]
     now = pd.Timestamp.now(tz="Europe/Amsterdam").strftime("%H:%M:%S")
@@ -1320,13 +1360,7 @@ def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: 
         st.info(f"Er staan geen {cfg['titel'].lower()} in {waar}. Voeg tickers toe in de zijbalk.")
         return
 
-    met_etfs = modus == "watchlist" and not crypto
-    alles_tickers = list(dict.fromkeys(tickers + (SECTOR_TICKERS if met_etfs else [])))
-    ranking, errors = build_ranking(alles_tickers, weights)
-    etfs = None
-    if met_etfs and not ranking.empty:
-        is_etf = ranking["ticker"].isin(SECTOR_TICKERS) & ~ranking["ticker"].isin(tickers)
-        etfs, ranking = ranking[is_etf], ranking[~is_etf].reset_index(drop=True)
+    ranking, etfs, errors = laad_ranking(tickers, weights, modus == "watchlist" and not crypto)
 
     if errors:
         st.warning("Niet verwerkt:\n\n" + "\n\n".join(errors))
@@ -1348,36 +1382,51 @@ def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: 
 
     st.divider()
     render_movers(ranking, crypto, etfs)
-    st.divider()
 
-    raster = ('<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));'
-              'column-gap:10px">{}</div>')
     if modus == "portefeuille":
+        st.divider()
         st.subheader("Mijn posities")
         st.caption("≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
         posities = ranking.sort_values("naam", key=lambda s: s.str.lower())
-        st.markdown(raster.format("".join(holding_card_html(r) for _, r in posities.iterrows())),
+        st.markdown(RASTER.format("".join(holding_card_html(r) for _, r in posities.iterrows())),
                     unsafe_allow_html=True)
-    else:
-        st.subheader("Ranglijst")
-        uitleg = ("Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. "
-                  "1u toont – als er niet gehandeld wordt. "
-                  "≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
-        if not crypto:
-            uitleg += (" 'Dag' is de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) "
-                       "staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
-        st.caption(uitleg)
-        st.markdown(
-            raster.format("".join(card_html(i + 1, r, r["ticker"] in in_bezit) for i, r in ranking.iterrows())),
-            unsafe_allow_html=True,
-        )
+        with st.expander("Ruwe tabel"):
+            st.dataframe(ranking, width="stretch", hide_index=True)
 
+
+def render_ranglijst(tickers: list, weights: dict, soort: str, in_bezit: tuple, elke):
+    """Het rustige deel: de watchlist-ranglijst met scores (veel kaartjes)."""
+    if not tickers:
+        return
+    crypto = SOORTEN[soort]["crypto"]
+    ranking, _, _ = laad_ranking(tickers, weights, not crypto)
+    if ranking.empty:
+        return
+    st.divider()
+    st.subheader("Ranglijst")
+    now = pd.Timestamp.now(tz="Europe/Amsterdam").strftime("%H:%M:%S")
+    uitleg = (f"Bijgewerkt om {now}" + (f", ververst elke {elke} s. " if elke else ". ")
+              + "Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. "
+              "1u toont – als er niet gehandeld wordt. "
+              "≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
+    if not crypto:
+        uitleg += (" 'Dag' is de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) "
+                   "staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
+    st.caption(uitleg)
+    st.markdown(
+        RASTER.format("".join(card_html(i + 1, r, r["ticker"] in in_bezit) for i, r in ranking.iterrows())),
+        unsafe_allow_html=True,
+    )
     with st.expander("Ruwe tabel"):
         st.dataframe(ranking, width="stretch", hide_index=True)
 
 
-# Fragment: alleen dit deel draait opnieuw, om de `interval` seconden.
-# Alleen de tickers van het gekozen tabblad worden opgehaald.
+# Twee fragmenten die elk in hun eigen tempo verversen. Alleen de tickers van
+# het gekozen tabblad worden opgehaald.
 st.fragment(run_every=interval if auto else None)(render_live)(
     lijst, weights, soort, modus, tuple(portefeuille)
 )
+if modus == "watchlist":
+    st.fragment(run_every=rang_interval if auto else None)(render_ranglijst)(
+        lijst, weights, soort, tuple(portefeuille), rang_interval if auto else None
+    )
