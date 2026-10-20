@@ -912,7 +912,7 @@ def render_movers(ranking: pd.DataFrame, crypto: bool):
     with c2:
         # Een schakelaar i.p.v. een uitklapper: de lijst loopt zo gewoon door,
         # en de stand blijft bewaard bij het automatisch verversen.
-        alles = st.toggle("Toon alle", key="mover_alles")
+        alles = st.toggle("Toon alle", value=True, key="mover_alles")
     col = perioden[periode]
     if col == "%_24u":
         st.caption("Laatste 24 uur." if crypto else
