@@ -28,9 +28,24 @@ import yfinance as yf
 DEFAULT_TICKERS = [
     # Aandelen & ETF's
     "VWRL.AS", "AMZN", "ACHR", "BESI.AS", "BSX", "MU", "NFLX", "MSTR", "TSLA", "PATH",
+    "NBIS",
     # Crypto (Yahoo gebruikt bij naamconflicten een nummer, bv. HYPE32196-USD)
     "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "HYPE32196-USD",
     "NEAR-USD", "AAVE-USD", "ONDO-USD", "INJ-USD", "VIRTUAL-USD",
+]
+
+# Vaste watchlist bij het openen. Tickers die al in je portefeuille staan
+# (bv. AMZN, TSLA, BESI) hoeven hier niet: die komen er automatisch bij.
+DEFAULT_WATCHLIST = [
+    # Gevraagd
+    "ASML.AS", "NVDA", "BABA", "META",
+    # Rest van de 'Magnificent 7' (AMZN en TSLA zitten al in je portefeuille)
+    "AAPL", "MSFT", "GOOGL",
+    # Grootste bedrijven ter wereld naar beurswaarde (top 20)
+    "AVGO", "TSM", "BRK-B", "LLY", "WMT", "JPM", "2222.SR", "V", "ORCL",
+    "0700.HK", "XOM", "MA", "JNJ",
+    # Uit je TradingView-lijst
+    "ASM.AS", "HIMS", "LMND", "CRM", "AMD", "NOW", "PLTR", "LTC-USD",
 ]
 
 DEFAULT_WEIGHTS = {"20w": 1.0, "50w": 1.5, "200w": 2.0, "200d": 1.5}
@@ -48,6 +63,7 @@ NAMES = {
     "MSTR": "Strategy (MicroStrategy)",
     "TSLA": "Tesla",
     "PATH": "UiPath",
+    "NBIS": "Nebius Group",
     "BTC-USD": "Bitcoin",
     "ETH-USD": "Ethereum",
     "SOL-USD": "Solana",
@@ -58,6 +74,35 @@ NAMES = {
     "ONDO-USD": "Ondo",
     "INJ-USD": "Injective",
     "VIRTUAL-USD": "Virtuals Protocol",
+    # Watchlist
+    "ASML.AS": "ASML",
+    "NVDA": "NVIDIA",
+    "BABA": "Alibaba",
+    "META": "Meta Platforms",
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "GOOGL": "Alphabet (Google)",
+    "AVGO": "Broadcom",
+    "TSM": "TSMC",
+    "BRK-B": "Berkshire Hathaway",
+    "LLY": "Eli Lilly",
+    "WMT": "Walmart",
+    "JPM": "JPMorgan Chase",
+    "2222.SR": "Saudi Aramco",
+    "V": "Visa",
+    "ORCL": "Oracle",
+    "0700.HK": "Tencent",
+    "XOM": "ExxonMobil",
+    "MA": "Mastercard",
+    "JNJ": "Johnson & Johnson",
+    "ASM.AS": "ASM International",
+    "HIMS": "Hims & Hers Health",
+    "LMND": "Lemonade",
+    "CRM": "Salesforce",
+    "AMD": "AMD",
+    "NOW": "ServiceNow",
+    "PLTR": "Palantir",
+    "LTC-USD": "Litecoin",
 }
 
 CRYPTO_SUFFIXES = ("-USD", "-EUR", "-USDT")
@@ -956,7 +1001,7 @@ with st.sidebar:
         help="Wat je nu bezit. Eén ticker per regel; crypto in yfinance-formaat, bv. BTC-USD.",
     )
     wl_text = st.text_area(
-        "Watchlist (extra)", "", height=120, key="wl_tickers",
+        "Watchlist (extra)", "\n".join(DEFAULT_WATCHLIST), height=160, key="wl_tickers",
         placeholder="bv.\nNVDA\nASML.AS\nLINK-USD",
         help="Tickers die je volgt maar niet bezit.",
     )
