@@ -692,9 +692,16 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     # 1 uur: alleen zinvol als er nu gehandeld wordt
     ch_1h = _pct(price, _at_or_before(intraday, last_ts - pd.Timedelta(hours=1))) if live else None
 
-    # 24 uur: crypto echt 24u terug; aandelen t.o.v. slotkoers vorige handelsdag
+    # 24 uur: crypto echt 24u terug; aandelen t.o.v. slotkoers vorige handelsdag.
+    # Aandelen: alleen als er vandaag (kalenderdag op de beurs) al gehandeld is.
+    # Anders is het percentage van een vorige dag; dan tonen we alleen de prijs
+    # (de slotkoers) en eventueel de voorbeurs.
+    vandaag_beurs = now_utc.tz_convert(meta["tz"] or "Europe/Amsterdam").date()
+    dag_actueel = crypto or last_date == vandaag_beurs
     if crypto and last_ts is not None:
         ch_24h = _pct(price, _at_or_before(intraday, last_ts - pd.Timedelta(hours=24)))
+    elif not dag_actueel:
+        ch_24h = None
     else:
         prev = daily[daily.index.date < last_date]
         ch_24h = _pct(price, float(prev.iloc[-1])) if not prev.empty else None
@@ -721,6 +728,20 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
             v = convert(price, currency, doel, intraday_map)
             omgerekend_prijzen[doel] = (v, v is not None)
 
+    # Aandelen alleen in dollar of euro tonen. Andere valuta (pond, Zwitserse
+    # frank, Deense kroon, ...) -> hoofdprijs in dollar, euro als tweede.
+    # Percentages en MA-afstanden blijven in de eigen valuta (die gaan over het
+    # aandeel zelf, niet over de wisselkoers).
+    weergave_valuta, prijs_omgerekend = currency, False
+    weergave_prijs, weergave_ext = price, ext_prijs
+    if not crypto and currency not in ("USD", "EUR"):
+        usd = omgerekend_prijzen["USD"][0]
+        if usd is not None:
+            factor = usd / price if price else None
+            weergave_valuta, weergave_prijs, prijs_omgerekend = "USD", usd, True
+            if ext_prijs is not None and factor:
+                weergave_ext = ext_prijs * factor
+
     mas = stats["mas"]
     pcts = {
         k: None if pd.isna(v) else round((price - float(v)) / float(v) * 100, 2)
@@ -732,11 +753,14 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     return {
         "ticker": ticker,
         "naam": meta["naam"],
-        "prijs": price,
+        "prijs": weergave_prijs,
+        "prijs_omgerekend": prijs_omgerekend,
         "ext_sessie": ext_sessie,
-        "ext_prijs": ext_prijs,
+        "ext_prijs": weergave_ext,
         "%_ext": ext_pct,
-        "valuta": currency,
+        "valuta": weergave_valuta,
+        "eigen_valuta": currency,
+        "dag_actueel": dag_actueel,
         "bijgewerkt": updated,
         "%_1u": ch_1h,
         "%_24u": ch_24h,
@@ -924,20 +948,10 @@ def change_chip(label: str, pct) -> str:
     )
 
 
-def _bedrag_uit_pct(prijs, pct):
-    """Verandering in geld, terugrekend uit de huidige prijs en het percentage."""
-    if prijs is None or pct is None or pd.isna(prijs) or pd.isna(pct) or pct <= -100:
-        return None
-    return prijs - prijs / (1 + pct / 100)
-
-
-def verandering_txt(bedrag, pct, valuta: str) -> str:
-    """'+$26,49 (+3,72%)' in Nederlandse notatie; zonder bedrag alleen het percentage."""
-    pct_txt = f"{pct:+.2f}%".replace(".", ",")
-    if bedrag is None or pd.isna(bedrag):
-        return pct_txt
-    teken = "+" if bedrag >= 0 else "−"
-    return f"{teken}{format_price(abs(bedrag), valuta)} ({pct_txt})"
+def hoofdprijs(row: pd.Series, kolom: str = "prijs") -> str:
+    """Prijs in de weergavevaluta; '≈' als hij uit een andere valuta is omgerekend."""
+    approx = "≈ " if row.get("prijs_omgerekend") is True else ""
+    return approx + format_price(row[kolom], row["valuta"])
 
 
 EXT_LABELS = {
@@ -957,17 +971,16 @@ def ext_chip_html(row: pd.Series) -> str:
         pct_html = ""
     else:
         color = "#d64545" if pct < 0 else "#2e9e58"
-        bedrag = row["ext_prijs"] - row["prijs"]
         pct_html = (
             f'<span style="color:{color};font-weight:600">'
-            f'{verandering_txt(bedrag, pct, row["valuta"])}</span>'
+            f'{f"{pct:+.2f}%".replace(".", ",")}</span>'
         )
     return (
         f'<span title="{uitleg}" style="display:inline-flex;align-items:baseline;gap:5px;'
         f'padding:1px 8px;border-radius:999px;background:rgba(128,128,128,0.14);'
         f'font-size:0.74rem;font-variant-numeric:tabular-nums;white-space:nowrap">'
         f'<span style="opacity:0.65">{label}</span>'
-        f'<span style="opacity:0.85">{format_price(row["ext_prijs"], row["valuta"])}</span>'
+        f'<span style="opacity:0.85">{hoofdprijs(row, "ext_prijs")}</span>'
         f"{pct_html}</span>"
     )
 
@@ -1038,7 +1051,7 @@ def card_html(rank: int, row: pd.Series, in_bezit: bool = False) -> str:
         # prijs met euro-prijs en eventueel voor-/nabeurs ernaast
         f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:1px">'
         f'<span style="font-weight:700;font-size:0.92rem;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</span>{andere}{ext_chip_html(row)}</div></div>'
+        f'{hoofdprijs(row)}</span>{andere}{ext_chip_html(row)}</div></div>'
         f'{score_html(row["score"])}'
         f"</div>"
         # wijzigingen + tijdstip op één regel
@@ -1054,15 +1067,15 @@ def holding_card_html(row: pd.Series) -> str:
     """Kaartje voor een positie in de portefeuille: prijs en koersverloop, geen score."""
     crypto = is_crypto(row["ticker"])
     dag = row["%_24u"]
-    dag_bedrag = ""
-    if dag is None or pd.isna(dag):
+    dag_label = "24u" if crypto else "dag"
+    if not crypto and row.get("dag_actueel") is False:
+        # nog geen handel vandaag: geen (oud) percentage, alleen de slotkoers
+        dag_txt, kleur, dag_label = "–", "inherit", "beurs dicht"
+    elif dag is None or pd.isna(dag):
         dag_txt, kleur = "–", "inherit"
     else:
         dag_txt = f"{dag:+.2f}%".replace(".", ",")
         kleur = "#2e9e58" if dag >= 0 else "#d64545"
-        b = _bedrag_uit_pct(row["prijs"], dag)
-        if b is not None:
-            dag_bedrag = ("+" if b >= 0 else "−") + format_price(abs(b), row["valuta"])
     chips = "".join(
         change_chip(lbl, row[col]) for lbl, col in [("1u", "%_1u"), ("7d", "%_7d"), ("30d", "%_30d")]
     )
@@ -1077,13 +1090,11 @@ def holding_card_html(row: pd.Series) -> str:
         f'<div style="flex:1;min-width:0">{title_html(row)}'
         f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:1px">'
         f'<span style="font-weight:700;font-size:0.92rem;font-variant-numeric:tabular-nums">'
-        f'{format_price(row["prijs"], row["valuta"])}</span>{andere}{ext_chip_html(row)}</div></div>'
+        f'{hoofdprijs(row)}</span>{andere}{ext_chip_html(row)}</div></div>'
         # dagverandering groot rechts
         f'<div style="text-align:right;flex-shrink:0;line-height:1">'
         f'<div style="font-size:1.2rem;font-weight:800;color:{kleur};font-variant-numeric:tabular-nums">{dag_txt}</div>'
-        + (f'<div style="font-size:0.72rem;font-weight:600;color:{kleur};margin-top:2px;'
-           f'font-variant-numeric:tabular-nums">{dag_bedrag}</div>' if dag_bedrag else "")
-        + f'<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">{"24u" if crypto else "dag"}</div></div>'
+        f'<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">{dag_label}</div></div>'
         f"</div>"
         f'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;font-size:0.72rem;'
         f'margin-top:5px">{chips}'
@@ -1111,20 +1122,13 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
     if toon_ext and isinstance(sessie, str) and e is not None and pd.notna(e):
         e_kleur = "#2e9e58" if e >= 0 else "#d64545"
         naam = "voorbeurs" if sessie == "pre" else "nabeurs"
-        ext_bedrag = row["ext_prijs"] - row["prijs"]
         ext_html = (
             f'<div style="font-size:0.68rem;white-space:nowrap;font-variant-numeric:tabular-nums;margin-top:2px">'
             f'<span style="opacity:0.55">{naam} </span>'
-            f'<span style="opacity:0.8">{format_price(row["ext_prijs"], row["valuta"])} </span>'
+            f'<span style="opacity:0.8">{hoofdprijs(row, "ext_prijs")} </span>'
             f'<span style="color:{e_kleur};font-weight:600">'
-            f'{verandering_txt(ext_bedrag, e, row["valuta"])}</span></div>'
+            f'{f"{e:+.2f}%".replace(".", ",")}</span></div>'
         )
-    bedrag = _bedrag_uit_pct(row["prijs"], pct)
-    bedrag_html = "" if bedrag is None else (
-        f'<div style="font-size:0.7rem;color:{color};opacity:0.85;white-space:nowrap;'
-        f'font-variant-numeric:tabular-nums">'
-        f'{("+" if bedrag >= 0 else "−") + format_price(abs(bedrag), row["valuta"])}</div>'
-    )
     uitleg = ETF_UITLEG.get(row["ticker"])
     info = (
         '<span title="Klik voor uitleg" style="display:inline-flex;align-items:center;justify-content:center;'
@@ -1139,12 +1143,12 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
         f'<div style="min-width:0">{title_html(row, "0.88rem", stacked=True)}</div>{info}</div>'
         # eigen valuta met de euro/dollar-prijs eronder
         f'<div style="text-align:right;line-height:1.2;white-space:nowrap;font-variant-numeric:tabular-nums">'
-        f'<div style="opacity:0.8;font-size:0.8rem">{format_price(row["prijs"], row["valuta"])}</div>'
+        f'<div style="opacity:0.8;font-size:0.8rem">{hoofdprijs(row)}</div>'
         + "".join(f'<div style="opacity:0.5;font-size:0.7rem">{p}</div>' for p in other_prices(row))
         + '</div>'
         f'<div style="min-width:64px;text-align:right;line-height:1.15">'
         f'<div style="font-weight:800;font-size:0.95rem;color:{color};'
-        f'font-variant-numeric:tabular-nums">{pct_txt}</div>{bedrag_html}{ext_html}</div></div>'
+        f'font-variant-numeric:tabular-nums">{pct_txt}</div>{ext_html}</div></div>'
     )
     kader = 'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px'
     if not uitleg:
