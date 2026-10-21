@@ -23,6 +23,12 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+try:
+    from yfinance.exceptions import YFRateLimitError
+except ImportError:  # oudere yfinance
+    class YFRateLimitError(Exception):
+        pass
+
 try:  # om threads aan de Streamlit-sessie te koppelen (voorkomt waarschuwingen)
     from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 except ImportError:  # pragma: no cover
@@ -243,29 +249,48 @@ st.set_page_config(page_title="Watchlist Ranker", page_icon="📉", layout="wide
 # DATA
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=12, show_spinner=False)
+# Zet op True zodra Yahoo 'Too Many Requests' teruggeeft; de pagina toont dan
+# een duidelijke melding in plaats van stilletjes lege data.
+RATE_LIMIT = {"geraakt": False, "tijd": None}
+
+
+def _markeer_rate_limit():
+    RATE_LIMIT["geraakt"] = True
+    RATE_LIMIT["tijd"] = pd.Timestamp.now(tz="Europe/Amsterdam")
+
+
+def _intraday_een(ticker: str) -> pd.Series:
+    """5-minuten-closes (2 dagen, incl. voor- en nabeurs VS) voor één ticker."""
+    try:
+        hist = yf.Ticker(ticker).history(
+            period="2d", interval="5m", auto_adjust=True, prepost=True,
+        )
+    except YFRateLimitError:
+        _markeer_rate_limit()
+        raise
+    s = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
+    if not s.empty and s.index.tz is None:
+        s.index = s.index.tz_localize("UTC")
+    return s
+
+
+def _download_intraday(tickers: tuple) -> dict:
+    """Intraday-data voor een lijst tickers, via de gedeelde pool (vast aantal
+    threads). Niet via yf.download: die start intern één thread per ticker en
+    is niet veilig om vanuit meerdere sessies tegelijk aan te roepen.
+    prepost=True: voor- en nabeurskoersen worden in compute_row weer van de
+    reguliere handel gescheiden."""
+    if not tickers:
+        return {}
+    res = parallel(_intraday_een, tickers)
+    return {t: (s if s is not None else pd.Series(dtype=float)) for t, s in zip(tickers, res)}
+
+
+@st.cache_data(ttl=12, max_entries=4, show_spinner=False)
 def fetch_intraday_batch(tickers: tuple) -> dict:
-    """5-minuten-data voor ALLE tickers in één verzoek naar Yahoo.
-    Zo blijft auto-verversen om de 10 sec beperkt tot 1 verzoek per keer,
-    in plaats van één per ticker (anders loop je snel tegen rate limits aan).
-    ttl=8 zodat elke ververs-ronde van 10 sec verse data ophaalt.
-    prepost=True: ook voor- en nabeurskoersen (VS); die worden in
-    compute_row weer van de reguliere handel gescheiden."""
-    df = yf.download(
-        list(tickers), period="2d", interval="5m", group_by="ticker",
-        auto_adjust=True, prepost=True, progress=False, threads=True,
-    )
-    out = {}
-    for t in tickers:
-        try:
-            sub = df[t] if isinstance(df.columns, pd.MultiIndex) else df
-            s = sub["Close"].dropna()
-        except KeyError:
-            s = pd.Series(dtype=float)
-        if not s.empty and s.index.tz is None:
-            s.index = s.index.tz_localize("UTC")
-        out[t] = s
-    return out
+    """Intraday-koersen voor alle tickers, 12 sec bewaard (elke ververs-ronde vers)."""
+    RATE_LIMIT["geraakt"] = False
+    return _download_intraday(tickers)
 
 
 _SUFFIX_RE = re.compile(
@@ -287,8 +312,27 @@ def clean_name(name: str, crypto: bool) -> str:
     return name
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch_meta(ticker: str) -> dict:
+    """Metadata met cache; lukt het ophalen niet (bv. rate limit bij Yahoo), dan
+    een tijdelijke gok op basis van de tickernaam die NIET 7 dagen bewaard wordt."""
+    try:
+        return _fetch_meta_cached(ticker)
+    except Exception:  # noqa: BLE001
+        return _meta_terugval(ticker)
+
+
+def _meta_terugval(ticker: str) -> dict:
+    t = ticker.upper()
+    crypto = looks_like_crypto(t)
+    return {
+        "naam": NAMES.get(t) or ticker, "crypto": crypto, "soort": None,
+        "valuta": "EUR" if t.endswith(("-EUR", ".AS", ".PA", ".DE", ".BR")) else "USD",
+        "tz": US_TZ if not crypto and "." not in t else None,
+    }
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _fetch_meta_cached(ticker: str) -> dict:
     """Soort (crypto of aandeel/ETF), naam, valuta en beurs-tijdzone, 6 uur gecachet.
     De soort komt van Yahoo zelf (quoteType), zodat ook nieuwe tickers goed
     worden ingedeeld; alleen als Yahoo niet antwoordt kijken we naar de tickernaam.
@@ -301,6 +345,9 @@ def fetch_meta(ticker: str) -> dict:
         meta["valuta"] = fi["currency"]
         meta["tz"] = fi["timezone"]
         meta["soort"] = fi["quoteType"]
+    except YFRateLimitError:
+        _markeer_rate_limit()
+        raise  # niet cachen: straks opnieuw proberen
     except Exception:  # noqa: BLE001
         pass
     if not meta["naam"]:
@@ -308,6 +355,9 @@ def fetch_meta(ticker: str) -> dict:
             info = yf.Ticker(ticker).info or {}
             meta["soort"] = meta["soort"] or info.get("quoteType")
             meta["naam"] = info.get("longName") or info.get("shortName")
+        except YFRateLimitError:
+            _markeer_rate_limit()
+            raise
         except Exception:  # noqa: BLE001
             pass
     soort = str(meta["soort"] or "").upper()
@@ -336,24 +386,44 @@ def us_session(ts: pd.Timestamp) -> str:
     return "dicht"
 
 
-def vooraf_ophalen(fn, items, workers: int = 6):
-    """Roept een gecachte functie voor veel tickers tegelijk aan, zodat de cache
-    gevuld is. Fouten worden genegeerd: die komen later per ticker netjes terug."""
+MAX_THREADS = 6  # totaal voor de hele app, over alle sessies en fragmenten heen
+
+
+@st.cache_resource
+def _gedeelde_pool() -> ThreadPoolExecutor:
+    """Eén vaste pool met een paar threads voor de hele app. Voorheen werd er
+    bij elke verversing een nieuwe pool gemaakt en startte yf.download één
+    thread per ticker; op Streamlit Cloud gaf dat 'can't start new thread'."""
+    return ThreadPoolExecutor(max_workers=MAX_THREADS, thread_name_prefix="yahoo")
+
+
+def parallel(fn, items) -> list:
+    """fn(x) voor elke x, verdeeld over de gedeelde pool. Geeft per item het
+    resultaat terug, of None als het mislukte."""
     items = list(items)
-    if len(items) < 2:
-        return
+    if not items:
+        return []
     ctx = get_script_run_ctx() if get_script_run_ctx else None
 
     def taak(x):
         if ctx is not None:
             add_script_run_ctx(threading.current_thread(), ctx)
         try:
-            fn(x)
+            return fn(x)
         except Exception:  # noqa: BLE001
-            pass
+            return None
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(taak, items))
+    if len(items) == 1:
+        return [taak(items[0])]
+    return list(_gedeelde_pool().map(taak, items))
+
+
+def vooraf_ophalen(fn, items):
+    """Roept een gecachte functie voor veel tickers tegelijk aan, zodat de cache
+    gevuld is. Fouten worden genegeerd: die komen later per ticker netjes terug."""
+    items = list(items)
+    if len(items) >= 2:
+        parallel(fn, items)
 
 
 def crypto_pair(ticker: str, valuta: str) -> str:
@@ -392,7 +462,11 @@ def convert(prijs: float, valuta: str, naar: str, intraday_map: dict):
 def fetch_daily_closes(ticker: str) -> pd.Series:
     """Dagelijkse closes (5 jaar). Ticker.history geeft altijd platte kolommen,
     in tegenstelling tot yf.download (die recent MultiIndex-kolommen teruggeeft)."""
-    hist = yf.Ticker(ticker).history(period="5y", interval="1d", auto_adjust=True)
+    try:
+        hist = yf.Ticker(ticker).history(period="5y", interval="1d", auto_adjust=True)
+    except YFRateLimitError:
+        _markeer_rate_limit()
+        raise ValueError("Yahoo: te veel verzoeken, probeer het over een paar minuten opnieuw")
     if hist.empty:
         raise ValueError("geen data (verkeerde ticker of Yahoo onbereikbaar)")
     closes = hist["Close"].dropna()
@@ -850,6 +924,22 @@ def change_chip(label: str, pct) -> str:
     )
 
 
+def _bedrag_uit_pct(prijs, pct):
+    """Verandering in geld, terugrekend uit de huidige prijs en het percentage."""
+    if prijs is None or pct is None or pd.isna(prijs) or pd.isna(pct) or pct <= -100:
+        return None
+    return prijs - prijs / (1 + pct / 100)
+
+
+def verandering_txt(bedrag, pct, valuta: str) -> str:
+    """'+$26,49 (+3,72%)' in Nederlandse notatie; zonder bedrag alleen het percentage."""
+    pct_txt = f"{pct:+.2f}%".replace(".", ",")
+    if bedrag is None or pd.isna(bedrag):
+        return pct_txt
+    teken = "+" if bedrag >= 0 else "−"
+    return f"{teken}{format_price(abs(bedrag), valuta)} ({pct_txt})"
+
+
 EXT_LABELS = {
     "pre": ("Voorbeurs", "Koers in de voorbeurs (04:00–09:30 New Yorkse tijd), t.o.v. de vorige slotkoers"),
     "post": ("Nabeurs", "Koers in de nabeurs (16:00–20:00 New Yorkse tijd), t.o.v. de slotkoers van vandaag"),
@@ -867,9 +957,10 @@ def ext_chip_html(row: pd.Series) -> str:
         pct_html = ""
     else:
         color = "#d64545" if pct < 0 else "#2e9e58"
+        bedrag = row["ext_prijs"] - row["prijs"]
         pct_html = (
             f'<span style="color:{color};font-weight:600">'
-            f'{f"{pct:+.2f}%".replace(".", ",")}</span>'
+            f'{verandering_txt(bedrag, pct, row["valuta"])}</span>'
         )
     return (
         f'<span title="{uitleg}" style="display:inline-flex;align-items:baseline;gap:5px;'
@@ -963,11 +1054,15 @@ def holding_card_html(row: pd.Series) -> str:
     """Kaartje voor een positie in de portefeuille: prijs en koersverloop, geen score."""
     crypto = is_crypto(row["ticker"])
     dag = row["%_24u"]
+    dag_bedrag = ""
     if dag is None or pd.isna(dag):
         dag_txt, kleur = "–", "inherit"
     else:
         dag_txt = f"{dag:+.2f}%".replace(".", ",")
         kleur = "#2e9e58" if dag >= 0 else "#d64545"
+        b = _bedrag_uit_pct(row["prijs"], dag)
+        if b is not None:
+            dag_bedrag = ("+" if b >= 0 else "−") + format_price(abs(b), row["valuta"])
     chips = "".join(
         change_chip(lbl, row[col]) for lbl, col in [("1u", "%_1u"), ("7d", "%_7d"), ("30d", "%_30d")]
     )
@@ -986,7 +1081,9 @@ def holding_card_html(row: pd.Series) -> str:
         # dagverandering groot rechts
         f'<div style="text-align:right;flex-shrink:0;line-height:1">'
         f'<div style="font-size:1.2rem;font-weight:800;color:{kleur};font-variant-numeric:tabular-nums">{dag_txt}</div>'
-        f'<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">{"24u" if crypto else "dag"}</div></div>'
+        + (f'<div style="font-size:0.72rem;font-weight:600;color:{kleur};margin-top:2px;'
+           f'font-variant-numeric:tabular-nums">{dag_bedrag}</div>' if dag_bedrag else "")
+        + f'<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">{"24u" if crypto else "dag"}</div></div>'
         f"</div>"
         f'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;font-size:0.72rem;'
         f'margin-top:5px">{chips}'
@@ -1014,11 +1111,20 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
     if toon_ext and isinstance(sessie, str) and e is not None and pd.notna(e):
         e_kleur = "#2e9e58" if e >= 0 else "#d64545"
         naam = "voorbeurs" if sessie == "pre" else "nabeurs"
+        ext_bedrag = row["ext_prijs"] - row["prijs"]
         ext_html = (
-            f'<div style="font-size:0.68rem;white-space:nowrap;font-variant-numeric:tabular-nums">'
+            f'<div style="font-size:0.68rem;white-space:nowrap;font-variant-numeric:tabular-nums;margin-top:2px">'
             f'<span style="opacity:0.55">{naam} </span>'
-            f'<span style="color:{e_kleur};font-weight:600">{f"{e:+.2f}%".replace(".", ",")}</span></div>'
+            f'<span style="opacity:0.8">{format_price(row["ext_prijs"], row["valuta"])} </span>'
+            f'<span style="color:{e_kleur};font-weight:600">'
+            f'{verandering_txt(ext_bedrag, e, row["valuta"])}</span></div>'
         )
+    bedrag = _bedrag_uit_pct(row["prijs"], pct)
+    bedrag_html = "" if bedrag is None else (
+        f'<div style="font-size:0.7rem;color:{color};opacity:0.85;white-space:nowrap;'
+        f'font-variant-numeric:tabular-nums">'
+        f'{("+" if bedrag >= 0 else "−") + format_price(abs(bedrag), row["valuta"])}</div>'
+    )
     uitleg = ETF_UITLEG.get(row["ticker"])
     info = (
         '<span title="Klik voor uitleg" style="display:inline-flex;align-items:center;justify-content:center;'
@@ -1038,7 +1144,7 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
         + '</div>'
         f'<div style="min-width:64px;text-align:right;line-height:1.15">'
         f'<div style="font-weight:800;font-size:0.95rem;color:{color};'
-        f'font-variant-numeric:tabular-nums">{pct_txt}</div>{ext_html}</div></div>'
+        f'font-variant-numeric:tabular-nums">{pct_txt}</div>{bedrag_html}{ext_html}</div></div>'
     )
     kader = 'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px'
     if not uitleg:
@@ -1110,6 +1216,103 @@ def render_movers(ranking: pd.DataFrame, crypto: bool, etfs=None):
     _mover_blok(ranking, col, periode, alles)
 
 
+# Ophalen op de achtergrond ("stale-while-revalidate"):
+# - De pagina leest altijd de laatst opgehaalde data uit een gedeeld geheugen;
+#   dat is direct klaar, dus de pagina wordt niet grijs en loopt niet vast.
+# - Is die data ouder dan VERS_SEC, dan start er op de achtergrond één
+#   ophaal-taak. Bij de volgende verversing staat de nieuwe data klaar.
+# - Alleen de allereerste keer (nog niets in het geheugen) wordt er gewacht.
+VERS_SEC = 10
+VERGEET_NA_SEC = 15 * 60  # data die zo lang niet gelezen is wordt opgeruimd
+
+
+@st.cache_resource
+def _data_geheugen() -> dict:
+    return {"lock": threading.Lock(), "data": {}, "bezig": set()}
+
+
+def _ophalen_en_bewaren(key: tuple):
+    """Haalt de ranking op en zet hem in het gedeelde geheugen."""
+    geh = _data_geheugen()
+    tickers, gewichten = key
+    try:
+        ranking, errors = build_ranking(list(tickers), dict(gewichten))
+    except Exception as e:  # noqa: BLE001  (oude data blijft staan)
+        with geh["lock"]:
+            oud = geh["data"].get(key)
+            if oud:
+                oud["errors"] = [f"Verversen mislukt: {e}"]
+        return
+    nu = time.time()
+    with geh["lock"]:
+        oud = geh["data"].get(key, {})
+        geh["data"][key] = {"ranking": ranking, "errors": errors, "tijd": nu,
+                            "gelezen": oud.get("gelezen", nu)}
+        for k in [k for k, v in geh["data"].items() if nu - v["gelezen"] > VERGEET_NA_SEC]:
+            del geh["data"][k]
+
+
+def _achtergrond(key: tuple):
+    geh = _data_geheugen()
+    ctx = get_script_run_ctx() if get_script_run_ctx else None
+
+    def taak():
+        if ctx is not None:
+            add_script_run_ctx(threading.current_thread(), ctx)
+        try:
+            _ophalen_en_bewaren(key)
+        finally:
+            with geh["lock"]:
+                geh["bezig"].discard(key)
+
+    with geh["lock"]:
+        if key in geh["bezig"]:
+            return  # er loopt al een ophaal-taak voor deze lijst
+        geh["bezig"].add(key)
+    threading.Thread(target=taak, daemon=True, name="verversen").start()
+
+
+def _ranking_uit_geheugen(tickers: tuple, gewichten: tuple):
+    key = (tickers, gewichten)
+    geh = _data_geheugen()
+    with geh["lock"]:
+        entry = geh["data"].get(key)
+    if entry is None:  # eerste keer: wachten tot de data er is
+        with st.spinner("Koersen ophalen…"):
+            _ophalen_en_bewaren(key)
+        with geh["lock"]:
+            entry = geh["data"].get(key)
+        if entry is None:
+            return pd.DataFrame(), ["Ophalen mislukt"], time.time()
+    entry["gelezen"] = time.time()
+    if time.time() - entry["tijd"] > VERS_SEC:
+        _achtergrond(key)
+    return entry["ranking"], entry["errors"], entry["tijd"]
+
+
+def wis_data_geheugen():
+    geh = _data_geheugen()
+    with geh["lock"]:
+        geh["data"].clear()
+
+
+def laad_ranking(tickers: list, weights: dict, met_etfs: bool):
+    """Koersen + berekening voor een lijst tickers, uit het gedeelde geheugen
+    (zie hierboven). Met `met_etfs` komen de sector-ETF's mee en worden ze
+    apart teruggegeven. Geeft ook het tijdstip van de data terug."""
+    alles = tuple(dict.fromkeys(list(tickers) + (SECTOR_TICKERS if met_etfs else [])))
+    ranking, errors, tijd = _ranking_uit_geheugen(alles, tuple(sorted(weights.items())))
+    etfs = None
+    if met_etfs and not ranking.empty:
+        is_etf = ranking["ticker"].isin(SECTOR_TICKERS) & ~ranking["ticker"].isin(tickers)
+        etfs, ranking = ranking[is_etf], ranking[~is_etf].reset_index(drop=True)
+    return ranking, etfs, errors, tijd
+
+
+def _klok(tijd: float) -> str:
+    return pd.Timestamp(tijd, unit="s", tz="UTC").tz_convert("Europe/Amsterdam").strftime("%H:%M:%S")
+
+
 # ---------------------------------------------------------------------------
 # PAGINA
 # ---------------------------------------------------------------------------
@@ -1167,6 +1370,7 @@ with st.sidebar:
     )
     if st.button("Nu verversen"):
         st.cache_data.clear()
+        wis_data_geheugen()
 
 watchlist = portefeuille + extra
 with st.spinner("Tickers indelen…"):
@@ -1195,6 +1399,11 @@ st.markdown(
     """<style>
     .st-key-weergave button { min-height: 3rem; font-weight: 600; }
     .st-key-weergave button p { font-size: 1.05rem; }
+    /* Tijdens het verversen niet grijs maken: de oude data blijft gewoon
+       zichtbaar en bruikbaar tot de nieuwe er staat. */
+    [data-stale="true"], .stale-element, .element-container.stale-element {
+        opacity: 1 !important; transition: none !important; filter: none !important;
+    }
     </style>""",
     unsafe_allow_html=True,
 )
@@ -1326,24 +1535,6 @@ def render_thermometer(soort: str, ranking: pd.DataFrame):
         )
 
 
-@st.cache_data(ttl=10, show_spinner=False)
-def _ranking_cached(tickers: tuple, gewichten: tuple):
-    return build_ranking(list(tickers), dict(gewichten))
-
-
-def laad_ranking(tickers: list, weights: dict, met_etfs: bool):
-    """Koersen + berekening voor een lijst tickers, kort bewaard zodat het snelle
-    en het rustige deel van de pagina dezelfde data delen. Met `met_etfs` komen
-    de sector-ETF's mee en worden ze apart teruggegeven."""
-    alles = tuple(dict.fromkeys(list(tickers) + (SECTOR_TICKERS if met_etfs else [])))
-    ranking, errors = _ranking_cached(alles, tuple(sorted(weights.items())))
-    etfs = None
-    if met_etfs and not ranking.empty:
-        is_etf = ranking["ticker"].isin(SECTOR_TICKERS) & ~ranking["ticker"].isin(tickers)
-        etfs, ranking = ranking[is_etf], ranking[~is_etf].reset_index(drop=True)
-    return ranking, etfs, errors
-
-
 RASTER = ('<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));'
           'column-gap:10px">{}</div>')
 
@@ -1352,16 +1543,20 @@ def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: 
     """Het snelle deel: graadmeters, stijgers/dalers en (portefeuille) de posities."""
     cfg = SOORTEN[soort]
     crypto = cfg["crypto"]
-    now = pd.Timestamp.now(tz="Europe/Amsterdam").strftime("%H:%M:%S")
-    st.caption(f"Laatst ververst om {now}")
-
     if not tickers:
         waar = "je portefeuille" if modus == "portefeuille" else "je watchlist"
         st.info(f"Er staan geen {cfg['titel'].lower()} in {waar}. Voeg tickers toe in de zijbalk.")
         return
 
-    ranking, etfs, errors = laad_ranking(tickers, weights, modus == "watchlist" and not crypto)
+    ranking, etfs, errors, tijd = laad_ranking(tickers, weights, modus == "watchlist" and not crypto)
+    st.caption(f"Koersen van {_klok(tijd)}")
 
+    if RATE_LIMIT["geraakt"]:
+        st.error(
+            f"Yahoo Finance weigert tijdelijk verzoeken ('Too Many Requests', sinds "
+            f"{RATE_LIMIT['tijd']:%H:%M}). Dit gaat meestal binnen 15–60 minuten vanzelf over. "
+            "Zet zolang automatisch verversen uit en druk niet steeds op 'Nu verversen'."
+        )
     if errors:
         st.warning("Niet verwerkt:\n\n" + "\n\n".join(errors))
 
@@ -1399,13 +1594,12 @@ def render_ranglijst(tickers: list, weights: dict, soort: str, in_bezit: tuple, 
     if not tickers:
         return
     crypto = SOORTEN[soort]["crypto"]
-    ranking, _, _ = laad_ranking(tickers, weights, not crypto)
+    ranking, _, _, tijd = laad_ranking(tickers, weights, not crypto)
     if ranking.empty:
         return
     st.divider()
     st.subheader("Ranglijst")
-    now = pd.Timestamp.now(tz="Europe/Amsterdam").strftime("%H:%M:%S")
-    uitleg = (f"Bijgewerkt om {now}" + (f", ververst elke {elke} s. " if elke else ". ")
+    uitleg = (f"Koersen van {_klok(tijd)}" + (f", ververst elke {elke} s. " if elke else ". ")
               + "Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. "
               "1u toont – als er niet gehandeld wordt. "
               "≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
