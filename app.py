@@ -749,11 +749,10 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     # (de slotkoers) en eventueel de voorbeurs.
     vandaag_beurs = now_utc.tz_convert(meta["tz"] or "Europe/Amsterdam").date()
     dag_actueel = crypto or last_date == vandaag_beurs
+    ref = None
     if crypto and last_ts is not None:
-        ch_24h = _pct(price, _at_or_before(intraday, last_ts - pd.Timedelta(hours=24)))
-    elif not dag_actueel:
-        ch_24h = None
-    else:
+        ref = _at_or_before(intraday, last_ts - pd.Timedelta(hours=24))
+    elif dag_actueel:
         # Referentie = Yahoo's eigen vorige slotkoers (zoals op de website).
         ref = vorige_slotkoers(ticker, last_date)
         if ref is None:
@@ -763,15 +762,18 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
             prev = daily[daily.index.date < last_date]
             if not prev.empty and prev.index[-1].date() >= vorige_werkdag(last_date):
                 ref = float(prev.iloc[-1])
-        ch_24h = _pct(price, ref)
+    ch_24h = _pct(price, ref)
+    ref_24h = ref
 
     # 7 dagen: slotkoers van (uiterlijk) een week geleden
     week_ago = daily[daily.index.date <= last_date - timedelta(days=7)]
-    ch_7d = _pct(price, float(week_ago.iloc[-1])) if not week_ago.empty else None
+    ref_7d = float(week_ago.iloc[-1]) if not week_ago.empty else None
+    ch_7d = _pct(price, ref_7d)
 
     # 30 dagen: slotkoers van (uiterlijk) 30 dagen geleden
     month_ago = daily[daily.index.date <= last_date - timedelta(days=30)]
-    ch_30d = _pct(price, float(month_ago.iloc[-1])) if not month_ago.empty else None
+    ref_30d = float(month_ago.iloc[-1]) if not month_ago.empty else None
+    ch_30d = _pct(price, ref_30d)
 
     # Prijs in euro én dollar. Crypto: bij voorkeur het echte handelspaar op Yahoo
     # (bv. BTC-EUR naast BTC-USD). Verder omrekenen met de live wisselkoers.
@@ -801,6 +803,11 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
             if ext_prijs is not None and factor:
                 weergave_ext = ext_prijs * factor
 
+    # Referentiekoersen in de weergavevaluta, voor de stijging/daling in geld.
+    f = weergave_prijs / price if price else None
+    refs = {k: (v * f if v is not None and f else None)
+            for k, v in (("24u", ref_24h), ("7d", ref_7d), ("30d", ref_30d))}
+
     mas = stats["mas"]
     pcts = {
         k: None if pd.isna(v) else round((price - float(v)) / float(v) * 100, 2)
@@ -826,6 +833,7 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
         "%_24u": ch_24h,
         "%_7d": ch_7d,
         "%_30d": ch_30d,
+        **{f"ref_{k}": v for k, v in refs.items()},
         "prijs_eur": omgerekend_prijzen["EUR"][0],
         "eur_omgerekend": omgerekend_prijzen["EUR"][1],
         "prijs_usd": omgerekend_prijzen["USD"][0],
@@ -1056,19 +1064,84 @@ LAMPJES = {  # status: (kleur, pulseren, uitleg)
 VOORBEURS_KLEUR = LAMPJES["pre"][0]  # zelfde oranje als het lampje
 
 
-def pre_label_html() -> str:
-    """Klein oranje 'pre' vóór een voorbeurspercentage (zelfde oranje als het lampje)."""
-    return (
-        f'<span title="{EXT_LABELS["pre"][1]}" style="color:{VOORBEURS_KLEUR};'
-        f'font-size:0.62em;font-weight:800;margin-right:4px;vertical-align:1px">pre</span>'
-    )
+ZON_SVG = (
+    '<svg width="12" height="12" viewBox="0 0 24 24" style="vertical-align:-1px">'
+    '<circle cx="12" cy="12" r="5" fill="currentColor"/>'
+    '<g stroke="currentColor" stroke-width="2.4" stroke-linecap="round">'
+    '<path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3M4.6 4.6l2.1 2.1M17.3 17.3l2.1 2.1'
+    'M4.6 19.4l2.1-2.1M17.3 6.7l2.1-2.1"/></g></svg>'
+)
+MAAN_SVG = (
+    '<svg width="11" height="11" viewBox="0 0 24 24" style="vertical-align:-1px">'
+    '<path fill="currentColor" d="M21 14.5A9 9 0 0 1 9.5 3a9 9 0 1 0 11.5 11.5z"/></svg>'
+)
+NABEURS_KLEUR = "#5b9bd5"
+SESSIE_STIJL = {  # sessie: (label, kleur, icoon)
+    "pre": ("PRE", VOORBEURS_KLEUR, ZON_SVG),
+    "post": ("POST", NABEURS_KLEUR, MAAN_SVG),
+}
+DAG_KOLOMMEN = ("%_24u", "%_dag_rang")
 
 
-def pre_prijs_html(row: pd.Series) -> str:
-    """Voorbeursprijs klein onder het percentage."""
+def _getal(x) -> bool:
+    return x is not None and pd.notna(x)
+
+
+def _bedrag(x: float, decimalen: int) -> str:
+    """Verandering in geld, met teken, Nederlandse notatie (geen valutateken)."""
+    txt = f"{x:+,.{decimalen}f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return txt.replace("-", "−")
+
+
+def _procent(x: float) -> str:
+    return f"{x:+.2f}%".replace(".", ",").replace("-", "−")
+
+
+def verandering_html(prijs, ref, pct, decimalen: int) -> str:
+    """'+15,68  +1,83%' in groen of rood. Zonder referentie alleen het percentage."""
+    kleur = "#2e9e58" if pct >= 0 else "#d64545"
+    delen = []
+    if _getal(ref) and _getal(prijs):
+        delen.append(_bedrag(prijs - ref, decimalen))
+    delen.append(_procent(pct))
+    return f'<span style="color:{kleur};font-weight:600">{"&nbsp;&nbsp;".join(delen)}</span>'
+
+
+def koers_blok_html(row: pd.Series, col: str = "%_24u") -> str:
+    """Rechterkant van een regel, in TradingView-stijl:
+    prijs groot; eronder de verandering in geld en procent; tijdens voor-/nabeurs
+    een extra regel met zon (PRE) of maan (POST), de prijs daar en de beweging
+    t.o.v. de slotkoers. In de voorbeurs staat de dag van gisteren er níet bij."""
+    prijs = row["prijs"]
+    dec = 2 if prijs >= 1 else 4
+    regel = ('<div style="font-size:0.74rem;white-space:nowrap;margin-top:2px;'
+             'font-variant-numeric:tabular-nums">')
+    regels = []
+    if col in DAG_KOLOMMEN:
+        dag = row.get("%_24u")
+        if _getal(dag):
+            regels.append(regel + verandering_html(prijs, row.get("ref_24u"), dag, dec) + "</div>")
+        sessie, e = row.get("ext_sessie"), row.get("%_ext")
+        if isinstance(sessie, str) and sessie in SESSIE_STIJL and _getal(e):
+            label, kleur, icoon = SESSIE_STIJL[sessie]
+            uitleg = EXT_LABELS[sessie][1]
+            ext_prijs = row.get("ext_prijs")
+            regels.append(
+                f'{regel}<span title="{uitleg}" style="color:{kleur};font-weight:800;'
+                f'font-size:0.92em">{icoon} {label}</span>&nbsp;'
+                f'<span style="opacity:0.85">{hoofdprijs(row, "ext_prijs")}</span>&nbsp;&nbsp;'
+                f'{verandering_html(ext_prijs, prijs, e, dec)}</div>'
+            )
+        elif not _getal(dag) and row.get("dag_actueel") is False:
+            regels.append(f'{regel}<span style="opacity:0.5">slotkoers · beurs dicht</span></div>')
+    else:
+        pct = row.get(col)
+        if _getal(pct):
+            regels.append(regel + verandering_html(prijs, row.get("ref" + col[1:]), pct, dec) + "</div>")
     return (
-        f'<div style="font-size:0.68rem;opacity:0.7;margin-top:2px;white-space:nowrap;'
-        f'font-variant-numeric:tabular-nums">{hoofdprijs(row, "ext_prijs")}</div>'
+        '<div style="text-align:right;flex-shrink:0;line-height:1.15">'
+        f'<div style="font-weight:750;font-size:0.98rem;font-variant-numeric:tabular-nums;'
+        f'white-space:nowrap">{hoofdprijs(row)}</div>{"".join(regels)}</div>'
     )
 
 
@@ -1086,7 +1159,8 @@ def lampje_html(row: pd.Series) -> str:
     )
 
 
-def title_html(row: pd.Series, size: str = "0.95rem", stacked: bool = False, tag: str = "") -> str:
+def title_html(row: pd.Series, size: str = "0.95rem", stacked: bool = False, tag: str = "",
+               extra: str = "") -> str:
     """Naam als hoofdtekst, de ticker klein en gedempt erachter (of eronder)."""
     naam = html.escape(str(row.get("naam") or row["ticker"]))
     richting = "flex-direction:column;gap:0;line-height:1.2" if stacked else "align-items:baseline;gap:6px"
@@ -1104,7 +1178,7 @@ def title_html(row: pd.Series, size: str = "0.95rem", stacked: bool = False, tag
     return (
         f'<div style="display:flex;{richting};min-width:0">'
         f'{naam_html}'
-        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap">{row["ticker"]}</span>'
+        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap">{row["ticker"]}{extra}</span>'
         f"{tag_html}</div>"
     )
 
@@ -1170,48 +1244,22 @@ def card_html(rank: int, row: pd.Series, in_bezit: bool = False) -> str:
 
 
 def holding_card_html(row: pd.Series) -> str:
-    """Kaartje voor een positie in de portefeuille: prijs en koersverloop, geen score."""
-    crypto = is_crypto(row["ticker"])
-    dag = row["%_24u"]
-    dag_label = "24u" if crypto else "dag"
-    e = row.get("%_ext")
-    voorbeurs = (not crypto and row.get("dag_actueel") is False
-                 and row.get("ext_sessie") == "pre" and e is not None and pd.notna(e))
-    onder_pct = f'<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">{dag_label}</div>'
-    if voorbeurs:
-        # voorbeurs (nog geen reguliere handel): het grote getal ís de voorbeurs
-        dag_txt = f"{e:+.2f}%".replace(".", ",")
-        kleur = "#2e9e58" if e >= 0 else "#d64545"
-        dag_txt = pre_label_html() + dag_txt
-        onder_pct = pre_prijs_html(row)
-    elif not crypto and row.get("dag_actueel") is False:
-        # nog geen handel vandaag: geen (oud) percentage, alleen de slotkoers
-        dag_txt, kleur = "–", "inherit"
-        onder_pct = '<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">beurs dicht</div>'
-    elif dag is None or pd.isna(dag):
-        dag_txt, kleur = "–", "inherit"
-    else:
-        dag_txt = f"{dag:+.2f}%".replace(".", ",")
-        kleur = "#2e9e58" if dag >= 0 else "#d64545"
+    """Kaartje voor een positie in de portefeuille: koers in TradingView-stijl
+    rechts, koersverloop (1u/7d/30d) onderaan, geen score."""
     chips = "".join(
         change_chip(lbl, row[col]) for lbl, col in [("1u", "%_1u"), ("7d", "%_7d"), ("30d", "%_30d")]
     )
-    andere = "".join(
-        f'<span style="font-size:0.8rem;opacity:0.6;font-variant-numeric:tabular-nums">{p}</span>'
-        for p in other_prices(row)
+    andere = " · ".join(other_prices(row))
+    andere_html = (
+        f'<div style="font-size:0.78rem;opacity:0.6;font-variant-numeric:tabular-nums;'
+        f'margin-top:1px">{andere}</div>' if andere else ""
     )
     return (
         f'<div style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;'
         f'padding:7px 10px 6px;margin-bottom:6px">'
         f'<div style="display:flex;align-items:center;gap:8px">'
-        f'<div style="flex:1;min-width:0">{title_html(row)}'
-        f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:1px">'
-        f'<span style="font-weight:700;font-size:0.92rem;font-variant-numeric:tabular-nums">'
-        f'{hoofdprijs(row)}</span>{andere}{"" if voorbeurs else ext_chip_html(row)}</div></div>'
-        # dagverandering groot rechts
-        f'<div style="text-align:right;flex-shrink:0;line-height:1">'
-        f'<div style="font-size:1.2rem;font-weight:800;color:{kleur};font-variant-numeric:tabular-nums">{dag_txt}</div>'
-        f'{onder_pct}</div>'
+        f'<div style="flex:1;min-width:0">{title_html(row)}{andere_html}</div>'
+        f'{koers_blok_html(row, "%_24u")}'
         f"</div>"
         f'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;font-size:0.72rem;'
         f'margin-top:5px">{chips}'
@@ -1229,42 +1277,9 @@ MOVER_PERIODES = {
 MOVERS_TOP = 3
 
 
-def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False) -> str:
-    """Compacte regel: rang, naam (ticker klein), prijs en percentage rechts.
-    Met `toon_ext` staat een actieve voor-/nabeursbeweging los onder het percentage."""
-    def _p(x):
-        return f"{x:+.2f}%".replace(".", ",")
-
-    def _kleur(x):
-        return "#2e9e58" if x >= 0 else "#d64545"
-
-    klein = ('<div style="font-size:0.68rem;white-space:nowrap;'
-             'font-variant-numeric:tabular-nums;margin-top:2px">')
-    ext_html = pre = ""
-    sessie, e = row.get("ext_sessie"), row.get("%_ext")
-    dag = row.get("%_24u")
-    heeft_dag = dag is not None and pd.notna(dag)
-    heeft_ext = toon_ext and isinstance(sessie, str) and e is not None and pd.notna(e)
-
-    if heeft_ext and sessie == "pre" and not heeft_dag:
-        # Voorbeurs (nog geen handel vandaag): het grote getal ís de voorbeurs.
-        pct = e
-        pre = pre_label_html()
-        ext_html = pre_prijs_html(row)
-    elif heeft_ext:
-        # Nabeurs: groot = de reguliere dag, eronder de nabeurs los, en wat ze
-        # samen doen (daarop staat de regel in de ranglijst).
-        if heeft_dag:
-            pct = dag
-        ext_html = (f'{klein}<span style="opacity:0.55">{"voorbeurs" if sessie == "pre" else "nabeurs"} </span>'
-                    f'<span style="opacity:0.8">{hoofdprijs(row, "ext_prijs")} </span>'
-                    f'<span style="color:{_kleur(e)};font-weight:600">{_p(e)}</span></div>')
-        if heeft_dag and sessie == "post":
-            samen = ((1 + dag / 100) * (1 + e / 100) - 1) * 100
-            ext_html += (f'{klein}<span style="opacity:0.55">samen </span>'
-                         f'<span style="color:{_kleur(samen)};opacity:0.85">{_p(samen)}</span></div>')
-    color = _kleur(pct)
-    pct_txt = _p(pct)
+def mover_row_html(rank: int, row: pd.Series, col: str) -> str:
+    """Compacte regel: rang, naam (ticker en euro/dollar-prijs klein eronder),
+    rechts de koers in TradingView-stijl voor de gekozen periode."""
     uitleg = ETF_UITLEG.get(row["ticker"])
     info = (
         '<span title="Klik voor uitleg" style="display:inline-flex;align-items:center;justify-content:center;'
@@ -1272,19 +1287,13 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
         'font-weight:700;opacity:0.5;margin-left:5px;flex-shrink:0;cursor:pointer">i</span>'
         if uitleg else ""
     )
+    andere = "".join(f" · {p}" for p in other_prices(row))
     regel = (
         f'<div style="display:flex;align-items:center;gap:8px;padding:5px 9px">'
         f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rank}</span>'
         f'<div style="flex:1;min-width:0;display:flex;align-items:center">'
-        f'<div style="min-width:0">{title_html(row, "0.88rem", stacked=True)}</div>{info}</div>'
-        # eigen valuta met de euro/dollar-prijs eronder
-        f'<div style="text-align:right;line-height:1.2;white-space:nowrap;font-variant-numeric:tabular-nums">'
-        f'<div style="opacity:0.8;font-size:0.8rem">{hoofdprijs(row)}</div>'
-        + "".join(f'<div style="opacity:0.5;font-size:0.7rem">{p}</div>' for p in other_prices(row))
-        + '</div>'
-        f'<div style="min-width:64px;text-align:right;line-height:1.15">'
-        f'<div style="font-weight:800;font-size:0.95rem;color:{color};'
-        f'font-variant-numeric:tabular-nums">{pre}{pct_txt}</div>{ext_html}</div></div>'
+        f'<div style="min-width:0">{title_html(row, "0.88rem", stacked=True, extra=andere)}</div>{info}</div>'
+        f'{koers_blok_html(row, col)}</div>'
     )
     kader = 'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px'
     if not uitleg:
@@ -1303,7 +1312,7 @@ def render_mover_list(titel: str, part: pd.DataFrame, col: str, leeg: str, alles
     if part.empty:
         st.caption(leeg)
         return
-    rows = [mover_row_html(i + 1, r, r[col], toon_ext=(col == "%_dag_rang"))
+    rows = [mover_row_html(i + 1, r, col)
             for i, (_, r) in enumerate(part.iterrows())]
     zichtbaar = rows if alles else rows[:MOVERS_TOP]
     stijl = "<style>details.etf-info summary::-webkit-details-marker{display:none}</style>"
