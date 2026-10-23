@@ -1557,20 +1557,24 @@ def rsi(closes: pd.Series, n: int = RSI_PERIODE) -> pd.Series:
     return 100 - 100 / (1 + stijg / daal)
 
 
-def btc_rsi_per_dag(df: pd.DataFrame) -> pd.Series:
-    """RSI(14) op dagslotkoersen, per datum in df. Bij voorkeur berekend over de
-    volledige Yahoo-historie (5 jaar), zodat de RSI aan het begin van de grafiek
-    al 'ingelopen' is; anders over de BTC-prijzen in df zelf."""
+def btc_dagdata(df: pd.DataFrame) -> pd.DataFrame:
+    """Zet BTC-prijs én RSI in df op dezelfde basis: de dagslotkoersen van Yahoo
+    (dag sluit om 00:00 UTC, net als op TradingView). De prijs van CMC is een
+    momentopname op een ander tijdstip van de dag; als we die tonen maar de RSI
+    op Yahoo-slotkoersen berekenen, lopen prijs en RSI niet precies gelijk.
+    De RSI wordt over de volledige 5 jaar berekend, zodat hij aan het begin van
+    de grafiek al ingelopen is. Lukt Yahoo niet, dan alles op de CMC-prijs."""
     try:
         yahoo = fetch_daily_closes("BTC-USD").copy()
         yahoo.index = pd.to_datetime(yahoo.index).normalize()
-        reeks = rsi(yahoo[~yahoo.index.duplicated(keep="last")])
-        uit = df["datum"].map(reeks)
-        if uit.notna().mean() > 0.9:
-            return uit
+        yahoo = yahoo[~yahoo.index.duplicated(keep="last")]
+        prijs = df["datum"].map(yahoo)
+        if prijs.notna().mean() > 0.9:
+            return df.assign(btc=prijs.fillna(df["btc"]), rsi=df["datum"].map(rsi(yahoo)),
+                             bron="Yahoo-slotkoersen")
     except Exception:  # noqa: BLE001
         pass
-    return rsi(df.set_index("datum")["btc"]).reindex(df["datum"]).to_numpy()
+    return df.assign(rsi=rsi(df.set_index("datum")["btc"]).to_numpy(), bron="CoinMarketCap")
 
 
 def render_fng_grafiek():
@@ -1588,8 +1592,10 @@ def render_fng_grafiek():
     if df.empty:
         st.info("Geen data.")
         return
-    # RSI vóór het filteren op periode berekenen, anders loopt hij steeds opnieuw in
-    df = df.assign(rsi=btc_rsi_per_dag(df))
+    # Prijs en RSI op dezelfde slotkoersen; RSI vóór het filteren op periode
+    # berekenen, anders loopt hij steeds opnieuw in.
+    df = btc_dagdata(df)
+    prijsbron = df["bron"].iloc[0]
 
     keuze = st.radio("Periode", list(FNG_PERIODES), index=1, horizontal=True,
                      key="fng_periode", label_visibility="collapsed")
@@ -1664,8 +1670,9 @@ def render_fng_grafiek():
     grafiek = alt.vconcat(prijs, index, rsi_paneel, spacing=6).resolve_scale(x="shared")
     st.altair_chart(grafiek, use_container_width=True)
     st.caption(
-        f"Dagwaarden van CoinMarketCap ({df['datum'].min():%d-%m-%Y} t/m "
-        f"{df['datum'].max():%d-%m-%Y}). Scrollen = zoomen, slepen = schuiven, "
+        f"Fear & Greed: dagwaarden van CoinMarketCap ({df['datum'].min():%d-%m-%Y} t/m "
+        f"{df['datum'].max():%d-%m-%Y}). BTC-prijs en RSI: {prijsbron}. "
+        "Scrollen = zoomen, slepen = schuiven, "
         "dubbelklik = terug. Gekleurde banden: de zones van de meter. "
         f"RSI({RSI_PERIODE}) op dagslotkoersen, Wilder-methode (zoals TradingView)."
     )
