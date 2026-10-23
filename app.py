@@ -1678,22 +1678,39 @@ def btc_dagdata(df: pd.DataFrame) -> pd.DataFrame:
     return df.assign(rsi=rsi(df.set_index("datum")["btc"]).to_numpy(), bron="CoinMarketCap")
 
 
-GRAFIEK_CSS = """<style>
-/* Grafiek 85% breed: op de telefoon blijft rechts ruimte om de pagina te scrollen */
-.st-key-fng_grafiek { width: 85% !important; max-width: 85% !important; }
+GRAFIEK_CSS_TELEFOON = """<style>
+/* Grafiek 75% breed: op de telefoon blijft rechts ruimte om de pagina te scrollen */
+.st-key-fng_grafiek { width: 75% !important; max-width: 75% !important; }
 /* In de grafiek zelf scrolt een vinger de pagina niet, maar verplaatst hij het punt */
 .st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: none; }
 </style>"""
 
+# Vega-expressies voor Nederlandse datums (los van de taal van de browser)
+_NL_MND = "['jan','feb','mrt','apr','mei','jun','jul','aug','sep','okt','nov','dec']"
+# As-labels: '8 mrt' voor tussenliggende dagen, 'mrt' op de 1e, 'jan 2026' bij een nieuw jaar
+X_LABEL_EXPR = (
+    f"(date(datum.value) == 1 ? '' : date(datum.value) + ' ') + {_NL_MND}[month(datum.value)]"
+    " + (month(datum.value) == 0 && date(datum.value) == 1 ? ' ' + year(datum.value) : '')"
+)
+DATUM_EXPR = f"date(datum.datum) + ' ' + {_NL_MND}[month(datum.datum)] + ' ' + year(datum.datum)"
+
+
+def _y_domein(reeks: pd.Series, marge: float = 3, lo: float = 0, hi: float = 100) -> list:
+    """y-as die meeschaalt met wat er te zien is (binnen 0–100)."""
+    r = reeks.dropna()
+    if r.empty:
+        return [lo, hi]
+    a, b = max(lo, float(r.min()) - marge), min(hi, float(r.max()) + marge)
+    return [a, b] if b > a else [lo, hi]
+
 
 def render_fng_grafiek():
     """BTC-prijs, CMC Fear & Greed en RSI op dagbasis, onder elkaar met een
-    gedeelde datum-as. Werkt met muis én vinger:
-    - periodeknoppen + schuifbalk bepalen welk stuk je ziet (ook op de telefoon);
-    - met de muis: scrollen = zoomen, slepen = schuiven (vingers doen dat niet,
-      zodat je niet per ongeluk verschuift);
-    - aanraken/bewegen kiest een dag; de waarden staan boven de grafiek en het
-      punt blijft staan als je je vinger optilt. Opnieuw aanraken = verplaatsen.
+    gedeelde datum-as. Twee weergaven (schakelaar bovenaan, standaard telefoon):
+    - telefoon: periode kiezen met een schuifbalk met twee uiteinden, y-assen
+      schalen mee met wat je ziet; tikken/slepen kiest een dag, het punt blijft
+      staan, de waarden staan bij elk paneel;
+    - pc: periodeknoppen, zoomen/schuiven met de muis, tooltip bij de muis.
     Draait als eigen fragment: alleen de grafiek ververst bij een klik."""
     import altair as alt  # wordt met Streamlit meegeleverd
 
@@ -1709,158 +1726,182 @@ def render_fng_grafiek():
     # anders loopt hij bij elk venster opnieuw in.
     df = btc_dagdata(df)
     prijsbron = df["bron"].iloc[0]
+    data_van, data_tot = df["datum"].min(), df["datum"].max()
+    zones = cyclus_zones()
 
-    k1, k2 = st.columns([3, 2])
+    k1, k2 = st.columns(2)
     with k1:
-        keuze = st.radio("Periode", list(FNG_PERIODES), index=1, horizontal=True,
-                         key="fng_periode", label_visibility="collapsed")
+        pc = st.toggle("🖥️ Pc-weergave", key="fng_pc",
+                       help="Uit = telefoon (aanraken en schuifbalk). "
+                            "Aan = pc (zoomen en schuiven met de muis).")
     with k2:
         toon_cyclus = st.checkbox("Theoretisch einde bullrun", key="fng_cyclus",
                                   help="Kernzone (donker) en aandachtszone (licht) van de "
-                                       "vorige en de aankomende cyclus. De x-as loopt dan door "
-                                       "tot na de aankomende zone.")
-
-    data_van, data_tot = df["datum"].min(), df["datum"].max()
-    zones = cyclus_zones()
+                                       "vorige en de aankomende cyclus.")
     as_tot = data_tot
     if toon_cyclus:
         as_tot = max(data_tot, max(z["aandacht_tot"] for z in zones) + pd.Timedelta(days=150))
 
-    # Venster: periodeknop = breedte, schuifbalk = waar het venster eindigt
-    dagen = FNG_PERIODES[keuze]
-    if dagen and data_van + pd.Timedelta(days=dagen) < as_tot:
-        eerste = (data_van + pd.Timedelta(days=dagen)).date()
-        eind = st.slider(
-            "Schuif door de tijd", min_value=eerste, max_value=as_tot.date(),
-            value=min(max(data_tot.date(), eerste), as_tot.date()), step=timedelta(days=1),
-            format="DD-MM-YYYY", key=f"fng_schuif_{keuze}_{toon_cyclus}",
-            help="Sleep om het venster naar links of rechts te schuiven.",
-        )
-        x_tot = pd.Timestamp(eind)
-        x_van = x_tot - pd.Timedelta(days=dagen)
+    # --- welk stuk van de tijd is te zien -----------------------------------
+    if pc:
+        keuze = st.radio("Periode", list(FNG_PERIODES), index=0, horizontal=True,
+                         key="fng_periode", label_visibility="collapsed")
+        dagen = FNG_PERIODES[keuze]
+        zicht = df[df["datum"] >= data_tot - pd.Timedelta(days=dagen)] if dagen else df
+        x_van, x_tot = zicht["datum"].min(), as_tot
     else:
-        x_van, x_tot = data_van, as_tot
-    zicht = df[(df["datum"] >= x_van) & (df["datum"] <= x_tot)]
+        laagste = max(data_van, data_tot - pd.DateOffset(years=4)).date()
+        standaard = (max(data_van, data_tot - pd.DateOffset(years=1)).date(), data_tot.date())
+        van, tot = st.slider(
+            "Periode", min_value=laagste, max_value=as_tot.date(), value=standaard,
+            step=timedelta(days=1), format="DD-MM-YYYY", key=f"fng_venster_{toon_cyclus}",
+            help="Sleep de twee uiteinden om precies te kiezen welke periode je ziet.",
+        )
+        x_van, x_tot = pd.Timestamp(van), pd.Timestamp(tot)
+        if x_tot <= x_van:
+            x_tot = x_van + pd.Timedelta(days=1)
+        zicht = df[(df["datum"] >= x_van) & (df["datum"] <= x_tot)]
     if zicht.empty:
         zicht = df.tail(1)
 
-    # Selecties gedeeld door alle drie de panelen:
-    # - hover: muis volgt de muis (weg bij verlaten); een tik zet het punt.
-    # - sleep: slepen met de vinger. Een gewone 'nearest'-selectie blijft bij
-    #   touch hangen op het punt waar je vinger begon, dus hier rekenen we de dag
-    #   uit via de x-positie (een onzichtbare interval-selectie: het eind ervan is
-    #   waar je vinger nu is). Na loslaten blijft het punt staan; opnieuw
-    #   aanraken begint opnieuw.
-    hover = alt.selection_point(name="hover", nearest=True, fields=["datum"], empty=False,
-                                on="mousemove, touchstart", clear="mouseout")
-    sleep = alt.selection_interval(name="sleep", encodings=["x"], clear="touchstart",
-                                   on="[touchstart, touchend] > touchmove",
-                                   translate=False, zoom=False,
-                                   mark=alt.BrushConfig(fillOpacity=0, strokeOpacity=0))
-    vinger = "data('sleep_store')[0].values[0][1]"  # datum onder de vinger
-    gekozen = {"or": [
-        {"and": ["length(data('sleep_store')) > 0",
-                 f"abs(+datum.datum - +{vinger}) < 43200000"]},  # binnen een halve dag
-        {"and": ["length(data('sleep_store')) == 0", {"param": "hover", "empty": False}]},
-    ]}
+    # --- selecties -------------------------------------------------------------
+    if pc:
+        # Muis: punt volgt de muis, weg bij verlaten; zoomen/schuiven met de muis.
+        hover = alt.selection_point(name="hover", nearest=True, fields=["datum"], empty=False,
+                                    on="pointerover", clear="pointerout")
+        zoom = alt.selection_interval(name="zoom", bind="scales", encodings=["x"])
+        params = [hover]
+        gekozen = {"param": "hover", "empty": False}
+    else:
+        # Vinger: tik zet het punt; bij slepen rekenen we de dag uit via de x-positie
+        # (een gewone 'nearest'-selectie blijft bij touch hangen op het beginpunt).
+        # Na loslaten blijft het punt staan; opnieuw aanraken begint opnieuw.
+        hover = alt.selection_point(name="hover", nearest=True, fields=["datum"], empty=False,
+                                    on="mousemove, touchstart", clear="mouseout")
+        sleep = alt.selection_interval(name="sleep", encodings=["x"], clear="touchstart",
+                                       on="[touchstart, touchend] > touchmove",
+                                       translate=False, zoom=False,
+                                       mark=alt.BrushConfig(fillOpacity=0, strokeOpacity=0))
+        zoom = None
+        params = [hover, sleep]
+        vinger = "data('sleep_store')[0].values[0][1]"  # datum onder de vinger
+        gekozen = {"or": [
+            {"and": ["length(data('sleep_store')) > 0",
+                     f"abs(+datum.datum - +{vinger}) < 43200000"]},  # binnen een halve dag
+            {"and": ["length(data('sleep_store')) == 0", {"param": "hover", "empty": False}]},
+        ]}
 
     def bij_keuze(aan, uit):
         return alt.value(uit, condition={"test": gekozen, "value": aan})
-    # Zoomen/schuiven alleen met de muis (wiel en slepen), niet met een vinger.
-    zoom = alt.selection_interval(name="zoom", bind="scales", encodings=["x"], zoom="wheel!",
-                                  translate="[mousedown, window:mouseup] > window:mousemove!")
-    x = alt.X("datum:T", title=None, axis=alt.Axis(format="%b %y", grid=False, labelOverlap=True),
+
+    x = alt.X("datum:T", title=None,
+              axis=alt.Axis(grid=False, labelExpr=X_LABEL_EXPR, labelOverlap=True),
               scale=alt.Scale(domain=[x_van.isoformat(), x_tot.isoformat()]))
     basis = alt.Chart(zicht).encode(x=x)
+    tooltip = [alt.Tooltip("datum:T", title="Datum", format="%d-%m-%Y"),
+               alt.Tooltip("btc:Q", title="BTC ($)", format=",.0f"),
+               alt.Tooltip("fng:Q", title="Fear & Greed", format=".0f"),
+               alt.Tooltip("rsi:Q", title=f"RSI ({RSI_PERIODE})", format=".0f")]
 
     def hoverlagen(y_veld, *extra):
         # Alle selecties op deze ene (onzichtbare) laag per paneel: Altair verdubbelt
         # ze anders over de lagen heen ("Duplicate signal name").
-        punten = basis.mark_point(opacity=0, size=60).encode(y=y_veld).add_params(
-            hover, sleep, *extra)
+        punten = basis.mark_point(opacity=0, size=60).encode(
+            y=y_veld, **({"tooltip": tooltip} if pc else {})).add_params(*params, *extra)
         lijn = basis.mark_rule(color="#888", strokeDash=[3, 3]).encode(opacity=bij_keuze(0.8, 0))
         stip = basis.mark_circle(size=45).encode(y=y_veld, opacity=bij_keuze(1, 0))
-        return punten, lijn, stip
+        return [punten, lijn, stip]
+
+    def waarde_label(expr: str, kleur: str):
+        """Telefoon: waarde van het gekozen punt linksboven in het paneel."""
+        if pc:
+            return []
+        return [basis.transform_calculate(t=expr).transform_filter(gekozen).mark_text(
+            align="left", baseline="top", fontSize=12, fontWeight="bold", color=kleur, dx=4, dy=4
+        ).encode(x=alt.value(0), y=alt.value(0), text="t:N")]
 
     zone_lagen = []
     if toon_cyclus:
         zdf = pd.DataFrame(zones)
         zone_lagen = [
-            alt.Chart(zdf).mark_rect(color="#d64545", opacity=0.07).encode(
+            alt.Chart(zdf).mark_rect(color="#d64545", opacity=0.07, clip=True).encode(
                 x="aandacht_van:T", x2="aandacht_tot:T"),
-            alt.Chart(zdf).mark_rect(color="#d64545", opacity=0.16).encode(
+            alt.Chart(zdf).mark_rect(color="#d64545", opacity=0.16, clip=True).encode(
                 x="kern_van:T", x2="kern_tot:T"),
-            alt.Chart(zdf).mark_rule(color="#d64545", strokeDash=[5, 3], opacity=0.8).encode(
+            alt.Chart(zdf).mark_rule(color="#d64545", strokeDash=[5, 3], opacity=0.8, clip=True).encode(
                 x="einde:T"),
         ]
 
-    # Kopregel met de waarden van het gekozen punt (blijft staan op de telefoon)
-    waarden = alt.Chart(zicht).transform_calculate(
-        tekst="timeFormat(datum.datum, '%d-%m-%Y') + '   BTC $' + format(datum.btc, ',.0f')"
-              " + '   F&G ' + format(datum.fng, '.0f')"
-              " + '   RSI ' + (isValid(datum.rsi) ? format(datum.rsi, '.0f') : '–')"
-    ).transform_filter(gekozen).mark_text(
-        align="left", baseline="middle", fontSize=12, fontWeight="bold"
-    ).encode(x=alt.value(0), y=alt.value(10), text="tekst:N")
-    hint = alt.Chart(pd.DataFrame({"t": ["Tik of beweeg over de grafiek voor de waarden"]})).mark_text(
-        align="left", baseline="middle", fontSize=11, color="#888"
-    ).encode(x=alt.value(0), y=alt.value(10), text="t:N",
-             opacity=alt.value(0, condition={"test": "length(data('hover_store')) == 0"
-                                                     " && length(data('sleep_store')) == 0",
-                                             "value": 1}))
-    kop = alt.layer(hint, waarden).properties(height=20, view=alt.ViewBackground(stroke=None))
-
+    # --- prijs -------------------------------------------------------------------
     lo, hi = float(zicht["btc"].min()), float(zicht["btc"].max())
     y_btc = alt.Y("btc:Q", title="BTC ($)",
-                  scale=alt.Scale(type="log", domain=[lo * 0.92, hi * 1.08], nice=False),
+                  scale=alt.Scale(type="log", domain=[lo * 0.95, hi * 1.05], nice=False),
                   axis=alt.Axis(orient="right", format="$~s", tickCount=5))
     label = []
     if toon_cyclus:
         label = [alt.Chart(pd.DataFrame(zones)).mark_text(
-            color="#d64545", fontSize=11, fontWeight="bold", baseline="top", align="right", dx=-5
-        ).encode(x="einde:T", y=alt.value(4), text=alt.value("theoretisch einde bullrun"))]
+            color="#d64545", fontSize=11, fontWeight="bold", baseline="top", align="right",
+            dx=-5, clip=True,
+        ).encode(x="einde:T", y=alt.value(4 if pc else 22),  # telefoon: onder de waarden
+                 text=alt.value("theoretisch einde bullrun"))]
     prijs = alt.layer(
         *zone_lagen, *label,
         basis.mark_line(color="#2a78d6", strokeWidth=1.6, clip=True).encode(y=y_btc),
-        *hoverlagen(y_btc, zoom),
+        *hoverlagen(y_btc, *([zoom] if zoom else [])),
+        *waarde_label(f"{DATUM_EXPR} + '   BTC $' + format(datum.btc, ',.0f')", "#2a78d6"),
     ).properties(height=240)
 
+    # --- Fear & Greed --------------------------------------------------------------
+    # Banden en hulplijnen krijgen hetzelfde y-domein, anders rekt hun data
+    # (0–100) de as weer op en schaalt hij niet mee.
+    fng_dom = [0, 100] if pc else _y_domein(zicht["fng"])
     fng_banden = alt.Chart(pd.DataFrame(
         [{"van": a, "tot": b, "kleur": k} for a, b, _, k in CMC_ZONES]
-    )).mark_rect(opacity=0.10).encode(
-        y=alt.Y("van:Q"), y2="tot:Q", color=alt.Color("kleur:N", scale=None, legend=None))
-    y_fng = alt.Y("fng:Q", title="Fear & Greed", scale=alt.Scale(domain=[0, 100]),
-                  axis=alt.Axis(orient="right", values=[0, 20, 40, 60, 80, 100]))
+    )).mark_rect(opacity=0.10, clip=True).encode(
+        y=alt.Y("van:Q", scale=alt.Scale(domain=fng_dom, nice=False)), y2="tot:Q",
+        color=alt.Color("kleur:N", scale=None, legend=None))
+    y_fng = alt.Y("fng:Q", title="Fear & Greed", scale=alt.Scale(domain=fng_dom, nice=False),
+                  axis=alt.Axis(orient="right", tickCount=5))
     index = alt.layer(
         fng_banden, *zone_lagen,
         basis.mark_line(color="#eb6834", strokeWidth=1.4, clip=True).encode(y=y_fng),
         *hoverlagen(y_fng),
+        *waarde_label("'F&G ' + format(datum.fng, '.0f')", "#eb6834"),
     ).properties(height=130)
 
-    # RSI: lichte banden boven 70 (overbought) en onder 30 (oversold)
+    # --- RSI: lichte banden boven 70 (overbought) en onder 30 (oversold) ----------
+    rsi_dom = [0, 100] if pc else _y_domein(zicht["rsi"])
+    rsi_schaal = alt.Scale(domain=rsi_dom, nice=False)
     rsi_banden = alt.Chart(pd.DataFrame([
         {"van": 70, "tot": 100, "kleur": "#2e9e58"}, {"van": 0, "tot": 30, "kleur": "#d64545"},
-    ])).mark_rect(opacity=0.08).encode(
-        y=alt.Y("van:Q"), y2="tot:Q", color=alt.Color("kleur:N", scale=None, legend=None))
+    ])).mark_rect(opacity=0.08, clip=True).encode(
+        y=alt.Y("van:Q", scale=rsi_schaal), y2="tot:Q",
+        color=alt.Color("kleur:N", scale=None, legend=None))
     rsi_lijnen = alt.Chart(pd.DataFrame({"y": [30, 50, 70]})).mark_rule(
-        strokeDash=[4, 3], color="#888", opacity=0.6).encode(y="y:Q")
-    y_rsi = alt.Y("rsi:Q", title=f"RSI ({RSI_PERIODE})", scale=alt.Scale(domain=[0, 100]),
-                  axis=alt.Axis(orient="right", values=[0, 30, 50, 70, 100]))
+        strokeDash=[4, 3], color="#888", opacity=0.6, clip=True).encode(
+        y=alt.Y("y:Q", scale=rsi_schaal))
+    y_rsi = alt.Y("rsi:Q", title=f"RSI ({RSI_PERIODE})", scale=alt.Scale(domain=rsi_dom, nice=False),
+                  axis=alt.Axis(orient="right", tickCount=5))
     rsi_paneel = alt.layer(
         rsi_banden, *zone_lagen, rsi_lijnen,
         basis.mark_line(color="#6250d6", strokeWidth=1.4, clip=True).encode(y=y_rsi),
         *hoverlagen(y_rsi),
+        *waarde_label(f"'RSI ' + (isValid(datum.rsi) ? format(datum.rsi, '.0f') : '–')", "#6250d6"),
     ).properties(height=110)
 
-    grafiek = alt.vconcat(kop, prijs, index, rsi_paneel, spacing=6).resolve_scale(x="shared")
-    st.markdown(GRAFIEK_CSS, unsafe_allow_html=True)
-    with st.container(key="fng_grafiek"):
+    grafiek = alt.vconcat(prijs, index, rsi_paneel, spacing=8).resolve_scale(x="shared")
+    if pc:
         st.altair_chart(grafiek, use_container_width=True)
+        uitleg = "Scrollen = zoomen, slepen = schuiven, dubbelklik = terug."
+    else:
+        st.markdown(GRAFIEK_CSS_TELEFOON, unsafe_allow_html=True)
+        with st.container(key="fng_grafiek"):
+            st.altair_chart(grafiek, use_container_width=True)
+        uitleg = ("Tik of sleep in de grafiek om een dag te kiezen; het punt blijft staan. "
+                  "De y-assen schalen mee met de gekozen periode.")
     st.caption(
-        f"Fear & Greed: dagwaarden van CoinMarketCap ({data_van:%d-%m-%Y} t/m "
+        f"{uitleg} Fear & Greed: dagwaarden van CoinMarketCap ({data_van:%d-%m-%Y} t/m "
         f"{data_tot:%d-%m-%Y}). BTC-prijs en RSI: {prijsbron}. "
-        "Telefoon: tik of sleep in de grafiek om een dag te kiezen (het punt blijft staan), "
-        "schuif met de balk. Muis: scrollen = zoomen, slepen = schuiven, dubbelklik = terug. "
         f"RSI({RSI_PERIODE}) op dagslotkoersen, Wilder-methode (zoals TradingView)."
     )
 
