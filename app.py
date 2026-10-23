@@ -1763,6 +1763,9 @@ def render_fng_grafiek():
         zicht = df[(df["datum"] >= x_van) & (df["datum"] <= x_tot)]
     if zicht.empty:
         zicht = df.tail(1)
+    # 'laatste' = meest recente dag in beeld: die waarden staan bij de panelen
+    # zolang er (op de telefoon) nog geen dag gekozen is, zoals bij TradingView.
+    zicht = zicht.assign(laatste=zicht["datum"] == zicht["datum"].max())
 
     # --- selecties -------------------------------------------------------------
     if pc:
@@ -1812,13 +1815,22 @@ def render_fng_grafiek():
         stip = basis.mark_circle(size=45).encode(y=y_veld, opacity=bij_keuze(1, 0))
         return [punten, lijn, stip]
 
+    geen_keuze = "length(data('hover_store')) == 0 && length(data('sleep_store')) == 0"
+
     def waarde_label(expr: str, kleur: str):
-        """Telefoon: waarde van het gekozen punt linksboven in het paneel."""
+        """Telefoon: linksboven in het paneel de waarde van de gekozen dag, of van
+        de laatste dag zolang er niets gekozen is. Dient meteen als paneelnaam."""
         if pc:
             return []
-        return [basis.transform_calculate(t=expr).transform_filter(gekozen).mark_text(
-            align="left", baseline="top", fontSize=12, fontWeight="bold", color=kleur, dx=4, dy=4
-        ).encode(x=alt.value(0), y=alt.value(0), text="t:N")]
+        stijl = dict(align="left", baseline="top", fontSize=12, fontWeight="bold",
+                     color=kleur, dx=4, dy=4)
+        plek = dict(x=alt.value(0), y=alt.value(0), text="t:N")
+        return [
+            basis.transform_calculate(t=expr).transform_filter(gekozen)
+                 .mark_text(**stijl).encode(**plek),
+            basis.transform_calculate(t=expr).transform_filter(f"{geen_keuze} && datum.laatste")
+                 .mark_text(**stijl).encode(**plek),
+        ]
 
     zone_lagen = []
     if toon_cyclus:
@@ -1834,7 +1846,7 @@ def render_fng_grafiek():
 
     # --- prijs -------------------------------------------------------------------
     lo, hi = float(zicht["btc"].min()), float(zicht["btc"].max())
-    y_btc = alt.Y("btc:Q", title="BTC ($)",
+    y_btc = alt.Y("btc:Q", title="BTC ($)" if pc else None,
                   scale=alt.Scale(type="log", domain=[lo * 0.95, hi * 1.05], nice=False),
                   axis=alt.Axis(orient="right", format="$~s", tickCount=5))
     label = []
@@ -1860,13 +1872,15 @@ def render_fng_grafiek():
     )).mark_rect(opacity=0.10, clip=True).encode(
         y=alt.Y("van:Q", scale=alt.Scale(domain=fng_dom, nice=False)), y2="tot:Q",
         color=alt.Color("kleur:N", scale=None, legend=None))
-    y_fng = alt.Y("fng:Q", title="Fear & Greed", scale=alt.Scale(domain=fng_dom, nice=False),
-                  axis=alt.Axis(orient="right", tickCount=5))
+    y_fng = alt.Y("fng:Q", title="Fear & Greed" if pc else None,
+                  scale=alt.Scale(domain=fng_dom, nice=False),
+                  axis=alt.Axis(orient="right", tickCount=5,
+                                **({} if pc else {"labelExpr": "datum.value + '%'"})))
     index = alt.layer(
         fng_banden, *zone_lagen,
         basis.mark_line(color="#eb6834", strokeWidth=1.4, clip=True).encode(y=y_fng),
         *hoverlagen(y_fng),
-        *waarde_label("'F&G ' + format(datum.fng, '.0f')", "#eb6834"),
+        *waarde_label("'Fear & Greed ' + format(datum.fng, '.0f') + '%'", "#eb6834"),
     ).properties(height=130)
 
     # --- RSI: lichte banden boven 70 (overbought) en onder 30 (oversold) ----------
@@ -1880,13 +1894,15 @@ def render_fng_grafiek():
     rsi_lijnen = alt.Chart(pd.DataFrame({"y": [30, 50, 70]})).mark_rule(
         strokeDash=[4, 3], color="#888", opacity=0.6, clip=True).encode(
         y=alt.Y("y:Q", scale=rsi_schaal))
-    y_rsi = alt.Y("rsi:Q", title=f"RSI ({RSI_PERIODE})", scale=alt.Scale(domain=rsi_dom, nice=False),
+    y_rsi = alt.Y("rsi:Q", title=f"RSI ({RSI_PERIODE})" if pc else None,
+                  scale=alt.Scale(domain=rsi_dom, nice=False),
                   axis=alt.Axis(orient="right", tickCount=5))
     rsi_paneel = alt.layer(
         rsi_banden, *zone_lagen, rsi_lijnen,
         basis.mark_line(color="#6250d6", strokeWidth=1.4, clip=True).encode(y=y_rsi),
         *hoverlagen(y_rsi),
-        *waarde_label(f"'RSI ' + (isValid(datum.rsi) ? format(datum.rsi, '.0f') : '–')", "#6250d6"),
+        *waarde_label(f"'RSI ({RSI_PERIODE}) ' + (isValid(datum.rsi) ? format(datum.rsi, '.0f') : '–')",
+                      "#6250d6"),
     ).properties(height=110)
 
     grafiek = alt.vconcat(prijs, index, rsi_paneel, spacing=8).resolve_scale(x="shared")
@@ -1894,6 +1910,9 @@ def render_fng_grafiek():
         st.altair_chart(grafiek, use_container_width=True)
         uitleg = "Scrollen = zoomen, slepen = schuiven, dubbelklik = terug."
     else:
+        # Geen zwevende tooltip op de telefoon: die hoort bij het punt waar je vinger
+        # begon en klopt tijdens het slepen niet. De waarden staan bij de panelen.
+        grafiek = grafiek.configure_mark(tooltip=False)
         st.markdown(GRAFIEK_CSS_TELEFOON, unsafe_allow_html=True)
         with st.container(key="fng_grafiek"):
             st.altair_chart(grafiek, use_container_width=True)
