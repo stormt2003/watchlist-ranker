@@ -617,6 +617,47 @@ def _at_or_before(series: pd.Series, ts):
     return float(s.iloc[-1]) if not s.empty else None
 
 
+@st.cache_data(ttl=12 * 3600, max_entries=500, show_spinner=False)
+def _yahoo_vorige_slot(ticker: str, handelsdag: str) -> float:
+    """Yahoo's eigen vorige slotkoers (regularMarketPreviousClose): hetzelfde getal
+    waarmee de Yahoo-website en brokers het dagpercentage berekenen.
+    `handelsdag` (vandaag op de beurs) zit in de cache-sleutel, zodat er per
+    handelsdag precies één keer opgehaald wordt. Fouten worden niet gecachet."""
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except YFRateLimitError:
+        _markeer_rate_limit()
+        raise
+    ref = info.get("regularMarketPreviousClose") or info.get("previousClose")
+    if not ref:
+        raise ValueError("geen vorige slotkoers van Yahoo")
+    # Controle: Yahoo's quote moet al over deze handelsdag gaan. Anders is
+    # 'vorige slotkoers' nog die van een dag eerder (niet cachen, later opnieuw).
+    t = info.get("regularMarketTime")
+    tz = info.get("exchangeTimezoneName")
+    if t and tz:
+        quote_dag = pd.Timestamp(t, unit="s", tz="UTC").tz_convert(tz).date().isoformat()
+        if quote_dag != handelsdag:
+            raise ValueError("Yahoo-quote nog niet bijgewerkt voor vandaag")
+    return float(ref)
+
+
+def vorige_slotkoers(ticker: str, handelsdag) -> float | None:
+    """Vorige slotkoers volgens Yahoo, of None als die (nog) niet op te halen is."""
+    try:
+        return _yahoo_vorige_slot(ticker, handelsdag.isoformat())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def vorige_werkdag(dag):
+    """Werkdag vóór `dag` (ma -> vr). Feestdagen kent dit niet."""
+    dag -= timedelta(days=1)
+    while dag.weekday() >= 5:
+        dag -= timedelta(days=1)
+    return dag
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def daily_stats(ticker: str) -> dict:
     """Alles wat alleen van de dagdata afhangt (5 jaar historie, MA's), 15 min
@@ -713,8 +754,16 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     elif not dag_actueel:
         ch_24h = None
     else:
-        prev = daily[daily.index.date < last_date]
-        ch_24h = _pct(price, float(prev.iloc[-1])) if not prev.empty else None
+        # Referentie = Yahoo's eigen vorige slotkoers (zoals op de website).
+        ref = vorige_slotkoers(ticker, last_date)
+        if ref is None:
+            # Terugval: dagdata, maar alleen als die rij echt van de vorige
+            # handelsdag is. Yahoo mist soms de dagbar van gisteren; dan zou
+            # het percentage stilletjes over twee dagen gaan. Liever "–".
+            prev = daily[daily.index.date < last_date]
+            if not prev.empty and prev.index[-1].date() >= vorige_werkdag(last_date):
+                ref = float(prev.iloc[-1])
+        ch_24h = _pct(price, ref)
 
     # 7 dagen: slotkoers van (uiterlijk) een week geleden
     week_ago = daily[daily.index.date <= last_date - timedelta(days=7)]
