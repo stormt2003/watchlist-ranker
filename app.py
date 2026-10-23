@@ -1544,6 +1544,107 @@ def _klok(tijd: float) -> str:
     return pd.Timestamp(tijd, unit="s", tz="UTC").tz_convert("Europe/Amsterdam").strftime("%H:%M:%S")
 
 
+# --- 4-jaarcyclus ------------------------------------------------------------
+# Halving -> top was 526, 548 en 534 dagen (2016, 2020, 2024; de eerste cyclus
+# van 2012 met 367 dagen laten we weg). Gemiddeld 536 dagen. Het theoretische
+# einde van de bullrun = halving + 536 dagen. Top -> top (1.424 en 1.426 dagen)
+# komt voor 2029 op vrijwel hetzelfde uit.
+HALVING_NAAR_TOP = 536
+HALVINGS = {
+    2024: pd.Timestamp("2024-04-20"),
+    2028: pd.Timestamp("2028-04-17"),  # SCHATTING op basis van het bloktempo; bijwerken als hij er is
+}
+KERN_MARGE = (pd.Timedelta(days=30), pd.Timedelta(days=30))       # kernzone rond het einde
+AANDACHT_MARGE = (pd.Timedelta(days=180), pd.Timedelta(days=75))  # eerste top kan ~half jaar eerder (2013, 2021)
+
+
+def cyclus_zones() -> list:
+    """De laatste en de aankomende cyclus: theoretisch einde, kern- en aandachtszone."""
+    zones = []
+    for jaar, halving in sorted(HALVINGS.items()):
+        einde = halving + pd.Timedelta(days=HALVING_NAAR_TOP)
+        zones.append({
+            "halving": halving, "einde": einde,
+            "kern_van": einde - KERN_MARGE[0], "kern_tot": einde + KERN_MARGE[1],
+            "aandacht_van": einde - AANDACHT_MARGE[0], "aandacht_tot": einde + AANDACHT_MARGE[1],
+        })
+    return zones
+
+
+NL_MAANDEN = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"]
+
+
+def _nl_datum(d: pd.Timestamp, dag: bool = True) -> str:
+    """'5 okt 2029' of 'okt 2029' (los van de taalinstelling van de server)."""
+    return (f"{d.day} " if dag else "") + f"{NL_MAANDEN[d.month - 1]} {d.year}"
+
+
+def _aftelling(van: pd.Timestamp, tot: pd.Timestamp) -> str:
+    """'2 jaar, 11 maanden en 12 dagen' (of minder delen als die 0 zijn)."""
+    from dateutil.relativedelta import relativedelta
+    r = relativedelta(tot.date(), van.date())
+    delen = [(r.years, "jaar", "jaar"), (r.months, "maand", "maanden"), (r.days, "dag", "dagen")]
+    tekst = [f"{n} {enk if n == 1 else mv}" for n, enk, mv in delen if n]
+    if not tekst:
+        return "vandaag"
+    return tekst[0] if len(tekst) == 1 else ", ".join(tekst[:-1]) + " en " + tekst[-1]
+
+
+def render_cyclus_kaart():
+    """Aftelling naar het theoretische einde van de bullrun, met een balkje
+    voor waar we tussen het vorige en het volgende theoretische einde staan."""
+    vandaag = pd.Timestamp.now(tz="Europe/Amsterdam").tz_localize(None).normalize()
+    zones = cyclus_zones()
+    komend = next((z for z in zones if z["aandacht_tot"] >= vandaag), zones[-1])
+    vorig = next((z for z in reversed(zones) if z["einde"] < komend["einde"]), None)
+
+    if vandaag < komend["aandacht_van"]:
+        fase, kleur = "opbouwfase: plan je exit-strategie, nog geen haast", "#2e9e58"
+    elif vandaag < komend["kern_van"]:
+        fase, kleur = "aandachtszone: let op een eerste top en bearish divergenties", "#ee8a35"
+    elif vandaag <= komend["kern_tot"]:
+        fase, kleur = "kernzone: historisch lag hier de top, voer je exit-plan uit", "#d64545"
+    else:
+        fase, kleur = "na de kernzone: historisch begint hier de bear market", "#d64545"
+
+    if vandaag <= komend["einde"]:
+        kop = (f"Nog <b>{_aftelling(vandaag, komend['einde'])}</b> tot het theoretische "
+               f"einde van de bullrun (± {_nl_datum(komend['einde'])})")
+    else:
+        kop = (f"Theoretisch einde van de bullrun was {_aftelling(komend['einde'], vandaag)} "
+               f"geleden (± {_nl_datum(komend['einde'])})")
+
+    balk = ""
+    if vorig is not None:
+        totaal = (komend["einde"] - vorig["einde"]).days
+        pct = min(max((vandaag - vorig["einde"]).days / totaal, 0), 1) * 100
+        a = (komend["aandacht_van"] - vorig["einde"]).days / totaal * 100
+        k = (komend["kern_van"] - vorig["einde"]).days / totaal * 100
+        balk = (
+            '<div style="position:relative;height:8px;border-radius:4px;margin:8px 0 3px;'
+            'background:rgba(128,128,128,0.18);overflow:hidden">'
+            f'<div style="position:absolute;left:{a:.1f}%;right:0;top:0;bottom:0;background:rgba(214,69,69,0.18)"></div>'
+            f'<div style="position:absolute;left:{k:.1f}%;right:0;top:0;bottom:0;background:rgba(214,69,69,0.35)"></div>'
+            f'<div style="position:absolute;left:0;width:{pct:.1f}%;top:0;bottom:0;background:#2a78d6;opacity:0.75"></div>'
+            '</div>'
+            '<div style="display:flex;justify-content:space-between;font-size:0.68rem;opacity:0.55">'
+            f'<span>einde vorige run (± {_nl_datum(vorig["einde"], dag=False)})</span>'
+            f'<span>{pct:.0f}% van de cyclus</span>'
+            f'<span>± {_nl_datum(komend["einde"], dag=False)}</span></div>'
+        )
+    st.markdown(
+        '<div style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;padding:9px 12px;margin:4px 0 8px">'
+        f'<div style="font-size:0.95rem">⏳ {kop}</div>'
+        f'<div style="font-size:0.78rem;margin-top:2px"><span style="color:{kleur};font-weight:700">●</span> '
+        f'<span style="opacity:0.75">{fase}</span></div>{balk}</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Op basis van de 4-jaarcyclus: halving + {HALVING_NAAR_TOP} dagen (gemiddelde van de "
+        "laatste drie cycli). Een richtlijn, geen voorspelling. Halving 2028 is een schatting."
+    )
+
+
 FNG_PERIODES = {"1 jaar": 365, "2 jaar": 730, "4 jaar": 1460, "Alles": None}
 RSI_PERIODE = 14
 
@@ -1597,11 +1698,34 @@ def render_fng_grafiek():
     df = btc_dagdata(df)
     prijsbron = df["bron"].iloc[0]
 
-    keuze = st.radio("Periode", list(FNG_PERIODES), index=1, horizontal=True,
-                     key="fng_periode", label_visibility="collapsed")
+    k1, k2 = st.columns([3, 2])
+    with k1:
+        keuze = st.radio("Periode", list(FNG_PERIODES), index=1, horizontal=True,
+                         key="fng_periode", label_visibility="collapsed")
+    with k2:
+        toon_cyclus = st.checkbox("Theoretisch einde bullrun", key="fng_cyclus",
+                                  help="Kernzone (donker) en aandachtszone (licht) van de "
+                                       "vorige en de aankomende cyclus. De x-as loopt dan door "
+                                       "tot na de aankomende zone.")
     dagen = FNG_PERIODES[keuze]
     if dagen:
         df = df[df["datum"] >= df["datum"].max() - pd.Timedelta(days=dagen)]
+
+    # x-as: van de data tot vandaag, of met het vinkje door tot na de aankomende zone
+    x_van, x_tot = df["datum"].min(), df["datum"].max()
+    zone_lagen = []
+    if toon_cyclus:
+        zones = cyclus_zones()
+        x_tot = max(x_tot, max(z["aandacht_tot"] for z in zones) + pd.Timedelta(days=150))
+        zdf = pd.DataFrame(zones)
+        aandacht = alt.Chart(zdf).mark_rect(color="#d64545", opacity=0.07).encode(
+            x="aandacht_van:T", x2="aandacht_tot:T")
+        kern = alt.Chart(zdf).mark_rect(color="#d64545", opacity=0.16).encode(
+            x="kern_van:T", x2="kern_tot:T")
+        einde = alt.Chart(zdf).mark_rule(color="#d64545", strokeDash=[5, 3], opacity=0.8).encode(
+            x="einde:T", tooltip=[alt.Tooltip("einde:T", title="Theoretisch einde bullrun",
+                                              format="%d-%m-%Y")])
+        zone_lagen = [aandacht, kern, einde]
 
     zoom = alt.selection_interval(name="zoom", bind="scales", encodings=["x"])
     # Eén hover-selectie per paneel; samen bepalen ze waar de lijn in beide staat.
@@ -1614,7 +1738,8 @@ def render_fng_grafiek():
 
     def bij_hover(aan, uit):
         return alt.value(uit, condition={"test": hover_test, "value": aan})
-    x = alt.X("datum:T", title=None, axis=alt.Axis(format="%b %y", grid=False))
+    x = alt.X("datum:T", title=None, axis=alt.Axis(format="%b %y", grid=False),
+              scale=alt.Scale(domain=[x_van.isoformat(), x_tot.isoformat()]))
     tooltip = [alt.Tooltip("datum:T", title="Datum", format="%d-%m-%Y"),
                alt.Tooltip("btc:Q", title="BTC ($)", format=",.0f"),
                alt.Tooltip("fng:Q", title="Fear & Greed", format=".0f"),
@@ -1635,7 +1760,13 @@ def render_fng_grafiek():
     y_btc = alt.Y("btc:Q", title="BTC ($)",
                   scale=alt.Scale(type="log", domain=[lo * 0.92, hi * 1.08], nice=False),
                   axis=alt.Axis(orient="right", format="$~s", tickCount=5))
+    label = []
+    if toon_cyclus:
+        label = [alt.Chart(pd.DataFrame(cyclus_zones())).mark_text(
+            color="#d64545", fontSize=11, fontWeight="bold", baseline="top", align="right", dx=-5
+        ).encode(x="einde:T", y=alt.value(4), text=alt.value("theoretisch einde bullrun"))]
     prijs = alt.layer(
+        *zone_lagen, *label,
         basis.mark_line(color="#2a78d6", strokeWidth=1.6).encode(y=y_btc),
         *hoverlagen(y_btc, hovers[0], zoom),
     ).properties(height=260)
@@ -1646,7 +1777,7 @@ def render_fng_grafiek():
     y_fng = alt.Y("fng:Q", title="Fear & Greed", scale=alt.Scale(domain=[0, 100]),
                   axis=alt.Axis(orient="right", values=[0, 20, 40, 60, 80, 100]))
     index = alt.layer(
-        banden,
+        banden, *zone_lagen,
         basis.mark_line(color="#eb6834", strokeWidth=1.4).encode(y=y_fng),
         *hoverlagen(y_fng, hovers[1]),
     ).properties(height=140)
@@ -1661,7 +1792,7 @@ def render_fng_grafiek():
     y_rsi = alt.Y("rsi:Q", title=f"RSI ({RSI_PERIODE})", scale=alt.Scale(domain=[0, 100]),
                   axis=alt.Axis(orient="right", values=[0, 30, 50, 70, 100]))
     rsi_paneel = alt.layer(
-        rsi_banden, rsi_lijnen,
+        rsi_banden, *zone_lagen, rsi_lijnen,
         basis.mark_line(color="#6250d6", strokeWidth=1.4).encode(y=y_rsi),
         *hoverlagen(y_rsi, hovers[2]),
     ).properties(height=120)
@@ -1910,8 +2041,8 @@ RASTER = ('<div style="display:grid;grid-template-columns:repeat(auto-fill,minma
           'column-gap:10px">{}</div>')
 
 
-def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: tuple):
-    """Het snelle deel: graadmeters, stijgers/dalers en (portefeuille) de posities."""
+def render_live_boven(tickers: list, weights: dict, soort: str, modus: str):
+    """Snel deel, bovenaan: meldingen en de twee graadmeters."""
     cfg = SOORTEN[soort]
     crypto = cfg["crypto"]
     if not tickers:
@@ -1945,6 +2076,17 @@ def render_live(tickers: list, weights: dict, soort: str, modus: str, in_bezit: 
         render_gauge(cfg["fetch"], cfg["gauge"], cfg["fout"])
     with g2:
         render_thermometer(soort, ranking)
+
+
+def render_live_onder(tickers: list, weights: dict, soort: str, modus: str, in_bezit: tuple):
+    """Snel deel, onder de grafieken: stijgers/dalers en (portefeuille) de posities.
+    De koersen komen uit hetzelfde gedeelde geheugen als render_live_boven."""
+    crypto = SOORTEN[soort]["crypto"]
+    if not tickers:
+        return
+    ranking, etfs, _, _ = laad_ranking(tickers, weights, modus == "watchlist" and not crypto)
+    if ranking.empty:
+        return
 
     st.divider()
     render_movers(ranking, crypto, etfs)
@@ -1988,14 +2130,18 @@ def render_ranglijst(tickers: list, weights: dict, soort: str, in_bezit: tuple, 
 
 # Twee fragmenten die elk in hun eigen tempo verversen. Alleen de tickers van
 # het gekozen tabblad worden opgehaald.
-st.fragment(run_every=interval if auto else None)(render_live)(
-    lijst, weights, soort, modus, tuple(portefeuille)
+st.fragment(run_every=interval if auto else None)(render_live_boven)(
+    lijst, weights, soort, modus
 )
 if soort == "crypto":
-    # Buiten de fragmenten: de grafiek ververst niet elke paar seconden mee,
-    # zodat inzoomen blijft staan. De data wordt 6 uur bewaard.
-    with st.expander("📈 BTC-prijs vs Fear & Greed (dagbasis)"):
+    # Buiten de fragmenten: cycluskaart en grafiek verversen niet elke paar
+    # seconden mee, zodat inzoomen blijft staan. De data wordt 6 uur bewaard.
+    render_cyclus_kaart()
+    with st.expander("📈 BTC-prijs, Fear & Greed en RSI (dagbasis)"):
         render_fng_grafiek()
+st.fragment(run_every=interval if auto else None)(render_live_onder)(
+    lijst, weights, soort, modus, tuple(portefeuille)
+)
 
 if modus == "watchlist":
     st.fragment(run_every=rang_interval if auto else None)(render_ranglijst)(
