@@ -1545,6 +1545,32 @@ def _klok(tijd: float) -> str:
 
 
 FNG_PERIODES = {"1 jaar": 365, "2 jaar": 730, "4 jaar": 1460, "Alles": None}
+RSI_PERIODE = 14
+
+
+def rsi(closes: pd.Series, n: int = RSI_PERIODE) -> pd.Series:
+    """RSI volgens Wilder (zoals TradingView): gemiddelde stijging vs. daling
+    over n perioden, met Wilder-smoothing (alpha = 1/n)."""
+    delta = closes.diff()
+    stijg = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    daal = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    return 100 - 100 / (1 + stijg / daal)
+
+
+def btc_rsi_per_dag(df: pd.DataFrame) -> pd.Series:
+    """RSI(14) op dagslotkoersen, per datum in df. Bij voorkeur berekend over de
+    volledige Yahoo-historie (5 jaar), zodat de RSI aan het begin van de grafiek
+    al 'ingelopen' is; anders over de BTC-prijzen in df zelf."""
+    try:
+        yahoo = fetch_daily_closes("BTC-USD").copy()
+        yahoo.index = pd.to_datetime(yahoo.index).normalize()
+        reeks = rsi(yahoo[~yahoo.index.duplicated(keep="last")])
+        uit = df["datum"].map(reeks)
+        if uit.notna().mean() > 0.9:
+            return uit
+    except Exception:  # noqa: BLE001
+        pass
+    return rsi(df.set_index("datum")["btc"]).reindex(df["datum"]).to_numpy()
 
 
 def render_fng_grafiek():
@@ -1562,6 +1588,8 @@ def render_fng_grafiek():
     if df.empty:
         st.info("Geen data.")
         return
+    # RSI vóór het filteren op periode berekenen, anders loopt hij steeds opnieuw in
+    df = df.assign(rsi=btc_rsi_per_dag(df))
 
     keuze = st.radio("Periode", list(FNG_PERIODES), index=1, horizontal=True,
                      key="fng_periode", label_visibility="collapsed")
@@ -1572,12 +1600,13 @@ def render_fng_grafiek():
     zoom = alt.selection_interval(name="zoom", bind="scales", encodings=["x"])
     # Eén hover-selectie per paneel; samen bepalen ze waar de lijn in beide staat.
     hovers = [alt.selection_point(name=n, nearest=True, on="pointerover", fields=["datum"],
-                                  empty=False, clear="pointerout") for n in ("hover_btc", "hover_fng")]
-    hover = hovers[0] | hovers[1]
+                                  empty=False, clear="pointerout") for n in ("hover_btc", "hover_fng", "hover_rsi")]
+    hover = hovers[0] | hovers[1] | hovers[2]
     x = alt.X("datum:T", title=None, axis=alt.Axis(format="%b %y", grid=False))
     tooltip = [alt.Tooltip("datum:T", title="Datum", format="%d-%m-%Y"),
                alt.Tooltip("btc:Q", title="BTC ($)", format=",.0f"),
-               alt.Tooltip("fng:Q", title="Fear & Greed", format=".0f")]
+               alt.Tooltip("fng:Q", title="Fear & Greed", format=".0f"),
+               alt.Tooltip("rsi:Q", title=f"RSI ({RSI_PERIODE})", format=".0f")]
     basis = alt.Chart(df).encode(x=x)
 
     def hoverlagen(y_veld, *params):
@@ -1610,13 +1639,29 @@ def render_fng_grafiek():
         *hoverlagen(y_fng, hovers[1]),
     ).properties(height=140)
 
-    # Zoom zit op de prijslijn; omdat de x-as gedeeld is, loopt de index mee.
-    grafiek = alt.vconcat(prijs, index, spacing=6).resolve_scale(x="shared")
+    # RSI: lichte banden boven 70 (overbought) en onder 30 (oversold)
+    rsi_banden = alt.Chart(pd.DataFrame([
+        {"van": 70, "tot": 100, "kleur": "#2e9e58"}, {"van": 0, "tot": 30, "kleur": "#d64545"},
+    ])).mark_rect(opacity=0.08).encode(
+        y=alt.Y("van:Q"), y2="tot:Q", color=alt.Color("kleur:N", scale=None, legend=None))
+    rsi_lijnen = alt.Chart(pd.DataFrame({"y": [30, 50, 70]})).mark_rule(
+        strokeDash=[4, 3], color="#888", opacity=0.6).encode(y="y:Q")
+    y_rsi = alt.Y("rsi:Q", title=f"RSI ({RSI_PERIODE})", scale=alt.Scale(domain=[0, 100]),
+                  axis=alt.Axis(orient="right", values=[0, 30, 50, 70, 100]))
+    rsi_paneel = alt.layer(
+        rsi_banden, rsi_lijnen,
+        basis.mark_line(color="#6250d6", strokeWidth=1.4).encode(y=y_rsi),
+        *hoverlagen(y_rsi, hovers[2]),
+    ).properties(height=120)
+
+    # Zoom zit op de prijslijn; omdat de x-as gedeeld is, lopen de panelen eronder mee.
+    grafiek = alt.vconcat(prijs, index, rsi_paneel, spacing=6).resolve_scale(x="shared")
     st.altair_chart(grafiek, use_container_width=True)
     st.caption(
         f"Dagwaarden van CoinMarketCap ({df['datum'].min():%d-%m-%Y} t/m "
         f"{df['datum'].max():%d-%m-%Y}). Scrollen = zoomen, slepen = schuiven, "
-        "dubbelklik = terug. Gekleurde banden: de zones van de meter."
+        "dubbelklik = terug. Gekleurde banden: de zones van de meter. "
+        f"RSI({RSI_PERIODE}) op dagslotkoersen, Wilder-methode (zoals TradingView)."
     )
 
 
