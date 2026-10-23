@@ -1679,8 +1679,12 @@ def btc_dagdata(df: pd.DataFrame) -> pd.DataFrame:
 
 
 GRAFIEK_CSS_TELEFOON = """<style>
-/* Grafiek 75% breed: op de telefoon blijft rechts ruimte om de pagina te scrollen */
-.st-key-fng_grafiek { width: 75% !important; max-width: 75% !important; }
+/* Tekengebied = volle breedte min 60px. Daarin vallen de as-labels rechts (~40px)
+   plus een smalle marge; samen met de rand van het uitklapblok blijft er zo op elk
+   telefoonformaat een vaste duimstrook van ~45-50px om de pagina te scrollen
+   (op een iPhone ~82% i.p.v. 75%). Een vaste strook werkt beter dan een
+   percentage: op een groot scherm hoef je niet meer ruimte op te geven. */
+.st-key-fng_grafiek { width: calc(100% - 60px) !important; max-width: calc(100% - 60px) !important; }
 /* In de grafiek zelf scrolt een vinger de pagina niet, maar verplaatst hij het punt */
 .st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: none; }
 </style>"""
