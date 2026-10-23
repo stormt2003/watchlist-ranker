@@ -1601,7 +1601,13 @@ def render_fng_grafiek():
     # Eén hover-selectie per paneel; samen bepalen ze waar de lijn in beide staat.
     hovers = [alt.selection_point(name=n, nearest=True, on="pointerover", fields=["datum"],
                                   empty=False, clear="pointerout") for n in ("hover_btc", "hover_fng", "hover_rsi")]
-    hover = hovers[0] | hovers[1] | hovers[2]
+    # Expliciet "empty: false" per selectie: bij het combineren met | raakt Altair
+    # dat kwijt, en dan telt een lege selectie als "alles geselecteerd" (dan
+    # verschijnen overal stippen en lijnen zodra de muis niet op dat paneel staat).
+    hover_test = {"or": [{"param": h.name, "empty": False} for h in hovers]}
+
+    def bij_hover(aan, uit):
+        return alt.value(uit, condition={"test": hover_test, "value": aan})
     x = alt.X("datum:T", title=None, axis=alt.Axis(format="%b %y", grid=False))
     tooltip = [alt.Tooltip("datum:T", title="Datum", format="%d-%m-%Y"),
                alt.Tooltip("btc:Q", title="BTC ($)", format=",.0f"),
@@ -1614,9 +1620,9 @@ def render_fng_grafiek():
         # verdubbelt ze anders over de lagen heen ("Duplicate signal name").
         punten = basis.mark_point(opacity=0).encode(y=y_veld, tooltip=tooltip).add_params(*params)
         lijn = basis.mark_rule(color="#888", strokeDash=[3, 3]).encode(
-            opacity=alt.condition(hover, alt.value(0.8), alt.value(0)))
+            opacity=bij_hover(0.8, 0))
         stip = basis.mark_circle(size=40).encode(
-            y=y_veld, opacity=alt.condition(hover, alt.value(1), alt.value(0)))
+            y=y_veld, opacity=bij_hover(1, 0))
         return punten, lijn, stip
 
     lo, hi = float(df["btc"].min()), float(df["btc"].max())
