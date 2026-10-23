@@ -574,6 +574,70 @@ def fetch_crypto_fear_greed() -> dict:
             "bron": "alternative.me", "zones": "standaard", "fouten": fouten}
 
 
+CMC_FNG_HISTORICAL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
+FNG_HISTORIE_START = pd.Timestamp("2018-01-01", tz="UTC")
+
+
+def _cmc_tijd(t) -> pd.Timestamp:
+    """CMC-tijdstempel (seconden of milliseconden, als tekst of getal) -> datum."""
+    t = float(t)
+    return pd.Timestamp(t, unit="ms" if t > 1e11 else "s", tz="UTC").normalize().tz_localize(None)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_crypto_fear_greed_historie() -> pd.DataFrame:
+    """Dagwaarden van de CoinMarketCap Fear & Greed (dezelfde bron als de meter),
+    met de BTC-prijs erbij. Kolommen: datum, fng, btc. 6 uur bewaard.
+    Eerst de grafiekdata van de CMC-website (gratis, met BTC-prijs), per jaar
+    opgehaald; lukt dat niet, dan de officiële API (kost credits)."""
+    rijen = []
+    nu = pd.Timestamp.now(tz="UTC")
+    try:
+        van = FNG_HISTORIE_START
+        while van < nu:
+            tot = min(van + pd.Timedelta(days=365), nu)
+            resp = requests.get(
+                CMC_FNG_CHART,
+                params={"start": int(van.timestamp()), "end": int(tot.timestamp())},
+                headers={"User-Agent": CNN_HEADERS["User-Agent"], "Accept": "application/json"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for d in (resp.json().get("data") or {}).get("dataList") or []:
+                btc = d.get("btcPrice")
+                rijen.append({"datum": _cmc_tijd(d["timestamp"]), "fng": float(d["score"]),
+                              "btc": float(btc) if btc not in (None, "") else None})
+            van = tot
+    except Exception:  # noqa: BLE001
+        rijen = []
+    sleutel = _cmc_api_key()
+    if not rijen and sleutel:
+        for pagina in range(10):  # 500 dagen per verzoek
+            resp = requests.get(
+                CMC_FNG_HISTORICAL, params={"start": 1 + pagina * 500, "limit": 500}, timeout=15,
+                headers={"X-CMC_PRO_API_KEY": sleutel, "Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+            rijen += [{"datum": _cmc_tijd(d["timestamp"]), "fng": float(d["value"]), "btc": None}
+                      for d in data]
+            if len(data) < 500:
+                break
+    if not rijen:
+        raise ValueError("geen Fear & Greed-geschiedenis van CoinMarketCap")
+    df = (pd.DataFrame(rijen).dropna(subset=["fng"])
+          .sort_values("datum").drop_duplicates("datum", keep="last"))
+    # BTC-prijs ontbreekt (API-route of losse dagen): aanvullen met Yahoo-dagkoersen
+    if df["btc"].isna().any():
+        try:
+            yahoo = fetch_daily_closes("BTC-USD")
+            yahoo.index = pd.to_datetime(yahoo.index).normalize()
+            df["btc"] = df["btc"].fillna(df["datum"].map(yahoo))
+        except Exception:  # noqa: BLE001
+            pass
+    return df.dropna(subset=["btc"]).reset_index(drop=True)
+
+
 CNN_FNG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CNN_HEADERS = {
     # CNN weigert verzoeken zonder browser-achtige headers
@@ -1480,6 +1544,82 @@ def _klok(tijd: float) -> str:
     return pd.Timestamp(tijd, unit="s", tz="UTC").tz_convert("Europe/Amsterdam").strftime("%H:%M:%S")
 
 
+FNG_PERIODES = {"1 jaar": 365, "2 jaar": 730, "4 jaar": 1460, "Alles": None}
+
+
+def render_fng_grafiek():
+    """BTC-prijs (boven) en de CMC Fear & Greed (onder) op dagbasis, met een
+    gedeelde datum-as: zoomen/schuiven en de hoverlijn lopen in beide mee.
+    Onder elkaar i.p.v. twee y-assen, zodat divergenties (lagere bodem in de
+    prijs, hogere bodem in de index) goed te zien zijn."""
+    import altair as alt  # wordt met Streamlit meegeleverd
+
+    try:
+        df = fetch_crypto_fear_greed_historie()
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"Fear & Greed-geschiedenis niet opgehaald: {e}")
+        return
+    if df.empty:
+        st.info("Geen data.")
+        return
+
+    keuze = st.radio("Periode", list(FNG_PERIODES), index=1, horizontal=True,
+                     key="fng_periode", label_visibility="collapsed")
+    dagen = FNG_PERIODES[keuze]
+    if dagen:
+        df = df[df["datum"] >= df["datum"].max() - pd.Timedelta(days=dagen)]
+
+    zoom = alt.selection_interval(name="zoom", bind="scales", encodings=["x"])
+    # Eén hover-selectie per paneel; samen bepalen ze waar de lijn in beide staat.
+    hovers = [alt.selection_point(name=n, nearest=True, on="pointerover", fields=["datum"],
+                                  empty=False, clear="pointerout") for n in ("hover_btc", "hover_fng")]
+    hover = hovers[0] | hovers[1]
+    x = alt.X("datum:T", title=None, axis=alt.Axis(format="%b %y", grid=False))
+    tooltip = [alt.Tooltip("datum:T", title="Datum", format="%d-%m-%Y"),
+               alt.Tooltip("btc:Q", title="BTC ($)", format=",.0f"),
+               alt.Tooltip("fng:Q", title="Fear & Greed", format=".0f")]
+    basis = alt.Chart(df).encode(x=x)
+
+    def hoverlagen(y_veld, *params):
+        # Alle selecties op deze ene (onzichtbare) laag: Altair/Vega-Lite
+        # verdubbelt ze anders over de lagen heen ("Duplicate signal name").
+        punten = basis.mark_point(opacity=0).encode(y=y_veld, tooltip=tooltip).add_params(*params)
+        lijn = basis.mark_rule(color="#888", strokeDash=[3, 3]).encode(
+            opacity=alt.condition(hover, alt.value(0.8), alt.value(0)))
+        stip = basis.mark_circle(size=40).encode(
+            y=y_veld, opacity=alt.condition(hover, alt.value(1), alt.value(0)))
+        return punten, lijn, stip
+
+    lo, hi = float(df["btc"].min()), float(df["btc"].max())
+    y_btc = alt.Y("btc:Q", title="BTC ($)",
+                  scale=alt.Scale(type="log", domain=[lo * 0.92, hi * 1.08], nice=False),
+                  axis=alt.Axis(orient="right", format="$~s", tickCount=5))
+    prijs = alt.layer(
+        basis.mark_line(color="#2a78d6", strokeWidth=1.6).encode(y=y_btc),
+        *hoverlagen(y_btc, hovers[0], zoom),
+    ).properties(height=260)
+
+    zones = pd.DataFrame([{"van": a, "tot": b, "kleur": k} for a, b, _, k in CMC_ZONES])
+    banden = alt.Chart(zones).mark_rect(opacity=0.10).encode(
+        y=alt.Y("van:Q"), y2="tot:Q", color=alt.Color("kleur:N", scale=None, legend=None))
+    y_fng = alt.Y("fng:Q", title="Fear & Greed", scale=alt.Scale(domain=[0, 100]),
+                  axis=alt.Axis(orient="right", values=[0, 20, 40, 60, 80, 100]))
+    index = alt.layer(
+        banden,
+        basis.mark_line(color="#eb6834", strokeWidth=1.4).encode(y=y_fng),
+        *hoverlagen(y_fng, hovers[1]),
+    ).properties(height=140)
+
+    # Zoom zit op de prijslijn; omdat de x-as gedeeld is, loopt de index mee.
+    grafiek = alt.vconcat(prijs, index, spacing=6).resolve_scale(x="shared")
+    st.altair_chart(grafiek, use_container_width=True)
+    st.caption(
+        f"Dagwaarden van CoinMarketCap ({df['datum'].min():%d-%m-%Y} t/m "
+        f"{df['datum'].max():%d-%m-%Y}). Scrollen = zoomen, slepen = schuiven, "
+        "dubbelklik = terug. Gekleurde banden: de zones van de meter."
+    )
+
+
 # ---------------------------------------------------------------------------
 # PAGINA
 # ---------------------------------------------------------------------------
@@ -1793,6 +1933,12 @@ def render_ranglijst(tickers: list, weights: dict, soort: str, in_bezit: tuple, 
 st.fragment(run_every=interval if auto else None)(render_live)(
     lijst, weights, soort, modus, tuple(portefeuille)
 )
+if soort == "crypto":
+    # Buiten de fragmenten: de grafiek ververst niet elke paar seconden mee,
+    # zodat inzoomen blijft staan. De data wordt 6 uur bewaard.
+    with st.expander("📈 BTC-prijs vs Fear & Greed (dagbasis)"):
+        render_fng_grafiek()
+
 if modus == "watchlist":
     st.fragment(run_every=rang_interval if auto else None)(render_ranglijst)(
         lijst, weights, soort, tuple(portefeuille), rang_interval if auto else None
