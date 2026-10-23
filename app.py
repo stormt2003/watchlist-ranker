@@ -1056,15 +1056,18 @@ LAMPJES = {  # status: (kleur, pulseren, uitleg)
 VOORBEURS_KLEUR = LAMPJES["pre"][0]  # zelfde oranje als het lampje
 
 
-def voorbeurs_onder_pct_html(row: pd.Series) -> str:
-    """Onder een voorbeurspercentage: dikgedrukt oranje label 'VOORBEURS' en
-    daaronder de voorbeursprijs, zodat meteen duidelijk is waar het getal over gaat."""
+def pre_label_html() -> str:
+    """Klein oranje 'pre' vóór een voorbeurspercentage (zelfde oranje als het lampje)."""
     return (
-        f'<div title="{EXT_LABELS["pre"][1]}" style="margin-top:3px">'
-        f'<span style="display:inline-block;padding:0 5px;border-radius:4px;'
-        f'background:{VOORBEURS_KLEUR}26;color:{VOORBEURS_KLEUR};font-size:0.6rem;'
-        f'font-weight:800;letter-spacing:0.04em;line-height:1.5">VOORBEURS</span></div>'
-        f'<div style="font-size:0.7rem;opacity:0.75;margin-top:2px;white-space:nowrap;'
+        f'<span title="{EXT_LABELS["pre"][1]}" style="color:{VOORBEURS_KLEUR};'
+        f'font-size:0.62em;font-weight:800;margin-right:4px;vertical-align:1px">pre</span>'
+    )
+
+
+def pre_prijs_html(row: pd.Series) -> str:
+    """Voorbeursprijs klein onder het percentage."""
+    return (
+        f'<div style="font-size:0.68rem;opacity:0.7;margin-top:2px;white-space:nowrap;'
         f'font-variant-numeric:tabular-nums">{hoofdprijs(row, "ext_prijs")}</div>'
     )
 
@@ -1179,7 +1182,8 @@ def holding_card_html(row: pd.Series) -> str:
         # voorbeurs (nog geen reguliere handel): het grote getal ís de voorbeurs
         dag_txt = f"{e:+.2f}%".replace(".", ",")
         kleur = "#2e9e58" if e >= 0 else "#d64545"
-        onder_pct = voorbeurs_onder_pct_html(row)
+        dag_txt = pre_label_html() + dag_txt
+        onder_pct = pre_prijs_html(row)
     elif not crypto and row.get("dag_actueel") is False:
         # nog geen handel vandaag: geen (oud) percentage, alleen de slotkoers
         dag_txt, kleur = "–", "inherit"
@@ -1236,7 +1240,7 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
 
     klein = ('<div style="font-size:0.68rem;white-space:nowrap;'
              'font-variant-numeric:tabular-nums;margin-top:2px">')
-    ext_html = ""
+    ext_html = pre = ""
     sessie, e = row.get("ext_sessie"), row.get("%_ext")
     dag = row.get("%_24u")
     heeft_dag = dag is not None and pd.notna(dag)
@@ -1245,7 +1249,8 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
     if heeft_ext and sessie == "pre" and not heeft_dag:
         # Voorbeurs (nog geen handel vandaag): het grote getal ís de voorbeurs.
         pct = e
-        ext_html = voorbeurs_onder_pct_html(row)
+        pre = pre_label_html()
+        ext_html = pre_prijs_html(row)
     elif heeft_ext:
         # Nabeurs: groot = de reguliere dag, eronder de nabeurs los, en wat ze
         # samen doen (daarop staat de regel in de ranglijst).
@@ -1279,7 +1284,7 @@ def mover_row_html(rank: int, row: pd.Series, pct: float, toon_ext: bool = False
         + '</div>'
         f'<div style="min-width:64px;text-align:right;line-height:1.15">'
         f'<div style="font-weight:800;font-size:0.95rem;color:{color};'
-        f'font-variant-numeric:tabular-nums">{pct_txt}</div>{ext_html}</div></div>'
+        f'font-variant-numeric:tabular-nums">{pre}{pct_txt}</div>{ext_html}</div></div>'
     )
     kader = 'border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px'
     if not uitleg:
