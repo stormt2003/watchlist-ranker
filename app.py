@@ -1679,14 +1679,22 @@ def btc_dagdata(df: pd.DataFrame) -> pd.DataFrame:
 
 
 GRAFIEK_CSS_TELEFOON = """<style>
-/* Bijna volle breedte: scrollen kan nu ook óver de grafiek (pan-y hieronder), dus
-   er is geen aparte duimstrook meer nodig. De 14px houdt de as-getallen rechts
-   binnen beeld (ze steken iets buiten het tekengebied uit). */
-.st-key-fng_grafiek { width: calc(100% - 14px) !important; max-width: calc(100% - 14px) !important; }
-/* Zo ver mogelijk naar links, tot net binnen de rand van het uitklapblok. */
-.st-key-fng_grafiek { margin-left: -18px !important; }
-/* Verticaal vegen = pagina scrollen (ook over de grafiek), zijwaarts = punt verschuiven */
-.st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: pan-y; }
+/* Zo breed mogelijk: de as-getallen rechts steken ~35px buiten het tekengebied uit
+   en vallen zo net binnen de rand van het uitklapblok. Zo ver mogelijk naar links. */
+.st-key-fng_grafiek { width: calc(100% - 2px) !important; max-width: calc(100% - 2px) !important;
+                      margin-left: -18px !important; position: relative; }
+/* Schakelaar 'Aflezen' rechtsboven in de prijsgrafiek, boven de hoogste prijs */
+.st-key-fng_lock { position: absolute !important; top: 2px; right: 44px; z-index: 5;
+                   width: auto !important; }
+.st-key-fng_lock label p { font-size: 0.8rem; }
+</style>"""
+# Uit (standaard): aanraken is voor de pagina, overal vrij scrollen
+GRAFIEK_CSS_SCROLLEN = """<style>
+.st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: auto; }
+</style>"""
+# Aan: aanraken is voor de grafiek (tikken/slepen), de pagina scrolt daar niet
+GRAFIEK_CSS_AFLEZEN = """<style>
+.st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: none; }
 </style>"""
 
 # Vega-expressies voor Nederlandse datums (los van de taal van de browser)
@@ -1771,6 +1779,8 @@ def render_fng_grafiek():
     # zolang er (op de telefoon) nog geen dag gekozen is, zoals bij TradingView.
     zicht = zicht.assign(laatste=zicht["datum"] == zicht["datum"].max())
 
+    aflezen = (not pc) and bool(st.session_state.get("fng_aflezen", False))
+
     # --- selecties -------------------------------------------------------------
     if pc:
         # Muis: punt volgt de muis, weg bij verlaten; zoomen/schuiven met de muis.
@@ -1780,33 +1790,30 @@ def render_fng_grafiek():
         params = [hover]
         gekozen = {"param": "hover", "empty": False}
     else:
-        # Vinger: tik zet het punt; bij slepen rekenen we de dag uit via de x-positie
-        # (een gewone 'nearest'-selectie blijft bij touch hangen op het beginpunt).
-        # Na loslaten blijft het punt staan; opnieuw aanraken begint opnieuw.
-        # De pagina scrolt met verticale vegen óók over de grafiek (touch-action: pan-y):
-        # - tik = 'click', en dat geeft de browser alleen bij een echte tik, niet na
-        #   scrollen; tikken op de as-getallen telt niet mee;
-        # - slepen telt alleen zolang de browser níet aan het scrollen is: tijdens
-        #   scrollen zijn touchmove-events niet 'cancelable', dus die negeren we.
-        #   Een verticale veeg sleept het punt zo niet mee. (Na een veeg valt het
-        #   punt terug op je laatste tik, of op de laatste dag.)
-        niet_op_as = ("!event.item || !event.item.mark || "
-                      "!test(/^axis-(label|tick|domain|title)$/, event.item.mark.role + '')")
-        hover = alt.selection_point(name="hover", nearest=True, fields=["datum"], empty=False,
-                                    on=f"click[{niet_op_as}]", clear=False)
-        sleep = alt.selection_interval(
-            name="sleep", encodings=["x"], clear="click",
-            on=f"[touchstart[{niet_op_as}], touchend] > touchmove[event.cancelable]",
-            translate=False, zoom=False, mark=alt.BrushConfig(fillOpacity=0, strokeOpacity=0))
+        # Telefoon heeft twee standen (schakelaar 'Aflezen' rechtsboven in de grafiek):
+        # - uit (standaard): de grafiek reageert niet op aanraken, je scrolt overal vrij;
+        # - aan: tikken en slepen kiest een dag, de pagina scrolt dan niet in de grafiek.
+        #   Bij slepen rekenen we de dag uit via de x-positie (een gewone 'nearest'-
+        #   selectie blijft bij touch hangen op het beginpunt). Na loslaten blijft het
+        #   punt staan; opnieuw aanraken begint opnieuw.
         zoom = None
-        params = [hover, sleep]
-        vinger = "data('sleep_store')[0].values[0][1]"  # datum onder de vinger
-        # de dag waarin de vinger valt: datum <= vinger < datum + 1 dag
-        gekozen = {"or": [
-            {"and": ["length(data('sleep_store')) > 0",
-                     f"+{vinger} - +datum.datum >= 0 && +{vinger} - +datum.datum < 86400000"]},
-            {"and": ["length(data('sleep_store')) == 0", {"param": "hover", "empty": False}]},
-        ]}
+        if aflezen:
+            hover = alt.selection_point(name="hover", nearest=True, fields=["datum"], empty=False,
+                                        on="mousemove, touchstart", clear="mouseout")
+            sleep = alt.selection_interval(name="sleep", encodings=["x"], clear="touchstart",
+                                           on="[touchstart, touchend] > touchmove",
+                                           translate=False, zoom=False,
+                                           mark=alt.BrushConfig(fillOpacity=0, strokeOpacity=0))
+            params = [hover, sleep]
+            vinger = "data('sleep_store')[0].values[0][1]"  # datum onder de vinger
+            # de dag waarin de vinger valt: datum <= vinger < datum + 1 dag
+            gekozen = {"or": [
+                {"and": ["length(data('sleep_store')) > 0",
+                         f"+{vinger} - +datum.datum >= 0 && +{vinger} - +datum.datum < 86400000"]},
+                {"and": ["length(data('sleep_store')) == 0", {"param": "hover", "empty": False}]},
+            ]}
+        else:
+            params, gekozen = [], "false"
 
     def bij_keuze(aan, uit):
         return alt.value(uit, condition={"test": gekozen, "value": aan})
@@ -1829,7 +1836,8 @@ def render_fng_grafiek():
         stip = basis.mark_circle(size=45).encode(y=y_veld, opacity=bij_keuze(1, 0))
         return [punten, lijn, stip]
 
-    geen_keuze = "length(data('hover_store')) == 0 && length(data('sleep_store')) == 0"
+    geen_keuze = ("length(data('hover_store')) == 0 && length(data('sleep_store')) == 0"
+                  if (not pc and aflezen) else "true")
 
     def waarde_label(expr: str, kleur: str):
         """Telefoon: linksboven in het paneel de waarde van de gekozen dag, of van
@@ -1931,17 +1939,16 @@ def render_fng_grafiek():
         # Geen zwevende tooltip op de telefoon: die hoort bij het punt waar je vinger
         # begon en klopt tijdens het slepen niet. De waarden staan bij de panelen.
         spec = grafiek.configure_mark(tooltip=False).to_dict()
-        # Vega blokkeert standaard de browseractie van aanrakingen die hij zelf
-        # gebruikt; daardoor kon je niet scrollen met je vinger op de grafiek.
-        # Hiermee mag de browser verticaal scrollen (zie touch-action: pan-y),
-        # terwijl de grafiek de aanrakingen nog steeds ontvangt.
-        spec.setdefault("config", {})["events"] = {
-            "defaults": {"allow": ["touchstart", "touchmove", "touchend"]}}
-        st.markdown(GRAFIEK_CSS_TELEFOON, unsafe_allow_html=True)
+        st.markdown(GRAFIEK_CSS_TELEFOON + (GRAFIEK_CSS_AFLEZEN if aflezen else GRAFIEK_CSS_SCROLLEN),
+                    unsafe_allow_html=True)
         with st.container(key="fng_grafiek"):
+            with st.container(key="fng_lock"):
+                st.toggle("👆 Aflezen", key="fng_aflezen",
+                          help="Aan: tik of sleep in de grafiek om een dag af te lezen. "
+                               "Uit: vrij scrollen over de grafiek.")
             st.vega_lite_chart(spec, use_container_width=True)
-        uitleg = ("Tik of sleep in de grafiek om een dag te kiezen; het punt blijft staan. "
-                  "De y-assen schalen mee met de gekozen periode.")
+        uitleg = ("Zet 'Aflezen' aan en tik of sleep in de grafiek om een dag te kiezen; het "
+                  "punt blijft staan. Uit = vrij scrollen. De y-assen schalen mee met de periode.")
     st.caption(
         f"{uitleg} Fear & Greed: dagwaarden van CoinMarketCap ({data_van:%d-%m-%Y} t/m "
         f"{data_tot:%d-%m-%Y}). BTC-prijs en RSI: {prijsbron}. "
