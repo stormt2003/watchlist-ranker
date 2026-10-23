@@ -1679,17 +1679,14 @@ def btc_dagdata(df: pd.DataFrame) -> pd.DataFrame:
 
 
 GRAFIEK_CSS_TELEFOON = """<style>
-/* Tekengebied = volle breedte min 46px. Daarin vallen de as-labels rechts (~40px)
-   plus een smalle marge; samen met de rand van het uitklapblok blijft er zo op elk
-   telefoonformaat een vaste duimstrook van ~45-50px om de pagina te scrollen
-   (op een iPhone ~86%). Een vaste strook werkt beter dan een
-   percentage: op een groot scherm hoef je niet meer ruimte op te geven. */
-.st-key-fng_grafiek { width: calc(100% - 46px) !important; max-width: calc(100% - 46px) !important; }
-/* Zo ver mogelijk naar links (tot net binnen de rand van het uitklapblok), zodat
-   alle vrije ruimte rechts zit: daar scrolt een rechterduim de pagina. */
+/* Bijna volle breedte: scrollen kan nu ook óver de grafiek (pan-y hieronder), dus
+   er is geen aparte duimstrook meer nodig. De 14px houdt de as-getallen rechts
+   binnen beeld (ze steken iets buiten het tekengebied uit). */
+.st-key-fng_grafiek { width: calc(100% - 14px) !important; max-width: calc(100% - 14px) !important; }
+/* Zo ver mogelijk naar links, tot net binnen de rand van het uitklapblok. */
 .st-key-fng_grafiek { margin-left: -18px !important; }
-/* In de grafiek zelf scrolt een vinger de pagina niet, maar verplaatst hij het punt */
-.st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: none; }
+/* Verticaal vegen = pagina scrollen (ook over de grafiek), zijwaarts = punt verschuiven */
+.st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: pan-y; }
 </style>"""
 
 # Vega-expressies voor Nederlandse datums (los van de taal van de browser)
@@ -1786,18 +1783,28 @@ def render_fng_grafiek():
         # Vinger: tik zet het punt; bij slepen rekenen we de dag uit via de x-positie
         # (een gewone 'nearest'-selectie blijft bij touch hangen op het beginpunt).
         # Na loslaten blijft het punt staan; opnieuw aanraken begint opnieuw.
+        # De pagina scrolt met verticale vegen óók over de grafiek (touch-action: pan-y):
+        # - tik = 'click', en dat geeft de browser alleen bij een echte tik, niet na
+        #   scrollen; tikken op de as-getallen telt niet mee;
+        # - slepen telt alleen zolang de browser níet aan het scrollen is: tijdens
+        #   scrollen zijn touchmove-events niet 'cancelable', dus die negeren we.
+        #   Een verticale veeg sleept het punt zo niet mee. (Na een veeg valt het
+        #   punt terug op je laatste tik, of op de laatste dag.)
+        niet_op_as = ("!event.item || !event.item.mark || "
+                      "!test(/^axis-(label|tick|domain|title)$/, event.item.mark.role + '')")
         hover = alt.selection_point(name="hover", nearest=True, fields=["datum"], empty=False,
-                                    on="mousemove, touchstart", clear="mouseout")
-        sleep = alt.selection_interval(name="sleep", encodings=["x"], clear="touchstart",
-                                       on="[touchstart, touchend] > touchmove",
-                                       translate=False, zoom=False,
-                                       mark=alt.BrushConfig(fillOpacity=0, strokeOpacity=0))
+                                    on=f"click[{niet_op_as}]", clear=False)
+        sleep = alt.selection_interval(
+            name="sleep", encodings=["x"], clear="click",
+            on=f"[touchstart[{niet_op_as}], touchend] > touchmove[event.cancelable]",
+            translate=False, zoom=False, mark=alt.BrushConfig(fillOpacity=0, strokeOpacity=0))
         zoom = None
         params = [hover, sleep]
         vinger = "data('sleep_store')[0].values[0][1]"  # datum onder de vinger
+        # de dag waarin de vinger valt: datum <= vinger < datum + 1 dag
         gekozen = {"or": [
             {"and": ["length(data('sleep_store')) > 0",
-                     f"abs(+datum.datum - +{vinger}) < 43200000"]},  # binnen een halve dag
+                     f"+{vinger} - +datum.datum >= 0 && +{vinger} - +datum.datum < 86400000"]},
             {"and": ["length(data('sleep_store')) == 0", {"param": "hover", "empty": False}]},
         ]}
 
@@ -1923,10 +1930,16 @@ def render_fng_grafiek():
     else:
         # Geen zwevende tooltip op de telefoon: die hoort bij het punt waar je vinger
         # begon en klopt tijdens het slepen niet. De waarden staan bij de panelen.
-        grafiek = grafiek.configure_mark(tooltip=False)
+        spec = grafiek.configure_mark(tooltip=False).to_dict()
+        # Vega blokkeert standaard de browseractie van aanrakingen die hij zelf
+        # gebruikt; daardoor kon je niet scrollen met je vinger op de grafiek.
+        # Hiermee mag de browser verticaal scrollen (zie touch-action: pan-y),
+        # terwijl de grafiek de aanrakingen nog steeds ontvangt.
+        spec.setdefault("config", {})["events"] = {
+            "defaults": {"allow": ["touchstart", "touchmove", "touchend"]}}
         st.markdown(GRAFIEK_CSS_TELEFOON, unsafe_allow_html=True)
         with st.container(key="fng_grafiek"):
-            st.altair_chart(grafiek, use_container_width=True)
+            st.vega_lite_chart(spec, use_container_width=True)
         uitleg = ("Tik of sleep in de grafiek om een dag te kiezen; het punt blijft staan. "
                   "De y-assen schalen mee met de gekozen periode.")
     st.caption(
