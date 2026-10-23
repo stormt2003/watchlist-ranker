@@ -1685,6 +1685,9 @@ GRAFIEK_CSS_TELEFOON = """<style>
    (op een iPhone ~86%). Een vaste strook werkt beter dan een
    percentage: op een groot scherm hoef je niet meer ruimte op te geven. */
 .st-key-fng_grafiek { width: calc(100% - 46px) !important; max-width: calc(100% - 46px) !important; }
+/* Zo ver mogelijk naar links (tot net binnen de rand van het uitklapblok), zodat
+   alle vrije ruimte rechts zit: daar scrolt een rechterduim de pagina. */
+.st-key-fng_grafiek { margin-left: -18px !important; }
 /* In de grafiek zelf scrolt een vinger de pagina niet, maar verplaatst hij het punt */
 .st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: none; }
 </style>"""
