@@ -1679,12 +1679,12 @@ def btc_dagdata(df: pd.DataFrame) -> pd.DataFrame:
 
 
 GRAFIEK_CSS_TELEFOON = """<style>
-/* Tekengebied = volle breedte min 60px. Daarin vallen de as-labels rechts (~40px)
+/* Tekengebied = volle breedte min 46px. Daarin vallen de as-labels rechts (~40px)
    plus een smalle marge; samen met de rand van het uitklapblok blijft er zo op elk
    telefoonformaat een vaste duimstrook van ~45-50px om de pagina te scrollen
-   (op een iPhone ~82% i.p.v. 75%). Een vaste strook werkt beter dan een
+   (op een iPhone ~86%). Een vaste strook werkt beter dan een
    percentage: op een groot scherm hoef je niet meer ruimte op te geven. */
-.st-key-fng_grafiek { width: calc(100% - 60px) !important; max-width: calc(100% - 60px) !important; }
+.st-key-fng_grafiek { width: calc(100% - 46px) !important; max-width: calc(100% - 46px) !important; }
 /* In de grafiek zelf scrolt een vinger de pagina niet, maar verplaatst hij het punt */
 .st-key-fng_grafiek .vega-embed, .st-key-fng_grafiek canvas, .st-key-fng_grafiek svg { touch-action: none; }
 </style>"""
@@ -1848,11 +1848,15 @@ def render_fng_grafiek():
                 x="einde:T"),
         ]
 
+    # Telefoon: y-as-labels strak tegen de grafiek: geen streepjes en aslijn, 3px afstand
+    # (was ~17px). Zo blijft er meer breedte over voor de grafiek zelf.
+    y_as = {} if pc else dict(ticks=False, domain=False, labelPadding=3, labelFontSize=11)
+
     # --- prijs -------------------------------------------------------------------
     lo, hi = float(zicht["btc"].min()), float(zicht["btc"].max())
     y_btc = alt.Y("btc:Q", title="BTC ($)" if pc else None,
                   scale=alt.Scale(type="log", domain=[lo * 0.95, hi * 1.05], nice=False),
-                  axis=alt.Axis(orient="right", format="$~s", tickCount=5))
+                  axis=alt.Axis(orient="right", format="$~s", tickCount=5, **y_as))
     label = []
     if toon_cyclus:
         label = [alt.Chart(pd.DataFrame(zones)).mark_text(
@@ -1878,7 +1882,7 @@ def render_fng_grafiek():
         color=alt.Color("kleur:N", scale=None, legend=None))
     y_fng = alt.Y("fng:Q", title="Fear & Greed" if pc else None,
                   scale=alt.Scale(domain=fng_dom, nice=False),
-                  axis=alt.Axis(orient="right", tickCount=5,
+                  axis=alt.Axis(orient="right", tickCount=5, **y_as,
                                 **({} if pc else {"labelExpr": "datum.value + '%'"})))
     index = alt.layer(
         fng_banden, *zone_lagen,
@@ -1900,7 +1904,7 @@ def render_fng_grafiek():
         y=alt.Y("y:Q", scale=rsi_schaal))
     y_rsi = alt.Y("rsi:Q", title=f"RSI ({RSI_PERIODE})" if pc else None,
                   scale=alt.Scale(domain=rsi_dom, nice=False),
-                  axis=alt.Axis(orient="right", tickCount=5))
+                  axis=alt.Axis(orient="right", tickCount=5, **y_as))
     rsi_paneel = alt.layer(
         rsi_banden, *zone_lagen, rsi_lijnen,
         basis.mark_line(color="#6250d6", strokeWidth=1.4, clip=True).encode(y=y_rsi),
