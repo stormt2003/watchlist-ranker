@@ -2314,11 +2314,56 @@ def render_ranglijst(tickers: list, weights: dict, soort: str, in_bezit: tuple, 
         st.dataframe(ranking, width="stretch", hide_index=True)
 
 
+MOMENTUM_MAANDEN = 3
+
+
+def momentum_rij(ticker: str) -> dict:
+    """Rendement over de afgelopen MOMENTUM_MAANDEN maanden op dagslotkoersen.
+    Gebruikt dezelfde (gecachete) dagdata als de ranglijst: geen extra verzoeken."""
+    closes = fetch_daily_closes(ticker)
+    laatste = closes.index[-1]
+    ref = _at_or_before(closes, laatste - pd.DateOffset(months=MOMENTUM_MAANDEN))
+    return {"Naam": fetch_meta(ticker)["naam"], "Ticker": ticker,
+            "pct": _pct(float(closes.iloc[-1]), ref), "Slotkoers van": laatste}
+
+
+def render_momentum(tickers: list):
+    """Aandelen (geen ETF's) gesorteerd op hun momentum over 3 maanden."""
+    aandelen = [t for t in tickers if str(fetch_meta(t).get("soort") or "").upper() != "ETF"]
+    if not aandelen:
+        st.info("Geen losse aandelen in deze lijst (ETF's worden overgeslagen).")
+        return
+    rijen = [r for r in parallel(momentum_rij, aandelen) if r and r["pct"] is not None]
+    mislukt = len(aandelen) - len(rijen)
+    if not rijen:
+        st.warning("Geen koersdata om het momentum te berekenen.")
+        return
+    df = pd.DataFrame(rijen).sort_values("pct", ascending=False).reset_index(drop=True)
+    df.insert(0, "#", df.index + 1)
+    df.insert(3, "Richting", df["pct"].map(lambda v: "🟢 omhoog" if v > 0 else "🔴 omlaag"))
+    df["Slotkoers van"] = df["Slotkoers van"].dt.strftime("%d-%m-%Y")
+    st.dataframe(
+        df, hide_index=True, width="stretch",
+        column_config={
+            "pct": st.column_config.NumberColumn(f"{MOMENTUM_MAANDEN} mnd", format="%+.1f%%"),
+        },
+    )
+    st.caption(
+        f"Koersverandering over de afgelopen {MOMENTUM_MAANDEN} maanden op dagslotkoersen, "
+        "elk in de eigen valuta. ETF's tellen niet mee."
+        + (f" {mislukt} aandeel/aandelen zonder data overgeslagen." if mislukt else "")
+    )
+
+
 # Twee fragmenten die elk in hun eigen tempo verversen. Alleen de tickers van
 # het gekozen tabblad worden opgehaald.
 st.fragment(run_every=interval if auto else None)(render_live_boven)(
     lijst, weights, soort, modus
 )
+if soort == "aandelen" and lijst:
+    # Buiten de fragmenten: ververst niet elke paar seconden (slotkoersen volstaan)
+    with st.expander(f"📊 Momentum ({MOMENTUM_MAANDEN} maanden)"):
+        render_momentum(lijst)
 if soort == "crypto":
     # Buiten de fragmenten: cycluskaart en grafiek verversen niet elke paar
     # seconden mee, zodat inzoomen blijft staan. De data wordt 6 uur bewaard.
