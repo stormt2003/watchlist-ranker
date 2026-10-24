@@ -2327,32 +2327,378 @@ def momentum_rij(ticker: str) -> dict:
             "pct": _pct(float(closes.iloc[-1]), ref), "Slotkoers van": laatste}
 
 
-def render_momentum(tickers: list):
-    """Aandelen (geen ETF's) gesorteerd op hun momentum over 3 maanden."""
+# ---------------------------------------------------------------------------
+# FUNDAMENTELE ANALYSE (alleen losse aandelen, geen ETF's)
+# ---------------------------------------------------------------------------
+# Aannames reverse DCF: pas hier aan
+DCF_RENDEMENT = 0.09   # gewenst jaarrendement (disconteringsvoet)
+DCF_JAREN = 10         # jaren met de ingeprijsde groei
+DCF_EINDGROEI = 0.025  # groei daarna, voor altijd
+# Oordeel 'goedkoper/duurder': yield nu minstens zoveel hoger/lager dan het gemiddelde
+WAARDERING_DREMPEL = 10  # procent
+
+
+def _maak_naief(index) -> pd.DatetimeIndex:
+    idx = pd.to_datetime(index)
+    return idx.tz_localize(None) if idx.tz is not None else idx
+
+
+@st.cache_data(ttl=24 * 3600, max_entries=200, show_spinner=False)
+def fetch_jaarcijfers(ticker: str) -> dict:
+    """Jaarcijfers (resultaat, balans, kasstroom), wat basisinfo en slotkoersen
+    zonder dividendcorrectie (zodat oude koersen echt de koers van toen zijn).
+    24 uur bewaard: jaarcijfers veranderen maar een paar keer per jaar."""
+    t = yf.Ticker(ticker)
+    try:
+        info = t.info or {}
+        stukken = {"resultaat": t.income_stmt, "balans": t.balance_sheet, "kasstroom": t.cashflow}
+        koers = t.history(period="6y", interval="1d", auto_adjust=False)
+    except YFRateLimitError:
+        _markeer_rate_limit()
+        raise  # niet cachen
+    for k, df in stukken.items():
+        if df is None or df.empty:
+            raise ValueError("geen jaarcijfers bij Yahoo")
+        df = df.copy()
+        df.columns = _maak_naief(df.columns)
+        stukken[k] = df[sorted(df.columns)]  # oud -> nieuw
+    if koers.empty:
+        raise ValueError("geen koersdata")
+    slot = koers["Close"].dropna()
+    slot.index = _maak_naief(slot.index)
+    return {
+        **stukken, "slot": slot,
+        "info": {k: info.get(k) for k in ("sector", "industry", "financialCurrency",
+                                           "currency", "marketCap", "sharesOutstanding")},
+    }
+
+
+def _regel(df: pd.DataFrame, *namen) -> pd.Series:
+    """Eerste regel die bestaat (Yahoo gebruikt niet altijd dezelfde namen)."""
+    for n in namen:
+        if n in df.index:
+            return pd.to_numeric(df.loc[n], errors="coerce")
+    return pd.Series(dtype=float)
+
+
+def _w(reeks: pd.Series, datum):
+    """Waarde op een jaareinde, of None."""
+    v = reeks.get(datum) if not reeks.empty else None
+    return None if v is None or pd.isna(v) else float(v)
+
+
+def _deel(a, b):
+    return a / b if a is not None and b not in (None, 0) else None
+
+
+def _fx_reeks(van: str, naar: str):
+    """Dagelijkse wisselkoers (1 van = x naar) of None als die er niet is."""
+    if van == naar:
+        return pd.Series(dtype=float)  # leeg = koers 1
+    for paar, omkeren in ((f"{van}{naar}=X", False), (f"{naar}{van}=X", True)):
+        try:
+            s = fetch_daily_closes(paar)
+            return 1 / s if omkeren else s
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _fx_op(reeks: pd.Series, datum) -> float:
+    if reeks.empty:
+        return 1.0
+    v = _at_or_before(reeks, datum)
+    return v if v is not None else float(reeks.iloc[0])  # ouder dan de reeks: eerste koers
+
+
+def _cagr(reeks: pd.Series):
+    """Gemiddelde jaarlijkse groei van eerste naar laatste jaar (alleen bij positieve waarden)."""
+    r = reeks.dropna()
+    if len(r) < 2 or r.iloc[0] <= 0 or r.iloc[-1] <= 0:
+        return None
+    jaren = (r.index[-1] - r.index[0]).days / 365.25
+    return (r.iloc[-1] / r.iloc[0]) ** (1 / jaren) - 1 if jaren > 0.5 else None
+
+
+def dcf_waarde(fcf: float, groei: float) -> float:
+    r, gt = DCF_RENDEMENT, DCF_EINDGROEI
+    waarde, kas = 0.0, fcf
+    for jaar in range(1, DCF_JAREN + 1):
+        kas *= 1 + groei
+        waarde += kas / (1 + r) ** jaar
+    return waarde + kas * (1 + gt) / (r - gt) / (1 + r) ** DCF_JAREN
+
+
+def ingeprijsde_groei(fcf: float, marktwaarde: float):
+    """Reverse DCF: welke jaarlijkse groei maakt de DCF-waarde gelijk aan de
+    marktwaarde? Geeft (groei, teken): teken is '>' of '<' als het buiten -50..100% valt."""
+    if fcf is None or marktwaarde is None or fcf <= 0 or marktwaarde <= 0:
+        return None, ""
+    lo, hi = -0.5, 1.0
+    if dcf_waarde(fcf, hi) < marktwaarde:
+        return hi, ">"
+    if dcf_waarde(fcf, lo) > marktwaarde:
+        return lo, "<"
+    for _ in range(60):  # halveren: de waarde stijgt met de groei
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if dcf_waarde(fcf, mid) < marktwaarde else (lo, mid)
+    return (lo + hi) / 2, ""
+
+
+def piotroski(res, bal, kas, nu, vorig) -> tuple:
+    """Piotroski F-score: (punten, aantal tests dat kon). Ontbreekt data voor een
+    test, dan telt die niet mee (zie het aantal)."""
+    ni, cfo = _regel(res, "Net Income", "Net Income Common Stockholders"), _regel(kas, "Operating Cash Flow")
+    activa = _regel(bal, "Total Assets")
+    lt_schuld = _regel(bal, "Long Term Debt", "Long Term Debt And Capital Lease Obligation")
+    vlot_a, vlot_p = _regel(bal, "Current Assets"), _regel(bal, "Current Liabilities")
+    aandelen = _regel(bal, "Ordinary Shares Number", "Share Issued")
+    bruto, omzet = _regel(res, "Gross Profit"), _regel(res, "Total Revenue", "Operating Revenue")
+
+    def roa(d):
+        return _deel(_w(ni, d), _w(activa, d))
+
+    tests = []
+    tests.append(None if roa(nu) is None else roa(nu) > 0)
+    tests.append(None if _w(cfo, nu) is None else _w(cfo, nu) > 0)
+    tests.append(None if None in (roa(nu), roa(vorig)) else roa(nu) > roa(vorig))
+    tests.append(None if None in (_w(cfo, nu), _w(ni, nu)) else _w(cfo, nu) > _w(ni, nu))
+    hef = [_deel(_w(lt_schuld, d), _w(activa, d)) for d in (nu, vorig)]
+    tests.append(None if None in hef else hef[0] <= hef[1])
+    cr = [_deel(_w(vlot_a, d), _w(vlot_p, d)) for d in (nu, vorig)]
+    tests.append(None if None in cr else cr[0] > cr[1])
+    st_ = [_w(aandelen, d) for d in (nu, vorig)]
+    verhouding = _deel(st_[0], st_[1])
+    # > 1,5x is vrijwel altijd een aandelensplitsing, geen uitgifte: niet meetellen
+    tests.append(None if verhouding is None or verhouding > 1.5 else verhouding <= 1.0)
+    marge = [_deel(_w(bruto, d), _w(omzet, d)) for d in (nu, vorig)]
+    tests.append(None if None in marge else marge[0] > marge[1])
+    omloop = [_deel(_w(omzet, d), _w(activa, d)) for d in (nu, vorig)]
+    tests.append(None if None in omloop else omloop[0] > omloop[1])
+    gedaan = [t for t in tests if t is not None]
+    return sum(gedaan), len(gedaan)
+
+
+def _is_financieel(info: dict) -> bool:
+    branche = str(info.get("industry") or "")
+    return info.get("sector") == "Financial Services" and any(
+        w in branche for w in ("Bank", "Insurance", "Capital Markets"))
+
+
+def fundamentele_rij(ticker: str) -> dict:
+    """Alle fundamentele cijfers voor één aandeel. Bedragen worden omgerekend
+    naar de valuta van de jaarcijfers (bv. Tencent: koers in HKD, cijfers in CNY)."""
+    rij = {"ticker": ticker}
+    d = fetch_jaarcijfers(ticker)
+    res, bal, kas, slot, info = d["resultaat"], d["balans"], d["kasstroom"], d["slot"], d["info"]
+    jaren = list(res.columns)
+    nu_jaar = jaren[-1]
+
+    # --- valuta en marktwaarde ------------------------------------------------
+    koers_val = info.get("currency") or fetch_meta(ticker)["valuta"]
+    deler = 100 if koers_val == "GBp" else 1  # Londen noteert in pence
+    koers_val = "GBP" if koers_val == "GBp" else koers_val
+    cijfer_val = info.get("financialCurrency") or koers_val
+    fx = _fx_reeks(koers_val, cijfer_val)
+    if fx is None:
+        raise ValueError(f"geen wisselkoers {koers_val}->{cijfer_val}")
+    aandelen = _regel(bal, "Ordinary Shares Number", "Share Issued")
+    laatste_aandelen = (_w(aandelen, aandelen.last_valid_index())
+                        if not aandelen.dropna().empty else None)
+    # Aantal volgens de koersnotering (bij ADR's al omgerekend), anders uit de balans
+    aandelen_nu = info.get("sharesOutstanding") or laatste_aandelen
+    if not aandelen_nu:
+        raise ValueError("aantal aandelen onbekend")
+    koers_nu = float(slot.iloc[-1]) / deler
+    mcap_nu = koers_nu * aandelen_nu * _fx_op(fx, slot.index[-1])  # in de valuta van de cijfers
+
+    def marktwaarde_op(datum):
+        """Marktwaarde op een jaareinde, afgeleid van de huidige (zo kloppen ook ADR's):
+        mcap_nu × koersverhouding × verhouding aantal aandelen × wisselkoersverhouding."""
+        k = _at_or_before(slot, datum)
+        if k is None:
+            return None
+        m = mcap_nu * (k / deler) / koers_nu * _fx_op(fx, datum) / _fx_op(fx, slot.index[-1])
+        verh = _deel(_w(aandelen, datum), laatste_aandelen)
+        if verh is not None and 0.67 <= verh <= 1.5:  # anders waarschijnlijk een splitsing
+            m *= verh
+        return m
+
+    schuld = _regel(bal, "Total Debt")
+    kasgeld = _regel(bal, "Cash Cash Equivalents And Short Term Investments",
+                     "Cash And Cash Equivalents")
+
+    def netto_schuld(datum):
+        return (_w(schuld, datum) or 0.0) - (_w(kasgeld, datum) or 0.0)
+
+    ebit = _regel(res, "EBIT", "Operating Income")
+    fcf = _regel(kas, "Free Cash Flow")
+    eigen_vermogen = _regel(bal, "Stockholders Equity", "Common Stock Equity")
+    netto_winst = _regel(res, "Net Income", "Net Income Common Stockholders")
+    omzet = _regel(res, "Total Revenue", "Operating Revenue")
+
+    financieel = _is_financieel(info) or fcf.dropna().empty
+    rij["soort"] = "financieel" if financieel else "normaal"
+
+    # --- 1. goedkoop t.o.v. zichzelf --------------------------------------------
+    def yields(datum, mcap):
+        if mcap is None:
+            return {}
+        if financieel:  # boekwaarde/koers: hoger = goedkoper
+            return {"bp": _deel(_w(eigen_vermogen, datum), mcap)}
+        ev = mcap + netto_schuld(datum)
+        return {"fcf": _deel(_w(fcf, datum), mcap), "ey": _deel(_w(ebit, datum), ev)}
+
+    nu = yields(nu_jaar, mcap_nu)
+    historie = [yields(j, marktwaarde_op(j)) for j in jaren]
+    verschillen = []
+    for k, v_nu in nu.items():
+        oud = [h[k] for h in historie if h.get(k) is not None]
+        gem = sum(oud) / len(oud) if len(oud) >= 2 else None
+        rij[f"{k}_nu"], rij[f"{k}_gem"] = v_nu, gem
+        # alleen bij positieve yields: een negatieve kasstroom geeft anders onzin-percentages
+        if v_nu is not None and v_nu > 0 and gem is not None and gem > 0:
+            verschillen.append((v_nu / gem - 1) * 100)
+    rij["tov_historie"] = sum(verschillen) / len(verschillen) if verschillen else None
+    rij["jaren"] = len(jaren)
+
+    # --- 2. reverse DCF + werkelijke groei -----------------------------------------
+    rij["omzetgroei"] = _cagr(omzet)
+    if not financieel:
+        groei, teken = ingeprijsde_groei(_w(fcf, nu_jaar), mcap_nu)
+        rij["ingeprijsd"], rij["ingeprijsd_teken"] = groei, teken
+        rij["fcfgroei"] = _cagr(fcf)
+
+    # --- 3. kwaliteit ----------------------------------------------------------------
+    if financieel:
+        roe = [_deel(_w(netto_winst, j), _w(eigen_vermogen, j)) for j in jaren]
+        reeks = [r for r in roe if r is not None]
+    else:
+        if len(jaren) >= 2:
+            rij["f_score"], rij["f_tests"] = piotroski(res, bal, kas, nu_jaar, jaren[-2])
+        winst_vb = _regel(res, "Pretax Income")
+        belasting = _regel(res, "Tax Provision")
+        reeks = []
+        for j in jaren:
+            e = _w(ebit, j)
+            kapitaal = (_w(schuld, j) or 0.0) + (_w(eigen_vermogen, j) or 0.0) - (_w(kasgeld, j) or 0.0)
+            if e is None or kapitaal <= 0:
+                continue
+            tarief = _deel(_w(belasting, j), _w(winst_vb, j))
+            tarief = 0.21 if tarief is None else min(max(tarief, 0.0), 0.35)
+            reeks.append(e * (1 - tarief) / kapitaal)
+    if reeks:
+        rij["rendement_nu"], rij["rendement_min"], rij["rendement_max"] = reeks[-1], min(reeks), max(reeks)
+    return rij
+
+
+def _fund_veilig(ticker: str):
+    try:
+        return fundamentele_rij(ticker)
+    except Exception as e:  # noqa: BLE001
+        return {"ticker": ticker, "fout": str(e)}
+
+
+def _pct_of_none(v, factor=100):
+    return None if v is None or pd.isna(v) else v * factor
+
+
+def _oordeel(v) -> str:
+    if v is None or pd.isna(v):
+        return "–"
+    if v >= WAARDERING_DREMPEL:
+        return "🟢 goedkoper"
+    if v <= -WAARDERING_DREMPEL:
+        return "🔴 duurder"
+    return "🟡 rond gem."
+
+
+def render_fundamenteel(tickers: list):
+    """Waardering t.o.v. eigen historie, reverse DCF, kwaliteit en momentum (3 mnd)
+    voor de losse aandelen in de lijst."""
     aandelen = [t for t in tickers if str(fetch_meta(t).get("soort") or "").upper() != "ETF"]
     if not aandelen:
         st.info("Geen losse aandelen in deze lijst (ETF's worden overgeslagen).")
         return
-    rijen = [r for r in parallel(momentum_rij, aandelen) if r and r["pct"] is not None]
-    mislukt = len(aandelen) - len(rijen)
-    if not rijen:
-        st.warning("Geen koersdata om het momentum te berekenen.")
+    if not st.toggle("Berekenen", key="fund_aan",
+                     help="Haalt de jaarcijfers op bij Yahoo (de eerste keer even wachten, "
+                          "daarna 24 uur bewaard). Staat uit zodat de pagina snel blijft."):
+        st.caption("Zet 'Berekenen' aan om de analyse te laden.")
         return
-    df = pd.DataFrame(rijen).sort_values("pct", ascending=False).reset_index(drop=True)
-    df.insert(0, "#", df.index + 1)
-    df.insert(3, "Richting", df["pct"].map(lambda v: "🟢 omhoog" if v > 0 else "🔴 omlaag"))
-    df["Slotkoers van"] = df["Slotkoers van"].dt.strftime("%d-%m-%Y")
+
+    with st.spinner("Jaarcijfers ophalen en doorrekenen…"):
+        fund = parallel(_fund_veilig, aandelen)
+        mom = parallel(momentum_rij, aandelen)
+
+    rijen, fouten = [], []
+    for t, f, m in zip(aandelen, fund, mom):
+        f = f or {"fout": "onbekende fout"}
+        if "fout" in f:
+            fouten.append(f"{t}: {f['fout']}")
+        fin = f.get("soort") == "financieel"
+        ing = _pct_of_none(f.get("ingeprijsd"))
+        f_score = (f"{f['f_score']}/9" if f.get("f_tests") == 9
+                   else f"{f['f_score']}/{f['f_tests']}*" if f.get("f_tests") else "–")
+        rmin, rmax = f.get("rendement_min"), f.get("rendement_max")
+        rijen.append({
+            "Naam": fetch_meta(t)["naam"], "Ticker": t,
+            "Waardering": _oordeel(f.get("tov_historie")),
+            "tov": f.get("tov_historie"),
+            "fcf": _pct_of_none(f.get("fcf_nu")), "fcf_gem": _pct_of_none(f.get("fcf_gem")),
+            "ey": _pct_of_none(f.get("bp_nu") if fin else f.get("ey_nu")),
+            "ey_gem": _pct_of_none(f.get("bp_gem") if fin else f.get("ey_gem")),
+            "ingeprijsd": ing,
+            "ing_tekst": (f"{f.get('ingeprijsd_teken', '')}{ing:+.0f}%".replace(".", ",")
+                          if ing is not None else "n.v.t."),
+            "omzetgroei": _pct_of_none(f.get("omzetgroei")),
+            "fcfgroei": _pct_of_none(f.get("fcfgroei")),
+            "F-score": "–" if fin else f_score,
+            "rendement": _pct_of_none(f.get("rendement_nu")),
+            "bandbreedte": (f"{rmin * 100:.0f} – {rmax * 100:.0f}%" if rmin is not None else "–"),
+            "mom": (m or {}).get("pct"),
+            "Opmerking": " · ".join(x for x in (
+                "bank/verzekeraar: boekwaarde en ROE" if fin else "",
+                f"{f['jaren']} jaar cijfers" if f.get("jaren") else "",
+                "fout, zie onder" if "fout" in f else "") if x),
+        })
+    df = pd.DataFrame(rijen).sort_values("tov", ascending=False, na_position="last")
+    pct = lambda titel, hulp, teken=True: st.column_config.NumberColumn(  # noqa: E731
+        titel, help=hulp, format="%+.1f%%" if teken else "%.1f%%")
     st.dataframe(
         df, hide_index=True, width="stretch",
+        column_order=["Naam", "Ticker", "Waardering", "tov", "fcf", "fcf_gem", "ey", "ey_gem",
+                      "ing_tekst", "omzetgroei", "fcfgroei", "F-score", "rendement",
+                      "bandbreedte", "mom", "Opmerking"],
         column_config={
-            "pct": st.column_config.NumberColumn(f"{MOMENTUM_MAANDEN} mnd", format="%+.1f%%"),
+            "tov": pct("t.o.v. historie", "Hoeveel hoger (+, goedkoper) of lager (−, duurder) de "
+                       "yields nu zijn dan gemiddeld over de jaren met cijfers."),
+            "fcf": pct("FCF yield", "Vrije kasstroom / marktwaarde, nu.", False),
+            "fcf_gem": pct("FCF yield gem.", "Gemiddeld op de jaareinden.", False),
+            "ey": pct("Earnings yield", "EBIT / ondernemingswaarde, nu. "
+                      "Banken/verzekeraars: boekwaarde / marktwaarde.", False),
+            "ey_gem": pct("Earnings yield gem.", "Gemiddeld op de jaareinden.", False),
+            "ing_tekst": st.column_config.TextColumn(
+                "Ingeprijsde groei", help=f"Reverse DCF: jaarlijkse FCF-groei die de koers rechtvaardigt "
+                f"({DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%})."),
+            "omzetgroei": pct("Omzetgroei/jr", "Werkelijke gemiddelde groei per jaar."),
+            "fcfgroei": pct("FCF-groei/jr", "Werkelijke gemiddelde groei van de vrije kasstroom."),
+            "F-score": st.column_config.TextColumn(
+                "F-score", help="Piotroski 0–9. * = niet alle 9 tests konden (data ontbrak)."),
+            "rendement": pct("ROIC", "Rendement op geïnvesteerd kapitaal, laatste jaar. "
+                             "Banken/verzekeraars: ROE.", False),
+            "bandbreedte": st.column_config.TextColumn("ROIC laag–hoog", help="Over de jaren met cijfers."),
+            "mom": pct(f"Momentum {MOMENTUM_MAANDEN} mnd", "Koersverandering op dagslotkoersen."),
         },
     )
     st.caption(
-        f"Koersverandering over de afgelopen {MOMENTUM_MAANDEN} maanden op dagslotkoersen, "
-        "elk in de eigen valuta. ETF's tellen niet mee."
-        + (f" {mislukt} aandeel/aandelen zonder data overgeslagen." if mislukt else "")
+        "Waardering: yields nu vergeleken met het eigen gemiddelde over de afgelopen jaren "
+        f"(🟢 minstens {WAARDERING_DREMPEL}% hoger = goedkoper). Ingeprijsde groei: wat de koers "
+        "verwacht; zet dat naast de werkelijke groei. F-score 7–9 = sterk, 0–3 = zwak. "
+        "Bedragen in de valuta van de jaarcijfers; jaarcijfers 24 uur bewaard. ETF's tellen niet mee."
     )
+    if fouten:
+        with st.expander(f"Niet (volledig) berekend ({len(fouten)})"):
+            st.write("\n\n".join(fouten))
 
 
 # Twee fragmenten die elk in hun eigen tempo verversen. Alleen de tickers van
@@ -2362,8 +2708,8 @@ st.fragment(run_every=interval if auto else None)(render_live_boven)(
 )
 if soort == "aandelen" and lijst:
     # Buiten de fragmenten: ververst niet elke paar seconden (slotkoersen volstaan)
-    with st.expander(f"📊 Momentum ({MOMENTUM_MAANDEN} maanden)"):
-        render_momentum(lijst)
+    with st.expander(f"📊 Waardering, kwaliteit & momentum ({MOMENTUM_MAANDEN} mnd)"):
+        render_fundamenteel(lijst)
 if soort == "crypto":
     # Buiten de fragmenten: cycluskaart en grafiek verversen niet elke paar
     # seconden mee, zodat inzoomen blijft staan. De data wordt 6 uur bewaard.
