@@ -1678,6 +1678,26 @@ def btc_dagdata(df: pd.DataFrame) -> pd.DataFrame:
     return df.assign(rsi=rsi(df.set_index("datum")["btc"]).to_numpy(), bron="CoinMarketCap")
 
 
+# Weeks-MA's in de BTC-prijsgrafiek: (aantal weken, kleur van de lijn)
+BTC_WEEK_MAS = {"ma50w": (50, "#f2a900"), "ma200w": (200, "#2e9e58")}
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def btc_week_mas() -> pd.DataFrame:
+    """50w- en 200w-MA van BTC op weekslotkoersen (hele historie), 12 uur bewaard.
+    Wordt alleen opgehaald als een van de vinkjes aan staat."""
+    weekly = fetch_weekly_max("BTC-USD")
+    return pd.DataFrame({k: weekly.rolling(w).mean() for k, (w, _) in BTC_WEEK_MAS.items()})
+
+
+def met_week_mas(df: pd.DataFrame, kolommen: list) -> pd.DataFrame:
+    """Zet de gekozen week-MA's als kolom bij de dagdata. Elke dag krijgt de MA van
+    de week waar hij in valt (trapjes, zoals een weeks-MA op een daggrafiek)."""
+    mas = btc_week_mas()
+    dagen = mas.reindex(df["datum"], method="bfill")  # weeklabel = zondag van die week
+    return df.assign(**{k: dagen[k].to_numpy() for k in kolommen})
+
+
 GRAFIEK_CSS_TELEFOON = """<style>
 /* Zo breed mogelijk: de as-getallen rechts steken ~35px buiten het tekengebied uit
    en vallen zo net binnen de rand van het uitklapblok. Zo ver mogelijk naar links. */
@@ -1750,6 +1770,21 @@ def render_fng_grafiek():
         toon_cyclus = st.checkbox("Theoretisch einde bullrun", key="fng_cyclus",
                                   help="Kernzone (donker) en aandachtszone (licht) van de "
                                        "vorige en de aankomende cyclus.")
+    m1, m2 = st.columns(2)
+    with m1:
+        toon_ma50 = st.checkbox(":orange[50w MA]", key="fng_ma50", value=False,
+                                help="50-weeks voortschrijdend gemiddelde (weekslotkoersen).")
+    with m2:
+        toon_ma200 = st.checkbox(":green[200w MA]", key="fng_ma200", value=False,
+                                 help="200-weeks voortschrijdend gemiddelde (weekslotkoersen).")
+    ma_kolommen = [k for k, aan in (("ma50w", toon_ma50), ("ma200w", toon_ma200)) if aan]
+    if ma_kolommen:
+        try:
+            df = met_week_mas(df, ma_kolommen)
+        except Exception as e:  # noqa: BLE001
+            st.caption(f"Week-MA's niet opgehaald: {e}")
+            ma_kolommen = []
+
     as_tot = data_tot
     if toon_cyclus:
         as_tot = max(data_tot, max(z["aandacht_tot"] for z in zones) + pd.Timedelta(days=150))
@@ -1826,6 +1861,8 @@ def render_fng_grafiek():
                alt.Tooltip("btc:Q", title="BTC ($)", format=",.0f"),
                alt.Tooltip("fng:Q", title="Fear & Greed", format=".0f"),
                alt.Tooltip("rsi:Q", title=f"RSI ({RSI_PERIODE})", format=".0f")]
+    tooltip += [alt.Tooltip(f"{k}:Q", title=f"{BTC_WEEK_MAS[k][0]}w MA ($)", format=",.0f")
+                for k in ma_kolommen]
 
     def hoverlagen(y_veld, *extra):
         # Alle selecties op deze ene (onzichtbare) laag per paneel: Altair verdubbelt
@@ -1871,9 +1908,10 @@ def render_fng_grafiek():
     y_as = {} if pc else dict(ticks=False, domain=False, labelPadding=3, labelFontSize=11)
 
     # --- prijs -------------------------------------------------------------------
-    lo, hi = float(zicht["btc"].min()), float(zicht["btc"].max())
-    y_btc = alt.Y("btc:Q", title="BTC ($)" if pc else None,
-                  scale=alt.Scale(type="log", domain=[lo * 0.95, hi * 1.05], nice=False),
+    in_beeld = zicht[["btc", *ma_kolommen]]
+    lo, hi = float(in_beeld.min().min()), float(in_beeld.max().max())
+    btc_schaal = alt.Scale(type="log", domain=[lo * 0.95, hi * 1.05], nice=False)
+    y_btc = alt.Y("btc:Q", title="BTC ($)" if pc else None, scale=btc_schaal,
                   axis=alt.Axis(orient="right", format="$~s", tickCount=5, **y_as))
     label = []
     if toon_cyclus:
@@ -1884,6 +1922,8 @@ def render_fng_grafiek():
                  text=alt.value("theoretisch einde bullrun"))]
     prijs = alt.layer(
         *zone_lagen, *label,
+        *[basis.mark_line(color=BTC_WEEK_MAS[k][1], strokeWidth=1.4, clip=True)
+               .encode(y=alt.Y(f"{k}:Q", scale=btc_schaal)) for k in ma_kolommen],
         basis.mark_line(color="#2a78d6", strokeWidth=1.6, clip=True).encode(y=y_btc),
         *hoverlagen(y_btc, *([zoom] if zoom else [])),
         *waarde_label(f"{DATUM_EXPR} + '   BTC $' + format(datum.btc, ',.0f')", "#2a78d6"),
