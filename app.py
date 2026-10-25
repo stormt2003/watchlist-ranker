@@ -2339,6 +2339,8 @@ WAARDE_HISTORIE_JAREN = 3
 # Jaarcijfers zijn pas een paar maanden na het boekjaar bekend: zolang wacht de code
 RAPPORT_VERTRAGING_MND = 3
 KWARTAAL_VERTRAGING_MND = 2  # kwartaalcijfers komen sneller
+# Werkelijke groei: gemiddelde over (maximaal) zoveel recente kwartalen, elk t.o.v. een jaar eerder
+KWARTALEN_GEMIDDELD = 4
 # Minimaal aantal maanden met winst om 'normaal' en de balk te tonen
 MIN_MAANDEN_VERGELIJKING = 12
 # Verhoudingen: (naam, 'je betaalt X× ...')
@@ -2717,7 +2719,26 @@ def fundamentele_rij(ticker: str) -> dict:
     rij["forward_kw"] = float(fpe) if isinstance(fpe, (int, float)) and 0 < fpe < 1000 else None
 
     # --- groei: ingeprijsd, verwacht, werkelijk ------------------------------------------
-    rij["omzetgroei"] = _cagr(omzet)
+    # Werkelijke omzetgroei: per kwartaal t.o.v. hetzelfde kwartaal een jaar eerder,
+    # gemiddeld over de recente kwartalen. Zo is het direct vergelijkbaar met de
+    # verwachtingen (die ook 'jaar op jaar' zijn). Zonder kwartaalcijfers: per jaar.
+    k_omzet = (_regel(kw["resultaat"], "Total Revenue", "Operating Revenue")
+               if "resultaat" in kw else pd.Series(dtype=float)).dropna()
+    groeien = []
+    for q, waarde in k_omzet.items():
+        jaar_eerder = [(abs((q - p_).days - 365), v) for p_, v in k_omzet.items() if 330 <= (q - p_).days <= 400]
+        if jaar_eerder and min(jaar_eerder)[1] > 0:
+            groeien.append(waarde / min(jaar_eerder)[1] - 1)
+    if groeien:
+        groeien = groeien[-KWARTALEN_GEMIDDELD:]
+        rij["omzetgroei"] = sum(groeien) / len(groeien)
+        rij["omzetgroei_bron"] = (f"gem. laatste {len(groeien)} kwartalen" if len(groeien) > 1
+                                  else "laatste kwartaal")
+    else:
+        rij["omzetgroei"] = _cagr(omzet)
+        r = omzet.dropna()
+        rij["omzetgroei_bron"] = (f"per jaar {r.index[0].year}–{r.index[-1].year}"
+                                  if len(r) >= 2 else "")
     if not financieel:
         rij["ingeprijsd"], rij["ingeprijsd_teken"] = ingeprijsde_groei(nu_p["fcf"], mcap_nu)
     rij.update(_analisten(d.get("analisten", {})))
@@ -3116,7 +3137,8 @@ def cijfers_html(f: dict, mf) -> str:
     if verwacht is not None and bron == "analisten":
         rijen.append(("Verwacht (omzet)", _p(verwacht, 0, True), "analisten"))
     if f.get("omzetgroei") is not None:
-        rijen.append(("Werkelijk (omzet)", _p(f["omzetgroei"], 0, True), "afgelopen jaren"))
+        rijen.append(("Werkelijk (omzet)", _p(f["omzetgroei"], 0, True),
+                      f.get("omzetgroei_bron") or "afgelopen periode"))
     if f.get("kwartalen"):
         rijen.append(("Verwachting verslagen", f"{f['verslagen']}/{f['kwartalen']}", "kwartalen"))
     if rijen:
@@ -3210,7 +3232,7 @@ HOE_LEES_IK_DIT = f"""
 - **Prijs voor groei** = PEG: forward K/W gedeeld door de verwachte winstgroei. Rond 1 of lager is redelijk
 - **Goedkoop + rendabel** = Magic Formula (Greenblatt): rang binnen jouw lijst
 
-**Groei**: *ingeprijsd* = de jaarlijkse groei van de vrije kasstroom die de koers rechtvaardigt (reverse DCF: {DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%}). *Verwacht* = omzetgroei volgend jaar volgens analisten. Verwacht hoger dan ingeprijsd = ruimte in de koers.
+**Groei**: *ingeprijsd* = de jaarlijkse groei van de vrije kasstroom die de koers rechtvaardigt (reverse DCF: {DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%}). *Verwacht* = omzetgroei volgend jaar volgens analisten. *Werkelijk* = omzetgroei per kwartaal t.o.v. hetzelfde kwartaal een jaar eerder, gemiddeld over de laatste kwartalen (zonder kwartaalcijfers: gemiddeld per jaar). Verwacht hoger dan ingeprijsd = ruimte in de koers.
 
 **Kwaliteit**
 - **Marges**: van elke 100 omzet wat er overblijft na inkoop (bruto) en als winst (netto)
