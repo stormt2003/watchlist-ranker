@@ -2314,7 +2314,7 @@ def render_ranglijst(tickers: list, weights: dict, soort: str, in_bezit: tuple, 
         st.dataframe(ranking, width="stretch", hide_index=True)
 
 
-MOMENTUM_MAANDEN = 3
+MOMENTUM_MAANDEN = 1
 
 
 def momentum_rij(ticker: str) -> dict:
@@ -2336,6 +2336,12 @@ DCF_JAREN = 10         # jaren met de ingeprijsde groei
 DCF_EINDGROEI = 0.025  # groei daarna, voor altijd
 # Oordeel 'goedkoper/duurder': yield nu minstens zoveel hoger/lager dan het gemiddelde
 WAARDERING_DREMPEL = 10  # procent
+# Weging van de eindscore (wordt herschaald als een onderdeel ontbreekt)
+SCORE_GEWICHTEN = {"waarde": 0.35, "kwaliteit": 0.35, "groei": 0.20, "veiligheid": 0.10}
+# Mohanram G-score: het origineel vergelijkt met de mediaan van de bedrijfstak. Die
+# vergelijkingsgroep hebben we niet, dus vaste drempels (pas aan naar smaak).
+G_DREMPELS = {"roa": 0.06, "cfo_roa": 0.06, "roa_spreiding": 0.03,
+              "groei_spreiding": 0.10, "rd": 0.02, "capex": 0.03}
 
 
 def _maak_naief(index) -> pd.DatetimeIndex:
@@ -2364,10 +2370,21 @@ def fetch_jaarcijfers(ticker: str) -> dict:
         stukken[k] = df[sorted(df.columns)]  # oud -> nieuw
     if koers.empty:
         raise ValueError("geen koersdata")
+    analisten = {}
+    for naam in ("revenue_estimate", "earnings_estimate", "earnings_history"):
+        try:
+            df = getattr(t, naam)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                analisten[naam] = df
+        except YFRateLimitError:
+            _markeer_rate_limit()
+            raise
+        except Exception:  # noqa: BLE001
+            pass
     slot = koers["Close"].dropna()
     slot.index = _maak_naief(slot.index)
     return {
-        **stukken, "slot": slot,
+        **stukken, "slot": slot, "analisten": analisten,
         "info": {k: info.get(k) for k in ("sector", "industry", "financialCurrency",
                                            "currency", "marketCap", "sharesOutstanding")},
     }
@@ -2445,9 +2462,12 @@ def ingeprijsde_groei(fcf: float, marktwaarde: float):
     return (lo + hi) / 2, ""
 
 
-def piotroski(res, bal, kas, nu, vorig) -> tuple:
-    """Piotroski F-score: (punten, aantal tests dat kon). Ontbreekt data voor een
-    test, dan telt die niet mee (zie het aantal)."""
+PIOTROSKI_TESTS = ["Winst", "Kasstroom", "Rendement stijgt", "Kas > winst", "Schuld lager",
+                   "Liquiditeit beter", "Geen uitgifte", "Marge stijgt", "Efficiënter"]
+
+
+def piotroski(res, bal, kas, nu, vorig) -> list:
+    """Piotroski F-score: per test True/False, of None als de data ontbreekt."""
     ni, cfo = _regel(res, "Net Income", "Net Income Common Stockholders"), _regel(kas, "Operating Cash Flow")
     activa = _regel(bal, "Total Assets")
     lt_schuld = _regel(bal, "Long Term Debt", "Long Term Debt And Capital Lease Obligation")
@@ -2455,28 +2475,31 @@ def piotroski(res, bal, kas, nu, vorig) -> tuple:
     aandelen = _regel(bal, "Ordinary Shares Number", "Share Issued")
     bruto, omzet = _regel(res, "Gross Profit"), _regel(res, "Total Revenue", "Operating Revenue")
 
-    def roa(d):
-        return _deel(_w(ni, d), _w(activa, d))
+    def twee(reeks_a, reeks_b=None):
+        return [(_deel(_w(reeks_a, d), _w(reeks_b, d)) if reeks_b is not None else _w(reeks_a, d))
+                for d in (nu, vorig)]
 
-    tests = []
-    tests.append(None if roa(nu) is None else roa(nu) > 0)
-    tests.append(None if _w(cfo, nu) is None else _w(cfo, nu) > 0)
-    tests.append(None if None in (roa(nu), roa(vorig)) else roa(nu) > roa(vorig))
-    tests.append(None if None in (_w(cfo, nu), _w(ni, nu)) else _w(cfo, nu) > _w(ni, nu))
-    hef = [_deel(_w(lt_schuld, d), _w(activa, d)) for d in (nu, vorig)]
-    tests.append(None if None in hef else hef[0] <= hef[1])
-    cr = [_deel(_w(vlot_a, d), _w(vlot_p, d)) for d in (nu, vorig)]
-    tests.append(None if None in cr else cr[0] > cr[1])
-    st_ = [_w(aandelen, d) for d in (nu, vorig)]
+    def groter(paar, of_gelijk=False):
+        if None in paar:
+            return None
+        return paar[0] >= paar[1] if of_gelijk else paar[0] > paar[1]
+
+    roa = twee(ni, activa)
+    st_ = twee(aandelen)
     verhouding = _deel(st_[0], st_[1])
-    # > 1,5x is vrijwel altijd een aandelensplitsing, geen uitgifte: niet meetellen
-    tests.append(None if verhouding is None or verhouding > 1.5 else verhouding <= 1.0)
-    marge = [_deel(_w(bruto, d), _w(omzet, d)) for d in (nu, vorig)]
-    tests.append(None if None in marge else marge[0] > marge[1])
-    omloop = [_deel(_w(omzet, d), _w(activa, d)) for d in (nu, vorig)]
-    tests.append(None if None in omloop else omloop[0] > omloop[1])
-    gedaan = [t for t in tests if t is not None]
-    return sum(gedaan), len(gedaan)
+    hef = twee(lt_schuld, activa)
+    return [
+        None if roa[0] is None else roa[0] > 0,
+        None if _w(cfo, nu) is None else _w(cfo, nu) > 0,
+        groter(roa),
+        None if None in (_w(cfo, nu), _w(ni, nu)) else _w(cfo, nu) > _w(ni, nu),
+        None if None in hef else hef[0] <= hef[1],
+        groter(twee(vlot_a, vlot_p)),
+        # > 1,5x is vrijwel altijd een aandelensplitsing, geen uitgifte: niet meetellen
+        None if verhouding is None or verhouding > 1.5 else verhouding <= 1.0,
+        groter(twee(bruto, omzet)),
+        groter(twee(omzet, activa)),
+    ]
 
 
 def _is_financieel(info: dict) -> bool:
@@ -2485,16 +2508,50 @@ def _is_financieel(info: dict) -> bool:
         w in branche for w in ("Bank", "Insurance", "Capital Markets"))
 
 
+def _analisten(a: dict) -> dict:
+    """Groeiverwachtingen van analisten (geen koersdoelen) en hoe vaak de winst
+    hun verwachting versloeg."""
+    uit = {}
+    for bron, sleutel in (("revenue_estimate", "omzet"), ("earnings_estimate", "winst")):
+        df = a.get(bron)
+        if df is None or "growth" not in df.columns:
+            continue
+        groei = pd.to_numeric(df["growth"], errors="coerce")
+        for periode, naam in (("+1q", "kw"), ("0y", "dit_jr"), ("+1y", "jr")):
+            if periode in groei.index and pd.notna(groei[periode]):
+                uit[f"{sleutel}_{naam}"] = float(groei[periode])
+    hist = a.get("earnings_history")
+    if hist is not None and {"epsActual", "epsEstimate"} <= set(hist.columns):
+        h = hist[["epsActual", "epsEstimate"]].apply(pd.to_numeric, errors="coerce").dropna().tail(4)
+        if not h.empty:
+            uit["verslagen"], uit["kwartalen"] = int((h["epsActual"] > h["epsEstimate"]).sum()), len(h)
+    return uit
+
+
+def _trend(reeks: list):
+    """Richting van een marge t.o.v. vorig jaar: 1 omhoog, -1 omlaag, 0 gelijk (±1 procentpunt)."""
+    if len(reeks) < 2 or None in reeks[-2:]:
+        return None
+    verschil = reeks[-1] - reeks[-2]
+    return 1 if verschil > 0.01 else -1 if verschil < -0.01 else 0
+
+
+def _std(waarden: list):
+    w = [v for v in waarden if v is not None]
+    return float(pd.Series(w).std()) if len(w) >= 3 else None
+
+
 def fundamentele_rij(ticker: str) -> dict:
-    """Alle fundamentele cijfers voor één aandeel. Bedragen worden omgerekend
-    naar de valuta van de jaarcijfers (bv. Tencent: koers in HKD, cijfers in CNY)."""
+    """Alle cijfers voor één aandeel. Bedragen worden omgerekend naar de valuta van
+    de jaarcijfers (bv. Tencent: koers in HKD, cijfers in CNY)."""
     rij = {"ticker": ticker}
     d = fetch_jaarcijfers(ticker)
     res, bal, kas, slot, info = d["resultaat"], d["balans"], d["kasstroom"], d["slot"], d["info"]
     jaren = list(res.columns)
     nu_jaar = jaren[-1]
+    rij["jaren"] = len(jaren)
 
-    # --- valuta en marktwaarde ------------------------------------------------
+    # --- valuta en marktwaarde ---------------------------------------------------
     koers_val = info.get("currency") or fetch_meta(ticker)["valuta"]
     deler = 100 if koers_val == "GBp" else 1  # Londen noteert in pence
     koers_val = "GBP" if koers_val == "GBp" else koers_val
@@ -2513,8 +2570,7 @@ def fundamentele_rij(ticker: str) -> dict:
     mcap_nu = koers_nu * aandelen_nu * _fx_op(fx, slot.index[-1])  # in de valuta van de cijfers
 
     def marktwaarde_op(datum):
-        """Marktwaarde op een jaareinde, afgeleid van de huidige (zo kloppen ook ADR's):
-        mcap_nu × koersverhouding × verhouding aantal aandelen × wisselkoersverhouding."""
+        """Marktwaarde op een jaareinde, afgeleid van de huidige (zo kloppen ook ADR's)."""
         k = _at_or_before(slot, datum)
         if k is None:
             return None
@@ -2525,28 +2581,25 @@ def fundamentele_rij(ticker: str) -> dict:
         return m
 
     schuld = _regel(bal, "Total Debt")
-    kasgeld = _regel(bal, "Cash Cash Equivalents And Short Term Investments",
-                     "Cash And Cash Equivalents")
-
-    def netto_schuld(datum):
-        return (_w(schuld, datum) or 0.0) - (_w(kasgeld, datum) or 0.0)
-
+    kasgeld = _regel(bal, "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents")
     ebit = _regel(res, "EBIT", "Operating Income")
     fcf = _regel(kas, "Free Cash Flow")
+    cfo = _regel(kas, "Operating Cash Flow")
     eigen_vermogen = _regel(bal, "Stockholders Equity", "Common Stock Equity")
     netto_winst = _regel(res, "Net Income", "Net Income Common Stockholders")
     omzet = _regel(res, "Total Revenue", "Operating Revenue")
+    activa = _regel(bal, "Total Assets")
 
     financieel = _is_financieel(info) or fcf.dropna().empty
-    rij["soort"] = "financieel" if financieel else "normaal"
+    rij["financieel"] = financieel
 
-    # --- 1. goedkoop t.o.v. zichzelf --------------------------------------------
+    # --- waarde: yields nu t.o.v. het eigen gemiddelde -------------------------------
     def yields(datum, mcap):
         if mcap is None:
             return {}
         if financieel:  # boekwaarde/koers: hoger = goedkoper
             return {"bp": _deel(_w(eigen_vermogen, datum), mcap)}
-        ev = mcap + netto_schuld(datum)
+        ev = mcap + (_w(schuld, datum) or 0.0) - (_w(kasgeld, datum) or 0.0)
         return {"fcf": _deel(_w(fcf, datum), mcap), "ey": _deel(_w(ebit, datum), ev)}
 
     nu = yields(nu_jaar, mcap_nu)
@@ -2560,35 +2613,73 @@ def fundamentele_rij(ticker: str) -> dict:
         if v_nu is not None and v_nu > 0 and gem is not None and gem > 0:
             verschillen.append((v_nu / gem - 1) * 100)
     rij["tov_historie"] = sum(verschillen) / len(verschillen) if verschillen else None
-    rij["jaren"] = len(jaren)
 
-    # --- 2. reverse DCF + werkelijke groei -----------------------------------------
+    # --- groei: ingeprijsd, verwacht, werkelijk ------------------------------------------
     rij["omzetgroei"] = _cagr(omzet)
     if not financieel:
-        groei, teken = ingeprijsde_groei(_w(fcf, nu_jaar), mcap_nu)
-        rij["ingeprijsd"], rij["ingeprijsd_teken"] = groei, teken
-        rij["fcfgroei"] = _cagr(fcf)
+        rij["ingeprijsd"], rij["ingeprijsd_teken"] = ingeprijsde_groei(_w(fcf, nu_jaar), mcap_nu)
+    rij.update(_analisten(d.get("analisten", {})))
 
-    # --- 3. kwaliteit ----------------------------------------------------------------
+    # --- kwaliteit: marges, ROIC/ROE, Piotroski, Mohanram -----------------------------------
+    for naam, teller in (("bruto", _regel(res, "Gross Profit")), ("operationeel", ebit),
+                         ("netto", netto_winst)):
+        reeks = [_deel(_w(teller, j), _w(omzet, j)) for j in jaren]
+        rij[f"marge_{naam}"], rij[f"marge_{naam}_trend"] = reeks[-1], _trend(reeks)
+
     if financieel:
-        roe = [_deel(_w(netto_winst, j), _w(eigen_vermogen, j)) for j in jaren]
-        reeks = [r for r in roe if r is not None]
+        rendementen = [_deel(_w(netto_winst, j), _w(eigen_vermogen, j)) for j in jaren]
     else:
-        if len(jaren) >= 2:
-            rij["f_score"], rij["f_tests"] = piotroski(res, bal, kas, nu_jaar, jaren[-2])
-        winst_vb = _regel(res, "Pretax Income")
-        belasting = _regel(res, "Tax Provision")
-        reeks = []
+        winst_vb, belasting = _regel(res, "Pretax Income"), _regel(res, "Tax Provision")
+        rendementen = []
         for j in jaren:
             e = _w(ebit, j)
             kapitaal = (_w(schuld, j) or 0.0) + (_w(eigen_vermogen, j) or 0.0) - (_w(kasgeld, j) or 0.0)
             if e is None or kapitaal <= 0:
+                rendementen.append(None)
                 continue
             tarief = _deel(_w(belasting, j), _w(winst_vb, j))
             tarief = 0.21 if tarief is None else min(max(tarief, 0.0), 0.35)
-            reeks.append(e * (1 - tarief) / kapitaal)
+            rendementen.append(e * (1 - tarief) / kapitaal)
+    reeks = [r for r in rendementen if r is not None]
     if reeks:
         rij["rendement_nu"], rij["rendement_min"], rij["rendement_max"] = reeks[-1], min(reeks), max(reeks)
+
+    if not financieel and len(jaren) >= 2:
+        rij["piotroski"] = piotroski(res, bal, kas, nu_jaar, jaren[-2])
+
+        roa = [_deel(_w(netto_winst, j), _w(activa, j)) for j in jaren]
+        groeien = [_deel(_w(omzet, b), _w(omzet, a)) for a, b in zip(jaren, jaren[1:])]
+        groeien = [g - 1 if g is not None else None for g in groeien]
+        rd = _deel(_w(_regel(res, "Research And Development"), nu_jaar), _w(activa, nu_jaar))
+        capex = _w(_regel(kas, "Capital Expenditure"), nu_jaar)
+        capex = _deel(abs(capex), _w(activa, nu_jaar)) if capex is not None else None
+        cfo_roa = _deel(_w(cfo, nu_jaar), _w(activa, nu_jaar))
+        roa_sd, groei_sd = _std(roa), _std(groeien)
+        gd = G_DREMPELS
+        rij["mohanram"] = [
+            None if roa[-1] is None else roa[-1] >= gd["roa"],
+            None if cfo_roa is None else cfo_roa >= gd["cfo_roa"],
+            None if None in (_w(cfo, nu_jaar), _w(netto_winst, nu_jaar))
+            else _w(cfo, nu_jaar) > _w(netto_winst, nu_jaar),
+            None if roa_sd is None else roa_sd <= gd["roa_spreiding"],
+            None if groei_sd is None else groei_sd <= gd["groei_spreiding"],
+            None if rd is None else rd >= gd["rd"],
+            None if capex is None else capex >= gd["capex"],
+        ]
+
+        # --- veiligheid: Altman Z ---------------------------------------------------------
+        ta = _w(activa, nu_jaar)
+        delen = [
+            _deel((_w(_regel(bal, "Current Assets"), nu_jaar) or 0.0)
+                  - (_w(_regel(bal, "Current Liabilities"), nu_jaar) or 0.0), ta),
+            _deel(_w(_regel(bal, "Retained Earnings"), nu_jaar), ta),
+            _deel(_w(ebit, nu_jaar), ta),
+            _deel(mcap_nu, _w(_regel(bal, "Total Liabilities Net Minority Interest",
+                                     "Total Liabilities"), nu_jaar)),
+            _deel(_w(omzet, nu_jaar), ta),
+        ]
+        if None not in delen:
+            rij["altman"] = sum(f * x for f, x in zip((1.2, 1.4, 3.3, 0.6, 1.0), delen))
     return rij
 
 
@@ -2599,106 +2690,340 @@ def _fund_veilig(ticker: str):
         return {"ticker": ticker, "fout": str(e)}
 
 
-def _pct_of_none(v, factor=100):
-    return None if v is None or pd.isna(v) else v * factor
+# --- scores ------------------------------------------------------------------------
+
+def _lin(x, laag, hoog):
+    """x lineair naar 0–100 (laag -> 0, hoog -> 100)."""
+    return None if x is None else max(0.0, min(100.0, (x - laag) / (hoog - laag) * 100))
 
 
-def _oordeel(v) -> str:
+def _telling(tests):
+    gedaan = [t for t in (tests or []) if t is not None]
+    return sum(gedaan), len(gedaan)
+
+
+def verwachte_groei(f: dict):
+    """Omzetgroei volgend jaar volgens analisten, anders de werkelijke groei."""
+    for k, bron in (("omzet_jr", "analisten"), ("omzet_dit_jr", "analisten"), ("omzetgroei", "historie")):
+        if f.get(k) is not None:
+            return f[k], bron
+    return None, None
+
+
+def scores(f: dict) -> dict:
+    """Deelscores 0–100, oordelen en de eindscore volgens SCORE_GEWICHTEN."""
+    s = {}
+    # waarde
+    s["waarde"] = _lin(f.get("tov_historie"), -50, 50)
+    t = f.get("tov_historie")
+    s["waarde_label"] = (None if t is None else "goedkoop" if t >= WAARDERING_DREMPEL
+                         else "duur" if t <= -WAARDERING_DREMPEL else "normaal")
+    # groei
+    verwacht, _ = verwachte_groei(f)
+    ing = f.get("ingeprijsd")
+    if ing is not None and verwacht is not None:
+        verschil = verwacht - ing
+        s["groei"] = _lin(verschil, -0.10, 0.10)
+        s["groei_label"] = "beter" if verschil >= 0.02 else "minder" if verschil <= -0.02 else "gelijk"
+    elif verwacht is not None:
+        s["groei"] = _lin(verwacht, -0.05, 0.20)
+        s["groei_label"] = "sterk" if s["groei"] >= 60 else "zwak" if s["groei"] < 40 else "gemiddeld"
+    else:
+        s["groei"], s["groei_label"] = None, None
+    # kwaliteit
+    delen = []
+    p, n = _telling(f.get("piotroski"))
+    if n >= 5:
+        delen.append(p / n * 100)
+    g, n = _telling(f.get("mohanram"))
+    if n >= 4:
+        delen.append(g / n * 100)
+    if f.get("rendement_nu") is not None:
+        delen.append(_lin(f["rendement_nu"], 0.0, 0.20))
+    trends = [f.get(f"marge_{m}_trend") for m in ("bruto", "operationeel", "netto")]
+    trends = [x for x in trends if x is not None]
+    if trends:
+        delen.append(50 + 50 * sum(trends) / len(trends))
+    s["kwaliteit"] = sum(delen) / len(delen) if delen else None
+    s["kwaliteit_label"] = (None if s["kwaliteit"] is None else "sterk" if s["kwaliteit"] >= 65
+                            else "zwak" if s["kwaliteit"] < 40 else "gemiddeld")
+    # veiligheid (hoog risico is een label, geen straf: het telt gewoon mee met 10%)
+    z = f.get("altman")
+    s["veiligheid"] = _lin(z, 1.0, 4.0)
+    s["veiligheid_label"] = (None if z is None else "veilig" if z > 2.99
+                             else "grijs gebied" if z >= 1.81 else "risico hoog")
+    # eindscore, herschaald over de onderdelen die er zijn
+    beschikbaar = {k: w for k, w in SCORE_GEWICHTEN.items() if s.get(k) is not None}
+    s["eind"] = (sum(s[k] * w for k, w in beschikbaar.items()) / sum(beschikbaar.values())
+                 if beschikbaar else None)
+    return s
+
+
+def magic_formula(rijen: list) -> dict:
+    """Greenblatt: rang op earnings yield + rang op ROIC, binnen de eigen lijst."""
+    kandidaten = [r for r in rijen if not r.get("financieel")
+                  and r.get("ey_nu") is not None and r.get("rendement_nu") is not None]
+    if len(kandidaten) < 2:
+        return {}
+    df = pd.DataFrame([{"t": r["ticker"], "ey": r["ey_nu"], "roic": r["rendement_nu"]} for r in kandidaten])
+    df["som"] = df["ey"].rank(ascending=False) + df["roic"].rank(ascending=False)
+    df["rang"] = df["som"].rank(method="min").astype(int)
+    return {r.t: (r.rang, len(df)) for r in df.itertuples()}
+
+
+# --- weergave: kaartjes met uitklapbare details --------------------------------------
+
+KLEUR = {  # (tekst, achtergrond): leesbaar in licht en donker thema
+    "groen": ("#2e9e58", "rgba(46,158,88,0.15)"),
+    "geel": ("#b08a0c", "rgba(233,196,64,0.20)"),
+    "rood": ("#d64545", "rgba(214,69,69,0.14)"),
+    "grijs": ("inherit", "rgba(128,128,128,0.15)"),
+}
+LABEL_KLEUR = {"goedkoop": "groen", "normaal": "geel", "duur": "rood",
+               "beter": "groen", "gelijk": "geel", "minder": "rood",
+               "sterk": "groen", "gemiddeld": "geel", "zwak": "rood",
+               "veilig": "groen", "grijs gebied": "geel", "risico hoog": "rood"}
+LABEL_TEKST = {"waarde": {"goedkoop": "goedkoper dan normaal", "normaal": "rond normaal",
+                          "duur": "duurder dan normaal"},
+               "groei": {"beter": "beter dan ingeprijsd", "gelijk": "zoals ingeprijsd",
+                         "minder": "minder dan ingeprijsd"}}
+
+FUND_CSS = """<style>
+.fk details > summary { list-style: none; cursor: pointer; }
+.fk details > summary::-webkit-details-marker { display: none; }
+.fk details[open] .fk-pijl { transform: rotate(180deg); }
+.fk-blok { border-top: 1px solid rgba(128,128,128,0.22); padding: 8px 0 4px; }
+.fk-rij { display: flex; justify-content: space-between; gap: 8px; font-size: 0.85rem;
+          font-variant-numeric: tabular-nums; }
+.fk-rij > span:first-child { opacity: 0.7; }
+.fk-uitleg { font-size: 0.75rem; opacity: 0.55; margin: 1px 0 7px; line-height: 1.4; }
+</style>"""
+
+
+def _p(v, dec=1, teken=False):
+    """Fractie -> '12,3%' (of '+12,3%')."""
     if v is None or pd.isna(v):
         return "–"
-    if v >= WAARDERING_DREMPEL:
-        return "🟢 goedkoper"
-    if v <= -WAARDERING_DREMPEL:
-        return "🔴 duurder"
-    return "🟡 rond gem."
+    return f"{v * 100:{'+' if teken else ''}.{dec}f}%".replace(".", ",")
+
+
+def _chip(tekst, kleur):
+    fg, bg = KLEUR[kleur]
+    return (f'<span style="font-size:0.72rem;padding:1px 7px;border-radius:6px;white-space:nowrap;'
+            f'color:{fg};background:{bg}">{html.escape(tekst)}</span>')
+
+
+def _kleur_score(v):
+    return "grijs" if v is None else "groen" if v >= 65 else "geel" if v >= 40 else "rood"
+
+
+def _rij(label, waarde, uitleg=""):
+    u = f'<div class="fk-uitleg">{uitleg}</div>' if uitleg else '<div style="height:5px"></div>'
+    return f'<div class="fk-rij"><span>{label}</span><span>{waarde}</span></div>{u}'
+
+
+def _blok(titel, label, kleur, inhoud):
+    kop = (f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">'
+           f'<b style="font-size:0.9rem">{titel}</b>{_chip(label, kleur) if label else ""}</div>')
+    return f'<div class="fk-blok">{kop}{inhoud}</div>'
+
+
+def _balk(label, waarde, max_waarde, kleur):
+    breedte = 0 if waarde is None else max(2, min(100, max(waarde, 0) / max_waarde * 100))
+    fg = KLEUR[kleur][0] if kleur != "grijs" else "rgba(128,128,128,0.55)"
+    return (f'<div style="font-size:0.75rem;opacity:0.7;margin-top:4px">{label}</div>'
+            f'<div style="display:flex;align-items:center;gap:8px">'
+            f'<div style="flex:1"><div style="height:9px;border-radius:5px;width:{breedte:.0f}%;'
+            f'background:{fg}"></div></div>'
+            f'<span style="font-size:0.85rem;font-weight:600;min-width:52px;text-align:right">'
+            f'{_p(waarde, 0, True)}</span></div>')
+
+
+def _pijl(trend):
+    return {1: " ↗", -1: " ↘", 0: " →"}.get(trend, "")
+
+
+def _vinkjes(namen, tests):
+    delen = []
+    for naam, t in zip(namen, tests or []):
+        teken, kleur = ("✓", KLEUR["groen"][0]) if t else ("✗", KLEUR["rood"][0]) if t is False else ("–", "inherit")
+        delen.append(f'<span style="white-space:nowrap"><span style="color:{kleur}">{teken}</span> {naam}</span>')
+    return ('<div style="display:flex;flex-wrap:wrap;gap:2px 12px;font-size:0.75rem;margin:-2px 0 8px">'
+            + "".join(delen) + "</div>")
+
+
+MOHANRAM_TESTS = ["Rendabel", "Kasstroom", "Kas > winst", "Stabiele winst", "Stabiele groei",
+                  "Investeert in R&D", "Investeert in capex"]
+
+
+def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf) -> str:
+    fin = f.get("financieel")
+    verwacht, bron = verwachte_groei(f)
+    ing, teken = f.get("ingeprijsd"), f.get("ingeprijsd_teken", "")
+
+    # ---- kop (altijd zichtbaar) ----
+    eind = s.get("eind")
+    fg, bg = KLEUR[_kleur_score(eind)]
+    cirkel = (f'<div style="width:42px;height:42px;border-radius:50%;flex-shrink:0;display:flex;'
+              f'align-items:center;justify-content:center;font-weight:700;color:{fg};background:{bg}">'
+              f'{"–" if eind is None else f"{eind:.0f}"}</div>')
+    mom_tekst = "" if mom is None else f" · 1 mnd {_pct_nl(mom, 1)}{' ↗' if mom > 0 else ' ↘'}"
+    groeiregel = ""
+    if ing is not None and verwacht is not None:
+        groeiregel = (f'<div style="font-size:0.8rem;margin-top:5px;opacity:0.85">Markt rekent op '
+                      f'<b>{teken}{_p(ing, 0, True)}</b> · verwacht <b style="color:'
+                      f'{KLEUR[LABEL_KLEUR[s["groei_label"]]][0]}">{_p(verwacht, 0, True)}</b> per jaar</div>')
+    chips = []
+    for deel, titel in (("waarde", "Waarde"), ("groei", "Groei"), ("kwaliteit", "Kwaliteit")):
+        lab = s.get(f"{deel}_label")
+        if lab:
+            chips.append(_chip(f"{titel}: {lab}", LABEL_KLEUR[lab]))
+    if s.get("veiligheid_label"):
+        chips.append(_chip(s["veiligheid_label"].capitalize(), LABEL_KLEUR[s["veiligheid_label"]]))
+    kop = (f'<div style="display:flex;align-items:center;gap:8px">'
+           f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rang}</span>'
+           f'<div style="flex:1;min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;'
+           f'text-overflow:ellipsis">{html.escape(naam)}</div><div style="font-size:0.78rem;opacity:0.6">'
+           f'{html.escape(f["ticker"])}{mom_tekst}</div></div>{cirkel}'
+           f'<span class="fk-pijl" style="opacity:0.45;font-size:0.8rem">▾</span></div>'
+           f'{groeiregel}<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">{"".join(chips)}</div>')
+
+    # ---- details ----
+    blokken = []
+    if f.get("fout") and len(f) <= 2:
+        blokken.append(f'<div class="fk-uitleg" style="margin-top:8px">Niet berekend: {html.escape(f["fout"])}</div>')
+    else:
+        # Waarde
+        if fin:
+            inh = _rij("Boekwaarde / beurswaarde", f"{_p(f.get('bp_nu'))} · normaal {_p(f.get('bp_gem'))}",
+                       "Hoeveel eigen vermogen je per 100 aan beurswaarde koopt. Hoger dan normaal = goedkoper.")
+        else:
+            inh = (_rij("FCF yield", f"{_p(f.get('fcf_nu'))} · normaal {_p(f.get('fcf_gem'))}",
+                        "Vrije kasstroom per 100 aan beurswaarde. Hoger dan normaal = goedkoper.")
+                   + _rij("Earnings yield", f"{_p(f.get('ey_nu'))} · normaal {_p(f.get('ey_gem'))}",
+                          "Bedrijfswinst als % van de ondernemingswaarde (beurswaarde plus schulden)."))
+            if mf:
+                inh += _rij("Magic Formula", f"rang {mf[0]} van {mf[1]}",
+                            "Goedkoop én rendabel tegelijk, vergeleken binnen jouw lijst. 1 = beste.")
+        t = f.get("tov_historie")
+        inh += _rij("T.o.v. eigen historie", _pct_nl(t, 0) if t is not None else "–",
+                    f"Gemiddeld over {f.get('jaren', '?')} jaar cijfers. Plus = goedkoper dan normaal.")
+        blokken.append(_blok("Waarde", LABEL_TEKST["waarde"].get(s.get("waarde_label")),
+                             LABEL_KLEUR.get(s.get("waarde_label"), "grijs"), inh))
+
+        # Groei
+        inh = ""
+        if ing is not None or verwacht is not None:
+            hoogste = max([x for x in (ing, verwacht, f.get("omzetgroei")) if x is not None] + [0.05])
+            kl = LABEL_KLEUR.get(s.get("groei_label"), "grijs")
+            if ing is not None:
+                inh += _balk("Ingeprijsd door de markt", ing, hoogste, "grijs")
+            inh += _balk("Verwacht" + (" door analisten (omzet)" if bron == "analisten" else " (werkelijke groei)"),
+                         verwacht, hoogste, kl)
+            if bron == "analisten" and f.get("omzetgroei") is not None:
+                inh += _balk("Werkelijk afgelopen jaren (omzet)", f["omzetgroei"], hoogste, kl)
+            if ing is not None:
+                oordeel = {"beter": "er zit ruimte in de koers",
+                           "gelijk": "de koers prijst dat ongeveer al in",
+                           "minder": "de koers verwacht meer dan het bedrijf waarschijnlijk haalt"
+                           }.get(s.get("groei_label"), "")
+                uitleg = (f"De koers is pas terecht als de vrije kasstroom {DCF_JAREN} jaar lang "
+                          f"{teken}{_p(ing, 0)} per jaar groeit. Verwacht wordt {_p(verwacht, 0)}: {oordeel}.")
+            else:
+                uitleg = ("Ingeprijsde groei is hier niet te berekenen (negatieve vrije kasstroom of "
+                          "financiële instelling); het oordeel kijkt alleen naar de verwachte groei.")
+            inh += f'<div class="fk-uitleg" style="margin-top:6px">{uitleg}</div>'
+        if f.get("omzet_kw") is not None:
+            inh += _rij("Omzet volgend kwartaal", _p(f["omzet_kw"], 0, True),
+                        "Verwacht door analisten, t.o.v. hetzelfde kwartaal vorig jaar.")
+        if f.get("winst_jr") is not None:
+            inh += _rij("Winst per aandeel volgend jaar", _p(f["winst_jr"], 0, True),
+                        "Verwachte groei van de winst per aandeel.")
+        if f.get("kwartalen"):
+            inh += _rij("Verwachting verslagen", f"{f['verslagen']} van {f['kwartalen']} kwartalen",
+                        "Hoe vaak de winst hoger uitviel dan analisten dachten.")
+        blokken.append(_blok("Groei", LABEL_TEKST["groei"].get(s.get("groei_label"), s.get("groei_label")),
+                             LABEL_KLEUR.get(s.get("groei_label"), "grijs"), inh or
+                             '<div class="fk-uitleg">Geen groeicijfers beschikbaar.</div>'))
+
+        # Kwaliteit
+        inh = ""
+        marges = [(m, f.get(f"marge_{m}"), f.get(f"marge_{m}_trend")) for m in ("bruto", "operationeel", "netto")]
+        for i, (m, v, tr) in enumerate(marges):
+            if v is not None:
+                uitleg = ("Van elke 100 omzet: bruto = over na inkoop, operationeel = na alle "
+                          "bedrijfskosten, netto = de winst. Pijl = richting t.o.v. vorig jaar."
+                          if i == 2 else "")
+                inh += _rij(f"{m.capitalize()}marge", f"{_p(v, 0)}{_pijl(tr)}", uitleg)
+        if f.get("rendement_nu") is not None:
+            inh += _rij("ROE" if fin else "ROIC",
+                        f"{_p(f['rendement_nu'], 0)} ({_p(f['rendement_min'], 0)} – {_p(f['rendement_max'], 0)})",
+                        ("Winst op het eigen vermogen" if fin else "Rendement op het geld dat in het bedrijf zit")
+                        + ". Boven 15% is sterk; tussen haakjes laagste en hoogste van de afgelopen jaren.")
+        if f.get("piotroski"):
+            p, n = _telling(f["piotroski"])
+            inh += _rij("Piotroski F-score", f"{p} / {n}",
+                        "Wordt het bedrijf beter dan vorig jaar? 7–9 sterk, 0–3 zwak.")
+            inh += _vinkjes(PIOTROSKI_TESTS, f["piotroski"])
+        if f.get("mohanram"):
+            g, n = _telling(f["mohanram"])
+            inh += _rij("Mohanram G-score", f"{g} / {n}",
+                        "Kwaliteit van de groei: rendabel, stabiel en investeert in de toekomst.")
+            inh += _vinkjes(MOHANRAM_TESTS, f["mohanram"])
+        blokken.append(_blok("Kwaliteit", s.get("kwaliteit_label"),
+                             LABEL_KLEUR.get(s.get("kwaliteit_label"), "grijs"),
+                             inh or '<div class="fk-uitleg">Geen kwaliteitscijfers beschikbaar.</div>'))
+
+        # Veiligheid
+        if f.get("altman") is not None:
+            inh = _rij("Altman Z-score", f"{f['altman']:.1f}".replace(".", ","),
+                       "Schat het faillissementsrisico. Boven 3 veilig, 1,8–3 grijs gebied, onder 1,8 "
+                       "verhoogd risico. Hoog risico kan ook hoge opbrengst betekenen.")
+        else:
+            inh = ('<div class="fk-uitleg">Altman Z werkt niet voor banken en verzekeraars.</div>' if fin
+                   else '<div class="fk-uitleg">Niet te berekenen: data ontbreekt.</div>')
+        blokken.append(_blok("Veiligheid", s.get("veiligheid_label"),
+                             LABEL_KLEUR.get(s.get("veiligheid_label"), "grijs"), inh))
+
+        if mom is not None:
+            blokken.append(f'<div class="fk-blok">{_rij("Koers afgelopen maand", _pct_nl(mom, 1), "Alleen een hint of de koers aan het keren is; telt niet mee in de score.")}</div>')
+
+    return (f'<div class="fk" style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;'
+            f'padding:8px 10px;margin-bottom:6px"><details><summary>{kop}</summary>'
+            f'<div style="margin-top:8px">{"".join(blokken)}</div></details></div>')
 
 
 def render_fundamenteel(tickers: list):
-    """Waardering t.o.v. eigen historie, reverse DCF, kwaliteit en momentum (3 mnd)
-    voor de losse aandelen in de lijst."""
+    """Ranglijst van losse aandelen op de eindscore, met per aandeel uitklapbare details."""
     aandelen = [t for t in tickers if str(fetch_meta(t).get("soort") or "").upper() != "ETF"]
     if not aandelen:
         st.info("Geen losse aandelen in deze lijst (ETF's worden overgeslagen).")
         return
     if not st.toggle("Berekenen", key="fund_aan",
-                     help="Haalt de jaarcijfers op bij Yahoo (de eerste keer even wachten, "
-                          "daarna 24 uur bewaard). Staat uit zodat de pagina snel blijft."):
+                     help="Haalt jaarcijfers en groeiverwachtingen op bij Yahoo (de eerste keer even "
+                          "wachten, daarna 24 uur bewaard). Staat uit zodat de pagina snel blijft."):
         st.caption("Zet 'Berekenen' aan om de analyse te laden.")
         return
 
     with st.spinner("Jaarcijfers ophalen en doorrekenen…"):
-        fund = parallel(_fund_veilig, aandelen)
-        mom = parallel(momentum_rij, aandelen)
+        fund = [f or {"ticker": t, "fout": "onbekende fout"}
+                for t, f in zip(aandelen, parallel(_fund_veilig, aandelen))]
+        mom = [(m or {}).get("pct") for m in parallel(momentum_rij, aandelen)]
 
-    rijen, fouten = [], []
-    for t, f, m in zip(aandelen, fund, mom):
-        f = f or {"fout": "onbekende fout"}
-        if "fout" in f:
-            fouten.append(f"{t}: {f['fout']}")
-        fin = f.get("soort") == "financieel"
-        ing = _pct_of_none(f.get("ingeprijsd"))
-        f_score = (f"{f['f_score']}/9" if f.get("f_tests") == 9
-                   else f"{f['f_score']}/{f['f_tests']}*" if f.get("f_tests") else "–")
-        rmin, rmax = f.get("rendement_min"), f.get("rendement_max")
-        rijen.append({
-            "Naam": fetch_meta(t)["naam"], "Ticker": t,
-            "Waardering": _oordeel(f.get("tov_historie")),
-            "tov": f.get("tov_historie"),
-            "fcf": _pct_of_none(f.get("fcf_nu")), "fcf_gem": _pct_of_none(f.get("fcf_gem")),
-            "ey": _pct_of_none(f.get("bp_nu") if fin else f.get("ey_nu")),
-            "ey_gem": _pct_of_none(f.get("bp_gem") if fin else f.get("ey_gem")),
-            "ingeprijsd": ing,
-            "ing_tekst": (f"{f.get('ingeprijsd_teken', '')}{ing:+.0f}%".replace(".", ",")
-                          if ing is not None else "n.v.t."),
-            "omzetgroei": _pct_of_none(f.get("omzetgroei")),
-            "fcfgroei": _pct_of_none(f.get("fcfgroei")),
-            "F-score": "–" if fin else f_score,
-            "rendement": _pct_of_none(f.get("rendement_nu")),
-            "bandbreedte": (f"{rmin * 100:.0f} – {rmax * 100:.0f}%" if rmin is not None else "–"),
-            "mom": (m or {}).get("pct"),
-            "Opmerking": " · ".join(x for x in (
-                "bank/verzekeraar: boekwaarde en ROE" if fin else "",
-                f"{f['jaren']} jaar cijfers" if f.get("jaren") else "",
-                "fout, zie onder" if "fout" in f else "") if x),
-        })
-    df = pd.DataFrame(rijen).sort_values("tov", ascending=False, na_position="last")
-    pct = lambda titel, hulp, teken=True: st.column_config.NumberColumn(  # noqa: E731
-        titel, help=hulp, format="%+.1f%%" if teken else "%.1f%%")
-    st.dataframe(
-        df, hide_index=True, width="stretch",
-        column_order=["Naam", "Ticker", "Waardering", "tov", "fcf", "fcf_gem", "ey", "ey_gem",
-                      "ing_tekst", "omzetgroei", "fcfgroei", "F-score", "rendement",
-                      "bandbreedte", "mom", "Opmerking"],
-        column_config={
-            "tov": pct("t.o.v. historie", "Hoeveel hoger (+, goedkoper) of lager (−, duurder) de "
-                       "yields nu zijn dan gemiddeld over de jaren met cijfers."),
-            "fcf": pct("FCF yield", "Vrije kasstroom / marktwaarde, nu.", False),
-            "fcf_gem": pct("FCF yield gem.", "Gemiddeld op de jaareinden.", False),
-            "ey": pct("Earnings yield", "EBIT / ondernemingswaarde, nu. "
-                      "Banken/verzekeraars: boekwaarde / marktwaarde.", False),
-            "ey_gem": pct("Earnings yield gem.", "Gemiddeld op de jaareinden.", False),
-            "ing_tekst": st.column_config.TextColumn(
-                "Ingeprijsde groei", help=f"Reverse DCF: jaarlijkse FCF-groei die de koers rechtvaardigt "
-                f"({DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%})."),
-            "omzetgroei": pct("Omzetgroei/jr", "Werkelijke gemiddelde groei per jaar."),
-            "fcfgroei": pct("FCF-groei/jr", "Werkelijke gemiddelde groei van de vrije kasstroom."),
-            "F-score": st.column_config.TextColumn(
-                "F-score", help="Piotroski 0–9. * = niet alle 9 tests konden (data ontbrak)."),
-            "rendement": pct("ROIC", "Rendement op geïnvesteerd kapitaal, laatste jaar. "
-                             "Banken/verzekeraars: ROE.", False),
-            "bandbreedte": st.column_config.TextColumn("ROIC laag–hoog", help="Over de jaren met cijfers."),
-            "mom": pct(f"Momentum {MOMENTUM_MAANDEN} mnd", "Koersverandering op dagslotkoersen."),
-        },
-    )
+    mf = magic_formula([f for f in fund if "fout" not in f])
+    lijst = [(f, scores(f), m) for f, m in zip(fund, mom)]
+    lijst.sort(key=lambda x: -1 if x[1]["eind"] is None else x[1]["eind"], reverse=True)
+
+    g = SCORE_GEWICHTEN
     st.caption(
-        "Waardering: yields nu vergeleken met het eigen gemiddelde over de afgelopen jaren "
-        f"(🟢 minstens {WAARDERING_DREMPEL}% hoger = goedkoper). Ingeprijsde groei: wat de koers "
-        "verwacht; zet dat naast de werkelijke groei. F-score 7–9 = sterk, 0–3 = zwak. "
-        "Bedragen in de valuta van de jaarcijfers; jaarcijfers 24 uur bewaard. ETF's tellen niet mee."
+        f"Eindscore 0–100: waarde {g['waarde']:.0%}, kwaliteit {g['kwaliteit']:.0%}, groei {g['groei']:.0%}, "
+        f"veiligheid {g['veiligheid']:.0%}. Tik op een aandeel voor de details en uitleg. "
+        "ETF's tellen niet mee; jaarcijfers worden 24 uur bewaard."
     )
-    if fouten:
-        with st.expander(f"Niet (volledig) berekend ({len(fouten)})"):
-            st.write("\n\n".join(fouten))
+    st.markdown(FUND_CSS, unsafe_allow_html=True)
+    st.markdown(RASTER.format("".join(
+        fund_kaart_html(i + 1, fetch_meta(f["ticker"])["naam"], f, s, m, mf.get(f["ticker"]))
+        for i, (f, s, m) in enumerate(lijst))), unsafe_allow_html=True)
 
 
 # Twee fragmenten die elk in hun eigen tempo verversen. Alleen de tickers van
@@ -2708,7 +3033,7 @@ st.fragment(run_every=interval if auto else None)(render_live_boven)(
 )
 if soort == "aandelen" and lijst:
     # Buiten de fragmenten: ververst niet elke paar seconden (slotkoersen volstaan)
-    with st.expander(f"📊 Waardering, kwaliteit & momentum ({MOMENTUM_MAANDEN} mnd)"):
+    with st.expander("📊 Aandelenanalyse: waarde, groei, kwaliteit en veiligheid"):
         render_fundamenteel(lijst)
 if soort == "crypto":
     # Buiten de fragmenten: cycluskaart en grafiek verversen niet elke paar
