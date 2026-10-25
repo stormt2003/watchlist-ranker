@@ -2334,8 +2334,14 @@ def momentum_rij(ticker: str) -> dict:
 DCF_RENDEMENT = 0.09   # gewenst jaarrendement (disconteringsvoet)
 DCF_JAREN = 10         # jaren met de ingeprijsde groei
 DCF_EINDGROEI = 0.025  # groei daarna, voor altijd
-# Oordeel 'goedkoper/duurder': yield nu minstens zoveel hoger/lager dan het gemiddelde
-WAARDERING_DREMPEL = 10  # procent
+# Waarde: elke maand een meetpunt over deze periode; 'normaal' = de mediaan
+WAARDE_HISTORIE_JAREN = 3
+# Jaarcijfers zijn pas een paar maanden na het boekjaar bekend: zolang wacht de code
+RAPPORT_VERTRAGING_MND = 3
+# Verhoudingen: (naam, 'je betaalt X× ...')
+VERHOUDINGEN = {"ev_ebit": ("EV/EBIT", "de bedrijfswinst"), "kw": ("K/W", "de winst"),
+                "p_fcf": ("Koers/vrije kasstroom", "de vrije kasstroom"),
+                "p_b": ("Koers/boekwaarde", "de boekwaarde")}
 # Weging van de eindscore (wordt herschaald als een onderdeel ontbreekt)
 SCORE_GEWICHTEN = {"waarde": 0.35, "kwaliteit": 0.35, "groei": 0.20, "veiligheid": 0.10}
 # Mohanram G-score: het origineel vergelijkt met de mediaan van de bedrijfstak. Die
@@ -2386,7 +2392,7 @@ def fetch_jaarcijfers(ticker: str) -> dict:
     return {
         **stukken, "slot": slot, "analisten": analisten,
         "info": {k: info.get(k) for k in ("sector", "industry", "financialCurrency",
-                                           "currency", "marketCap", "sharesOutstanding")},
+                                           "currency", "marketCap", "sharesOutstanding", "forwardPE")},
     }
 
 
@@ -2569,13 +2575,14 @@ def fundamentele_rij(ticker: str) -> dict:
     koers_nu = float(slot.iloc[-1]) / deler
     mcap_nu = koers_nu * aandelen_nu * _fx_op(fx, slot.index[-1])  # in de valuta van de cijfers
 
-    def marktwaarde_op(datum):
-        """Marktwaarde op een jaareinde, afgeleid van de huidige (zo kloppen ook ADR's)."""
+    def marktwaarde_op(datum, jaar):
+        """Marktwaarde op een datum, afgeleid van de huidige (zo kloppen ook ADR's):
+        koersverhouding × wisselkoersverhouding × verhouding aantal aandelen (van `jaar`)."""
         k = _at_or_before(slot, datum)
         if k is None:
             return None
         m = mcap_nu * (k / deler) / koers_nu * _fx_op(fx, datum) / _fx_op(fx, slot.index[-1])
-        verh = _deel(_w(aandelen, datum), laatste_aandelen)
+        verh = _deel(_w(aandelen, jaar), laatste_aandelen)
         if verh is not None and 0.67 <= verh <= 1.5:  # anders waarschijnlijk een splitsing
             m *= verh
         return m
@@ -2593,32 +2600,73 @@ def fundamentele_rij(ticker: str) -> dict:
     financieel = _is_financieel(info) or fcf.dropna().empty
     rij["financieel"] = financieel
 
-    # --- waarde: yields nu t.o.v. het eigen gemiddelde -------------------------------
-    def yields(datum, mcap):
+    # --- waarde: verhoudingen nu t.o.v. elke maand van de afgelopen jaren ----------------
+    def verhoudingen(mcap, jaar):
+        """K/W en co. alleen bij een positieve noemer (bij verlies zeggen ze niets)."""
         if mcap is None:
             return {}
-        if financieel:  # boekwaarde/koers: hoger = goedkoper
-            return {"bp": _deel(_w(eigen_vermogen, datum), mcap)}
-        ev = mcap + (_w(schuld, datum) or 0.0) - (_w(kasgeld, datum) or 0.0)
-        return {"fcf": _deel(_w(fcf, datum), mcap), "ey": _deel(_w(ebit, datum), ev)}
 
-    nu = yields(nu_jaar, mcap_nu)
-    historie = [yields(j, marktwaarde_op(j)) for j in jaren]
-    verschillen = []
+        def maal(teller, noemer):
+            return teller / noemer if noemer is not None and noemer > 0 and teller > 0 else None
+
+        if financieel:
+            return {"p_b": maal(mcap, _w(eigen_vermogen, jaar))}
+        ev = mcap + (_w(schuld, jaar) or 0.0) - (_w(kasgeld, jaar) or 0.0)
+        return {"ev_ebit": maal(ev, _w(ebit, jaar)), "kw": maal(mcap, _w(netto_winst, jaar)),
+                "p_fcf": maal(mcap, _w(fcf, jaar))}
+
+    nu = verhoudingen(mcap_nu, nu_jaar)
+    laatste_dag = slot.index[-1]
+    n_maanden = WAARDE_HISTORIE_JAREN * 12
+    punten = []
+    for i in range(1, n_maanden + 1):
+        maand = laatste_dag - pd.DateOffset(months=i)
+        bekend = [j for j in jaren if j + pd.DateOffset(months=RAPPORT_VERTRAGING_MND) <= maand]
+        if bekend:  # de jaarcijfers die op dat moment het laatst bekend waren
+            punten.append(verhoudingen(marktwaarde_op(maand, bekend[-1]), bekend[-1]))
+    rij["maanden"] = len(punten)
+    waarschuwingen = []
     for k, v_nu in nu.items():
-        oud = [h[k] for h in historie if h.get(k) is not None]
-        gem = sum(oud) / len(oud) if len(oud) >= 2 else None
-        rij[f"{k}_nu"], rij[f"{k}_gem"] = v_nu, gem
-        # alleen bij positieve yields: een negatieve kasstroom geeft anders onzin-percentages
-        if v_nu is not None and v_nu > 0 and gem is not None and gem > 0:
-            verschillen.append((v_nu / gem - 1) * 100)
-    rij["tov_historie"] = sum(verschillen) / len(verschillen) if verschillen else None
+        historie = [p[k] for p in punten if p.get(k) is not None]
+        naam = VERHOUDINGEN[k][0]
+        if v_nu is None:
+            if k != "ev_ebit" or not financieel:
+                waarschuwingen.append(f"{naam} niet te berekenen: {VERHOUDINGEN[k][1]} is nu negatief.")
+            continue
+        if len(punten) < 12 or len(historie) < 0.75 * len(punten):
+            waarschuwingen.append(f"{naam} niet vergeleken: te weinig bruikbare maanden "
+                                  f"(eerder verlies of te korte historie).")
+            continue
+        rij[k] = {"nu": v_nu, "normaal": float(pd.Series(historie).median()),
+                  "min": min(historie + [v_nu]), "max": max(historie + [v_nu]),
+                  "goedkoper": sum(h > v_nu for h in historie) / len(historie), "n": len(historie)}
+    if rij.get("ev_ebit"):
+        rij["ey_nu"] = 1 / rij["ev_ebit"]["nu"]  # voor de Magic Formula
+
+    for naam, reeks in (("bedrijfswinst", ebit), ("winst", netto_winst)):
+        nu_w, vorig_w = (_w(reeks, nu_jaar), _w(reeks, jaren[-2])) if len(jaren) >= 2 else (None, None)
+        if nu_w is not None and vorig_w is not None and nu_w > 0:
+            if vorig_w <= 0:
+                waarschuwingen.append(f"De {naam} was vorig jaar nog negatief: het bedrijf is pas "
+                                      "net winstgevend, dus de verhoudingen kunnen snel veranderen.")
+                break
+            if nu_w > 2 * vorig_w:
+                waarschuwingen.append(f"De {naam} is in het laatste jaar meer dan verdubbeld: "
+                                      "check of dat blijvend is (eenmalige meevaller?).")
+                break
+    rij["waarschuwingen"] = waarschuwingen
+
+    # forward K/W (koers ÷ verwachte winst volgend jaar) en PEG
+    fpe = info.get("forwardPE")
+    rij["forward_kw"] = float(fpe) if isinstance(fpe, (int, float)) and 0 < fpe < 1000 else None
 
     # --- groei: ingeprijsd, verwacht, werkelijk ------------------------------------------
     rij["omzetgroei"] = _cagr(omzet)
     if not financieel:
         rij["ingeprijsd"], rij["ingeprijsd_teken"] = ingeprijsde_groei(_w(fcf, nu_jaar), mcap_nu)
     rij.update(_analisten(d.get("analisten", {})))
+    if rij["forward_kw"] and rij.get("winst_jr") and rij["winst_jr"] > 0:
+        rij["peg"] = rij["forward_kw"] / (rij["winst_jr"] * 100)
 
     # --- kwaliteit: marges, ROIC/ROE, Piotroski, Mohanram -----------------------------------
     for naam, teller in (("bruto", _regel(res, "Gross Profit")), ("operationeel", ebit),
@@ -2714,10 +2762,11 @@ def scores(f: dict) -> dict:
     """Deelscores 0–100, oordelen en de eindscore volgens SCORE_GEWICHTEN."""
     s = {}
     # waarde
-    s["waarde"] = _lin(f.get("tov_historie"), -50, 50)
-    t = f.get("tov_historie")
-    s["waarde_label"] = (None if t is None else "goedkoop" if t >= WAARDERING_DREMPEL
-                         else "duur" if t <= -WAARDERING_DREMPEL else "normaal")
+    # = in hoeveel procent van de maanden het aandeel duurder was dan nu
+    delen = [f[k]["goedkoper"] * 100 for k in VERHOUDINGEN if isinstance(f.get(k), dict)]
+    s["waarde"] = sum(delen) / len(delen) if delen else None
+    s["waarde_label"] = (None if s["waarde"] is None else "goedkoop" if s["waarde"] >= 65
+                         else "duur" if s["waarde"] <= 35 else "normaal")
     # groei
     verwacht, _ = verwachte_groei(f)
     ing = f.get("ingeprijsd")
@@ -2839,6 +2888,38 @@ def _balk(label, waarde, max_waarde, kleur):
             f'{_p(waarde, 0, True)}</span></div>')
 
 
+def _maal(v):
+    """9.46 -> '9,5×', 42.3 -> '42×' (onder 30× één decimaal, zodat kleine verschillen zichtbaar zijn)."""
+    return "–" if v is None else (f"{v:.1f}×" if v < 30 else f"{v:.0f}×").replace(".", ",")
+
+
+def _bandbreedte(v: dict) -> str:
+    """Balk van goedkoopste (links) tot duurste maand (rechts); streepje = normaal, stip = nu."""
+    breed = v["max"] - v["min"]
+
+    def pos(x):
+        return 50.0 if breed <= 0 else (x - v["min"]) / breed * 100
+
+    kleur = KLEUR["groen" if v["goedkoper"] >= 0.65 else "rood" if v["goedkoper"] <= 0.35 else "geel"][0]
+    return (f'<div style="position:relative;height:8px;border-radius:4px;margin:7px 6px 2px;'
+            f'background:rgba(128,128,128,0.18)">'
+            f'<div style="position:absolute;top:-3px;left:calc({pos(v["normaal"]):.0f}% - 1px);width:2px;'
+            f'height:14px;background:currentColor;opacity:0.45"></div>'
+            f'<div style="position:absolute;top:-4px;left:calc({pos(v["nu"]):.0f}% - 8px);width:12px;'
+            f'height:12px;border-radius:50%;background:{kleur};border:2px solid rgba(255,255,255,0.85)"></div>'
+            f'</div><div style="display:flex;justify-content:space-between;font-size:0.7rem;opacity:0.5">'
+            f'<span>goedkoopst ({_maal(v["min"])})</span><span>duurst ({_maal(v["max"])})</span></div>')
+
+
+def _verhouding_html(k: str, v: dict) -> str:
+    naam, waarvan = VERHOUDINGEN[k]
+    deel = round(v["goedkoper"] * v["n"])
+    zin = (f"Je betaalt nu {_maal(v['nu'])} {waarvan}; normaal (mediaan) was dat {_maal(v['normaal'])}. "
+           f"Goedkoper dan in {deel} van de {v['n']} maanden.")
+    return (f'<div class="fk-rij"><span>{naam}</span><span><b>{_maal(v["nu"])}</b> {waarvan} · '
+            f'normaal {_maal(v["normaal"])}</span></div>{_bandbreedte(v)}<div class="fk-uitleg">{zin}</div>')
+
+
 def _pijl(trend):
     return {1: " ↗", -1: " ↘", 0: " →"}.get(trend, "")
 
@@ -2877,7 +2958,8 @@ def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf) -> str:
     for deel, titel in (("waarde", "Waarde"), ("groei", "Groei"), ("kwaliteit", "Kwaliteit")):
         lab = s.get(f"{deel}_label")
         if lab:
-            chips.append(_chip(f"{titel}: {lab}", LABEL_KLEUR[lab]))
+            tekst = LABEL_TEKST["groei"].get(lab, lab) if deel == "groei" else lab
+            chips.append(_chip(f"{titel}: {tekst}", LABEL_KLEUR[lab]))
     if s.get("veiligheid_label"):
         chips.append(_chip(s["veiligheid_label"].capitalize(), LABEL_KLEUR[s["veiligheid_label"]]))
     kop = (f'<div style="display:flex;align-items:center;gap:8px">'
@@ -2894,20 +2976,27 @@ def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf) -> str:
         blokken.append(f'<div class="fk-uitleg" style="margin-top:8px">Niet berekend: {html.escape(f["fout"])}</div>')
     else:
         # Waarde
-        if fin:
-            inh = _rij("Boekwaarde / beurswaarde", f"{_p(f.get('bp_nu'))} · normaal {_p(f.get('bp_gem'))}",
-                       "Hoeveel eigen vermogen je per 100 aan beurswaarde koopt. Hoger dan normaal = goedkoper.")
-        else:
-            inh = (_rij("FCF yield", f"{_p(f.get('fcf_nu'))} · normaal {_p(f.get('fcf_gem'))}",
-                        "Vrije kasstroom per 100 aan beurswaarde. Hoger dan normaal = goedkoper.")
-                   + _rij("Earnings yield", f"{_p(f.get('ey_nu'))} · normaal {_p(f.get('ey_gem'))}",
-                          "Bedrijfswinst als % van de ondernemingswaarde (beurswaarde plus schulden)."))
-            if mf:
-                inh += _rij("Magic Formula", f"rang {mf[0]} van {mf[1]}",
-                            "Goedkoop én rendabel tegelijk, vergeleken binnen jouw lijst. 1 = beste.")
-        t = f.get("tov_historie")
-        inh += _rij("T.o.v. eigen historie", _pct_nl(t, 0) if t is not None else "–",
-                    f"Gemiddeld over {f.get('jaren', '?')} jaar cijfers. Plus = goedkoper dan normaal.")
+        inh = "".join(_verhouding_html(k, f[k]) for k in VERHOUDINGEN if isinstance(f.get(k), dict))
+        if f.get("forward_kw"):
+            kw_nu = f["kw"]["nu"] if isinstance(f.get("kw"), dict) else None
+            extra = (f" Lager dan nu ({_maal(kw_nu)}) = analisten verwachten winstgroei."
+                     if kw_nu and f["forward_kw"] < kw_nu else "")
+            inh += _rij("Forward K/W", f"<b>{_maal(f['forward_kw'])}</b>",
+                        "K/W op de verwachte winst van volgend jaar." + extra)
+        if f.get("peg") is not None:
+            inh += _rij("PEG", f"<b>{f['peg']:.1f}</b>".replace(".", ","),
+                        "Forward K/W gedeeld door de verwachte winstgroei. Rond 1 of lager = "
+                        "redelijke prijs voor de groei die je krijgt.")
+        if mf:
+            inh += _rij("Magic Formula", f"rang {mf[0]} van {mf[1]}",
+                        "Goedkoop én rendabel tegelijk, vergeleken binnen jouw lijst. 1 = beste.")
+        if f.get("waarschuwingen"):
+            fg, bg = KLEUR["geel"]
+            inh += (f'<div style="font-size:0.75rem;line-height:1.4;border-radius:6px;padding:6px 8px;'
+                    f'margin:2px 0 6px;color:{fg};background:{bg}">⚠ '
+                    + " ".join(html.escape(w) for w in f["waarschuwingen"]) + "</div>")
+        if not inh:
+            inh = '<div class="fk-uitleg">Geen waarderingscijfers beschikbaar.</div>'
         blokken.append(_blok("Waarde", LABEL_TEKST["waarde"].get(s.get("waarde_label")),
                              LABEL_KLEUR.get(s.get("waarde_label"), "grijs"), inh))
 
@@ -3017,7 +3106,8 @@ def render_fundamenteel(tickers: list):
     g = SCORE_GEWICHTEN
     st.caption(
         f"Eindscore 0–100: waarde {g['waarde']:.0%}, kwaliteit {g['kwaliteit']:.0%}, groei {g['groei']:.0%}, "
-        f"veiligheid {g['veiligheid']:.0%}. Tik op een aandeel voor de details en uitleg. "
+        f"veiligheid {g['veiligheid']:.0%}. Waarde = huidige verhoudingen vergeleken met elke maand van "
+        f"de afgelopen {WAARDE_HISTORIE_JAREN} jaar. Tik op een aandeel voor de details en uitleg. "
         "ETF's tellen niet mee; jaarcijfers worden 24 uur bewaard."
     )
     st.markdown(FUND_CSS, unsafe_allow_html=True)
