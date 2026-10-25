@@ -2737,8 +2737,11 @@ def fundamentele_rij(ticker: str) -> dict:
         rendementen = []
         for j in jaren:
             e = _w(ebit, j)
-            kapitaal = (_w(schuld, j) or 0.0) + (_w(eigen_vermogen, j) or 0.0) - (_w(kasgeld, j) or 0.0)
-            if e is None or kapitaal <= 0:
+            # Geïnvesteerd kapitaal = schuld + eigen vermogen. Kas trekken we níet af: bij bedrijven
+            # met veel kas blijft er anders bijna niets over en krijg je onzin als 2000%.
+            kapitaal = (_w(schuld, j) or 0.0) + (_w(eigen_vermogen, j) or 0.0)
+            ta = _w(activa, j)
+            if e is None or kapitaal <= 0 or (ta and kapitaal < 0.1 * ta):  # te klein om iets te zeggen
                 rendementen.append(None)
                 continue
             tarief = _deel(_w(belasting, j), _w(winst_vb, j))
@@ -2891,16 +2894,22 @@ LABEL_KLEUR = {"goedkoop": "groen", "normaal": "geel", "duur": "rood",
                "veilig": "groen", "grijs gebied": "geel", "risico hoog": "rood"}
 GROEI_TEKST = {"beter": "beter dan ingeprijsd", "gelijk": "zoals ingeprijsd", "minder": "minder dan ingeprijsd"}
 # Namen in gewone taal (de vakterm staat in 'Hoe lees ik dit?')
-NAAM = {"kw": "× winst", "ev_ebit": "× bedrijfswinst", "p_fcf": "× kasstroom", "p_b": "× boekwaarde"}
-PIOTROSKI_MIST = ["winst", "kasstroom", "rendement stijgt", "kas > winst", "schuld lager",
-                  "liquiditeit", "geen uitgifte", "marge stijgt", "efficiënter"]
-MOHANRAM_MIST = ["rendement ≥ 6%", "kasstroom ≥ 6%", "kas > winst", "stabiele winst",
-                 "stabiele groei", "R&D", "investeringen"]
+WAARVAN = {"kw": "winst", "ev_ebit": "bedrijfswinst", "p_fcf": "kasstroom", "p_b": "boekwaarde"}
+NAAM = {"kw": "Je betaalt × de winst", "ev_ebit": "Je betaalt × bedrijfswinst",
+        "p_fcf": "Je betaalt × kasstroom", "p_b": "Je betaalt × boekwaarde"}
+PIOTROSKI_NAMEN = ["Winst positief", "Kasstroom positief", "Rendement gestegen", "Kasstroom hoger dan winst",
+                   "Schuld gedaald", "Liquiditeit verbeterd", "Geen nieuwe aandelen", "Brutomarge gestegen",
+                   "Efficiënter (omzet per bezitting)"]
+MOHANRAM_NAMEN = [f"Rendement ≥ {G_DREMPELS['roa']:.0%}", f"Kasstroom ≥ {G_DREMPELS['cfo_roa']:.0%} van bezittingen",
+                  "Kasstroom hoger dan winst", "Stabiele winst", "Stabiele omzetgroei",
+                  f"Investeert in R&D (≥ {G_DREMPELS['rd']:.0%})",
+                  f"Investeert in bezittingen (≥ {G_DREMPELS['capex']:.0%})"]
 MAX_PUNTEN = 4
 
 FUND_CSS = """<style>
 .fk details > summary { list-style: none; cursor: pointer; }
 .fk details > summary::-webkit-details-marker { display: none; }
+.fk details.fk-test > summary { list-style: none; }
 .fk details[open] > summary .fk-pijl { transform: rotate(180deg); }
 .fk details[open] > summary .fk-toon { display: none; }
 .fk details:not([open]) > summary .fk-verberg { display: none; }
@@ -2960,11 +2969,11 @@ def punten(f: dict, s: dict) -> tuple:
     Elk punt is (tekst, toelichting)."""
     sterk, let_op = [], []
     k, v = _hoofd_verhouding(f)
-    zin_waarde = (f"Je betaalt {_maal(v['nu'])} de {NAAM[k][2:]}", f"normaal {_maal(v['normaal'])}") if v else None
+    zin_waarde = (f"Je betaalt {_maal(v['nu'])} de {WAARVAN[k]}", f"normaal {_maal(v['normaal'])}") if v else None
     verwacht, bron = verwachte_groei(f)
     ing = f.get("ingeprijsd")
     pio, moh = f.get("piotroski") or [], f.get("mohanram") or []
-    trends = [f.get(f"marge_{m}_trend") for m in ("bruto", "operationeel", "netto")]
+    trends = [f.get(f"marge_{m}_trend") for m in ("bruto", "netto")]
     z = f.get("altman")
 
     # waarde
@@ -3008,9 +3017,9 @@ def punten(f: dict, s: dict) -> tuple:
     if "net_winstgevend" in f.get("waarschuwingen", []):
         let_op.append(("Pas net winstgevend", "vorig jaar nog verlies"))
     # kwaliteit
-    if sum(t == 1 for t in trends if t is not None) >= 2:
+    if trends and all(t == 1 for t in trends):
         sterk.append(("Marges stijgen", f"netto {_p(f.get('marge_netto'))}"))
-    elif sum(t == -1 for t in trends if t is not None) >= 2:
+    elif trends and all(t == -1 for t in trends):
         let_op.append(("Marges dalen", f"netto {_p(f.get('marge_netto'))}"))
     r = f.get("rendement_nu")
     if r is not None and r >= 0.15:
@@ -3053,11 +3062,25 @@ def _tabel(rijen) -> str:
         for l, n, v in rijen) + "</table>"
 
 
-def _mist(namen, tests):
-    gemist = [n for n, t in zip(namen, tests or []) if t is False]
-    if not gemist:
-        return "alles gehaald"
-    return f"mist: {', '.join(gemist)}" if len(gemist) <= 2 else f"mist {len(gemist)} tests"
+def _tests_html(titel, namen, tests) -> str:
+    """Regel 'Verbetering 8/9 · mist 1 ▾' die openklapt tot de lijst met ✓ en ✗."""
+    if not tests:
+        return ""
+    goed, n = _telling(tests)
+    gemist = sum(t is False for t in tests)
+    rechts = "alles gehaald ▾" if not gemist else f"{gemist} gemist ▾"
+    lijst = "".join(
+        f'<div style="display:flex;gap:6px;font-size:0.78rem;line-height:1.5">'
+        f'<span style="width:12px;color:{KLEUR["groen"][0] if t else KLEUR["rood"][0] if t is False else "inherit"}">'
+        f'{"✓" if t else "✗" if t is False else "–"}</span>'
+        f'<span style="{"" if t is not None else "opacity:0.5"}">{html.escape(naam)}'
+        f'{"" if t is not None else " (geen data)"}</span></div>'
+        for naam, t in zip(namen, tests))
+    return (f'<details class="fk-test"><summary style="display:flex;font-size:0.82rem;padding:2px 0;'
+            f'font-variant-numeric:tabular-nums"><span style="width:44%;opacity:0.7">{titel}</span>'
+            f'<span style="width:22%;text-align:right;font-weight:600">{goed}/{n}</span>'
+            f'<span style="width:34%;text-align:right;opacity:0.55;font-size:0.75rem">{rechts}</span></summary>'
+            f'<div style="padding:2px 0 6px 4px">{lijst}</div></details>')
 
 
 def cijfers_html(f: dict, mf) -> str:
@@ -3076,7 +3099,7 @@ def cijfers_html(f: dict, mf) -> str:
             rijen.append((NAAM[k], _maal(v["nu"]),
                           f"normaal {_maal(v['normaal'])}" if "goedkoper" in v else "geen vergelijking"))
     if f.get("forward_kw"):
-        rijen.append(("× verwachte winst", _maal(f["forward_kw"]),
+        rijen.append(("Je betaalt × verwachte winst", _maal(f["forward_kw"]),
                       f"prijs voor groei {f['peg']:.1f}".replace(".", ",") if f.get("peg") is not None else ""))
     if mf:
         rijen.append(("Goedkoop + rendabel", f"#{mf[0]}", f"van {mf[1]}"))
@@ -3100,25 +3123,20 @@ def cijfers_html(f: dict, mf) -> str:
         delen.append(f'<div class="fk-sec">Groei per jaar</div>{_tabel(rijen)}')
     # kwaliteit
     rijen = []
-    marges = [f.get(f"marge_{m}") for m in ("bruto", "operationeel", "netto")]
+    marges = [f.get(f"marge_{m}") for m in ("bruto", "netto")]
     if any(m is not None for m in marges):
-        trends = [t for t in (f.get(f"marge_{m}_trend") for m in ("bruto", "operationeel", "netto")) if t is not None]
-        richting = ("alle stijgend" if trends and all(t == 1 for t in trends)
-                    else "alle dalend" if trends and all(t == -1 for t in trends)
-                    else f"{sum(t == 1 for t in trends)} stijgend" if trends else "")
-        rijen.append(("Marge bruto / oper. / netto",
-                      "/".join("–" if m is None else f"{m * 100:.0f}" for m in marges) + "%", richting))
+        trends = [f.get(f"marge_{m}_trend") for m in ("bruto", "netto")]
+        richting = {(1, 1): "beide stijgend", (-1, -1): "beide dalend", (0, 0): "gelijk"}.get(
+            tuple(trends), " / ".join({1: "stijgt", -1: "daalt", 0: "gelijk"}.get(t, "–") for t in trends))
+        rijen.append(("Marge bruto / netto",
+                      " / ".join("–" if m is None else f"{m * 100:.0f}%" for m in marges), richting))
     if f.get("rendement_nu") is not None:
         rijen.append(("Rendement op vermogen" if fin else "Rendement op kapitaal", _p(f["rendement_nu"]),
                       f"bereik {_p(f['rendement_min'])} tot {_p(f['rendement_max'])}"))
-    if f.get("piotroski"):
-        p, n = _telling(f["piotroski"])
-        rijen.append(("Verbetering", f"{p}/{n}", _mist(PIOTROSKI_MIST, f["piotroski"])))
-    if f.get("mohanram"):
-        g, n = _telling(f["mohanram"])
-        rijen.append(("Groeikwaliteit", f"{g}/{n}", _mist(MOHANRAM_MIST, f["mohanram"])))
-    if rijen:
-        delen.append(f'<div class="fk-sec">Kwaliteit</div>{_tabel(rijen)}')
+    tests = "".join(_tests_html(titel, namen, f.get(sleutel)) for titel, namen, sleutel in (
+        ("Verbetering", PIOTROSKI_NAMEN, "piotroski"), ("Groeikwaliteit", MOHANRAM_NAMEN, "mohanram")))
+    if rijen or tests:
+        delen.append(f'<div class="fk-sec">Kwaliteit</div>{_tabel(rijen) if rijen else ""}{tests}')
     # veiligheid
     z = f.get("altman")
     if z is not None:
@@ -3184,21 +3202,21 @@ HOE_LEES_IK_DIT = f"""
 **Eindscore (0–100)**: waarde {{w}}, kwaliteit {{k}}, groei {{g}}, veiligheid {{v}}. Ontbreekt een onderdeel, dan tellen de andere naar verhouding zwaarder.
 
 **Waarde: "je betaalt X× ..."**: hoeveel jaar winst je betaalt voor het aandeel, en vergeleken met elke maand van de afgelopen {WAARDE_HISTORIE_JAREN} jaar ('normaal' = de mediaan). Lager dan normaal = goedkoper.
-- **× winst** = koers/winst (K/W, P/E)
-- **× bedrijfswinst** = ondernemingswaarde/bedrijfswinst (EV/EBIT): schulden tellen mee
-- **× kasstroom** = koers/vrije kasstroom (P/FCF): het geld dat overblijft na investeringen
-- **× boekwaarde** = koers/boekwaarde (P/B), alleen bij banken en verzekeraars
-- **× verwachte winst** = forward K/W: op de winst die analisten volgend jaar verwachten
-- **Prijs voor groei** = PEG: × verwachte winst gedeeld door de verwachte winstgroei. Rond 1 of lager is redelijk
+- **Je betaalt × de winst** = koers/winst (K/W, P/E)
+- **Je betaalt × bedrijfswinst** = ondernemingswaarde/bedrijfswinst (EV/EBIT): schulden tellen mee
+- **Je betaalt × kasstroom** = koers/vrije kasstroom (P/FCF): het geld dat overblijft na investeringen
+- **Je betaalt × boekwaarde** = koers/boekwaarde (P/B), alleen bij banken en verzekeraars
+- **Je betaalt × verwachte winst** = forward K/W: op de winst die analisten volgend jaar verwachten
+- **Prijs voor groei** = PEG: forward K/W gedeeld door de verwachte winstgroei. Rond 1 of lager is redelijk
 - **Goedkoop + rendabel** = Magic Formula (Greenblatt): rang binnen jouw lijst
 
 **Groei**: *ingeprijsd* = de jaarlijkse groei van de vrije kasstroom die de koers rechtvaardigt (reverse DCF: {DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%}). *Verwacht* = omzetgroei volgend jaar volgens analisten. Verwacht hoger dan ingeprijsd = ruimte in de koers.
 
 **Kwaliteit**
-- **Marges**: van elke 100 omzet wat er overblijft na inkoop (bruto), na alle kosten (operationeel) en als winst (netto)
-- **Rendement op kapitaal** = ROIC; bij banken rendement op eigen vermogen (ROE). Boven 15% is sterk
-- **Verbetering** = Piotroski F-score: 9 tests of het bedrijf beter wordt dan vorig jaar
-- **Groeikwaliteit** = Mohanram G-score: rendabel, stabiel en investeert. Benaderd met vaste drempels
+- **Marges**: van elke 100 omzet wat er overblijft na inkoop (bruto) en als winst (netto)
+- **Rendement op kapitaal** = ROIC (bedrijfswinst na belasting ÷ schuld + eigen vermogen); bij banken rendement op eigen vermogen (ROE). Boven 15% is sterk
+- **Verbetering** = Piotroski F-score: 9 tests of het bedrijf beter wordt dan vorig jaar. Tik erop voor de tests
+- **Groeikwaliteit** = Mohanram G-score: rendabel, stabiel en investeert. Benaderd met vaste drempels. Tik erop voor de tests
 
 **Veiligheid: faillissementsrisico** = Altman Z-score. Boven 3 veilig, 1,8–3 grijs gebied, daaronder verhoogd. Hoog risico kan ook hoge opbrengst betekenen.
 
