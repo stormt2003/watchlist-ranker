@@ -2338,6 +2338,9 @@ DCF_EINDGROEI = 0.025  # groei daarna, voor altijd
 WAARDE_HISTORIE_JAREN = 3
 # Jaarcijfers zijn pas een paar maanden na het boekjaar bekend: zolang wacht de code
 RAPPORT_VERTRAGING_MND = 3
+KWARTAAL_VERTRAGING_MND = 2  # kwartaalcijfers komen sneller
+# Minimaal aantal maanden met winst om 'normaal' en de balk te tonen
+MIN_MAANDEN_VERGELIJKING = 12
 # Verhoudingen: (naam, 'je betaalt X× ...')
 VERHOUDINGEN = {"ev_ebit": ("EV/EBIT", "de bedrijfswinst"), "kw": ("K/W", "de winst"),
                 "p_fcf": ("Koers/vrije kasstroom", "de vrije kasstroom"),
@@ -2364,7 +2367,9 @@ def fetch_jaarcijfers(ticker: str) -> dict:
     try:
         info = t.info or {}
         stukken = {"resultaat": t.income_stmt, "balans": t.balance_sheet, "kasstroom": t.cashflow}
-        koers = t.history(period="6y", interval="1d", auto_adjust=False)
+        # vaste startdatum i.p.v. period="6y": oudere yfinance-versies kennen alleen 5y/10y
+        start = (pd.Timestamp.now() - pd.DateOffset(years=6)).strftime("%Y-%m-%d")
+        koers = t.history(start=start, interval="1d", auto_adjust=False)
     except YFRateLimitError:
         _markeer_rate_limit()
         raise  # niet cachen
@@ -2376,6 +2381,21 @@ def fetch_jaarcijfers(ticker: str) -> dict:
         stukken[k] = df[sorted(df.columns)]  # oud -> nieuw
     if koers.empty:
         raise ValueError("geen koersdata")
+    # Kwartaalcijfers voor de winst over de laatste 12 maanden (TTM). Niet verplicht.
+    kwartaal = {}
+    for k, naam in (("resultaat", "quarterly_income_stmt"), ("balans", "quarterly_balance_sheet"),
+                    ("kasstroom", "quarterly_cashflow")):
+        try:
+            df = getattr(t, naam)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.copy()
+                df.columns = _maak_naief(df.columns)
+                kwartaal[k] = df[sorted(df.columns)]
+        except YFRateLimitError:
+            _markeer_rate_limit()
+            raise
+        except Exception:  # noqa: BLE001
+            pass
     analisten = {}
     for naam in ("revenue_estimate", "earnings_estimate", "earnings_history"):
         try:
@@ -2390,7 +2410,7 @@ def fetch_jaarcijfers(ticker: str) -> dict:
     slot = koers["Close"].dropna()
     slot.index = _maak_naief(slot.index)
     return {
-        **stukken, "slot": slot, "analisten": analisten,
+        **stukken, "slot": slot, "analisten": analisten, "kwartaal": kwartaal,
         "info": {k: info.get(k) for k in ("sector", "industry", "financialCurrency",
                                            "currency", "marketCap", "sharesOutstanding", "forwardPE")},
     }
@@ -2575,18 +2595,6 @@ def fundamentele_rij(ticker: str) -> dict:
     koers_nu = float(slot.iloc[-1]) / deler
     mcap_nu = koers_nu * aandelen_nu * _fx_op(fx, slot.index[-1])  # in de valuta van de cijfers
 
-    def marktwaarde_op(datum, jaar):
-        """Marktwaarde op een datum, afgeleid van de huidige (zo kloppen ook ADR's):
-        koersverhouding × wisselkoersverhouding × verhouding aantal aandelen (van `jaar`)."""
-        k = _at_or_before(slot, datum)
-        if k is None:
-            return None
-        m = mcap_nu * (k / deler) / koers_nu * _fx_op(fx, datum) / _fx_op(fx, slot.index[-1])
-        verh = _deel(_w(aandelen, jaar), laatste_aandelen)
-        if verh is not None and 0.67 <= verh <= 1.5:  # anders waarschijnlijk een splitsing
-            m *= verh
-        return m
-
     schuld = _regel(bal, "Total Debt")
     kasgeld = _regel(bal, "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents")
     ebit = _regel(res, "EBIT", "Operating Income")
@@ -2600,49 +2608,99 @@ def fundamentele_rij(ticker: str) -> dict:
     financieel = _is_financieel(info) or fcf.dropna().empty
     rij["financieel"] = financieel
 
-    # --- waarde: verhoudingen nu t.o.v. elke maand van de afgelopen jaren ----------------
-    def verhoudingen(mcap, jaar):
-        """K/W en co. alleen bij een positieve noemer (bij verlies zeggen ze niets)."""
-        if mcap is None:
+    # --- waarde ---------------------------------------------------------------------
+    # Periodes met cijfers: elk boekjaar, plus 'laatste 12 maanden' (TTM) uit de
+    # kwartaalcijfers. Per periode: vanaf wanneer bekend, en de bedragen.
+    periodes = [{"datum": j, "vanaf": j + pd.DateOffset(months=RAPPORT_VERTRAGING_MND), "bron": "jaar",
+                 "ebit": _w(ebit, j), "ni": _w(netto_winst, j), "fcf": _w(fcf, j),
+                 "eq": _w(eigen_vermogen, j), "schuld": _w(schuld, j), "kas": _w(kasgeld, j),
+                 "aandelen": _w(aandelen, j)} for j in jaren]
+    kw = d.get("kwartaal", {})
+    if {"resultaat", "kasstroom"} <= set(kw):
+        k_res, k_kas, k_bal = kw["resultaat"], kw["kasstroom"], kw.get("balans", pd.DataFrame())
+        k_ebit, k_ni = _regel(k_res, "EBIT", "Operating Income"), _regel(k_res, "Net Income",
+                                                                          "Net Income Common Stockholders")
+        k_fcf = _regel(k_kas, "Free Cash Flow")
+        k_eq = _regel(k_bal, "Stockholders Equity", "Common Stock Equity") if not k_bal.empty else pd.Series(dtype=float)
+        k_schuld = _regel(k_bal, "Total Debt") if not k_bal.empty else pd.Series(dtype=float)
+        k_kasg = (_regel(k_bal, "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents")
+                  if not k_bal.empty else pd.Series(dtype=float))
+        k_aand = _regel(k_bal, "Ordinary Shares Number", "Share Issued") if not k_bal.empty else pd.Series(dtype=float)
+        kols = list(k_res.columns)
+
+        def som4(reeks, venster):
+            w = [_w(reeks, c) for c in venster]
+            return None if None in w else sum(w)
+
+        for i in range(3, len(kols)):
+            venster = kols[i - 3:i + 1]
+            if not 240 <= (venster[-1] - venster[0]).days <= 300:  # 4 opeenvolgende kwartalen
+                continue
+            q = venster[-1]
+            periodes.append({"datum": q, "vanaf": q + pd.DateOffset(months=KWARTAAL_VERTRAGING_MND),
+                             "bron": "ttm", "ebit": som4(k_ebit, venster), "ni": som4(k_ni, venster),
+                             "fcf": som4(k_fcf, venster), "eq": _w(k_eq, q), "schuld": _w(k_schuld, q),
+                             "kas": _w(k_kasg, q), "aandelen": _w(k_aand, q)})
+    # bij dezelfde datum wint TTM (vollediger), daarna gewoon de nieuwste
+    periodes.sort(key=lambda p: (p["datum"], p["bron"] == "ttm"))
+    nu_p = periodes[-1]
+    rij["bron_nu"] = (f"laatste 12 maanden t/m {_maand(nu_p['datum'])}" if nu_p["bron"] == "ttm"
+                      else f"boekjaar t/m {_maand(nu_p['datum'])}")
+    ref_aandelen = nu_p["aandelen"] or laatste_aandelen
+
+    def marktwaarde_op(datum, periode):
+        """Marktwaarde op een datum, afgeleid van de huidige (zo kloppen ook ADR's):
+        koersverhouding × wisselkoersverhouding × verhouding aantal aandelen."""
+        k = _at_or_before(slot, datum)
+        if k is None:
+            return None
+        m = mcap_nu * (k / deler) / koers_nu * _fx_op(fx, datum) / _fx_op(fx, slot.index[-1])
+        verh = _deel(periode["aandelen"], ref_aandelen)
+        if verh is not None and 0.67 <= verh <= 1.5:  # anders waarschijnlijk een splitsing
+            m *= verh
+        return m
+
+    def verhoudingen(mcap, p):
+        """Per verhouding de waarde, of 'verlies' (noemer ≤ 0) of None (geen data)."""
+        if mcap is None or p is None:
             return {}
 
         def maal(teller, noemer):
-            return teller / noemer if noemer is not None and noemer > 0 and teller > 0 else None
+            if noemer is None or teller is None:
+                return None
+            return teller / noemer if noemer > 0 and teller > 0 else "verlies"
 
         if financieel:
-            return {"p_b": maal(mcap, _w(eigen_vermogen, jaar))}
-        ev = mcap + (_w(schuld, jaar) or 0.0) - (_w(kasgeld, jaar) or 0.0)
-        return {"ev_ebit": maal(ev, _w(ebit, jaar)), "kw": maal(mcap, _w(netto_winst, jaar)),
-                "p_fcf": maal(mcap, _w(fcf, jaar))}
+            return {"p_b": maal(mcap, p["eq"])}
+        ev = mcap + (p["schuld"] or 0.0) - (p["kas"] or 0.0)
+        return {"ev_ebit": maal(ev, p["ebit"]), "kw": maal(mcap, p["ni"]), "p_fcf": maal(mcap, p["fcf"])}
 
-    nu = verhoudingen(mcap_nu, nu_jaar)
+    nu = verhoudingen(mcap_nu, nu_p)
     laatste_dag = slot.index[-1]
     n_maanden = WAARDE_HISTORIE_JAREN * 12
     punten = []
     for i in range(1, n_maanden + 1):
         maand = laatste_dag - pd.DateOffset(months=i)
-        bekend = [j for j in jaren if j + pd.DateOffset(months=RAPPORT_VERTRAGING_MND) <= maand]
-        if bekend:  # de jaarcijfers die op dat moment het laatst bekend waren
-            punten.append(verhoudingen(marktwaarde_op(maand, bekend[-1]), bekend[-1]))
-    rij["maanden"] = len(punten)
-    waarschuwingen = []
+        bekend = [p for p in periodes if p["vanaf"] <= maand]
+        # de cijfers die op dat moment het laatst bekend waren
+        p = bekend[-1] if bekend else None
+        punten.append(verhoudingen(marktwaarde_op(maand, p) if p else None, p))
+    rij["maanden"] = n_maanden
     for k, v_nu in nu.items():
-        historie = [p[k] for p in punten if p.get(k) is not None]
-        naam = VERHOUDINGEN[k][0]
-        if v_nu is None:
-            if k != "ev_ebit" or not financieel:
-                waarschuwingen.append(f"{naam} niet te berekenen: {VERHOUDINGEN[k][1]} is nu negatief.")
-            continue
-        if len(punten) < 12 or len(historie) < 0.75 * len(punten):
-            waarschuwingen.append(f"{naam} niet vergeleken: te weinig bruikbare maanden "
-                                  f"(eerder verlies of te korte historie).")
-            continue
-        rij[k] = {"nu": v_nu, "normaal": float(pd.Series(historie).median()),
-                  "min": min(historie + [v_nu]), "max": max(historie + [v_nu]),
-                  "goedkoper": sum(h > v_nu for h in historie) / len(historie), "n": len(historie)}
-    if rij.get("ev_ebit"):
+        waarden = [pt.get(k) for pt in punten]
+        historie = [v for v in waarden if isinstance(v, float)]
+        info_k = {"nu": v_nu if isinstance(v_nu, float) else None,
+                  "nu_verlies": v_nu == "verlies", "totaal": n_maanden, "n": len(historie),
+                  "verlies": sum(v == "verlies" for v in waarden),
+                  "ontbreekt": sum(v is None for v in waarden)}
+        if info_k["nu"] is not None and len(historie) >= MIN_MAANDEN_VERGELIJKING:
+            info_k.update(normaal=float(pd.Series(historie).median()),
+                          min=min(historie + [v_nu]), max=max(historie + [v_nu]),
+                          goedkoper=sum(h > v_nu for h in historie) / len(historie))
+        rij[k] = info_k
+    if rij.get("ev_ebit", {}).get("nu"):
         rij["ey_nu"] = 1 / rij["ev_ebit"]["nu"]  # voor de Magic Formula
-
+    waarschuwingen = []
     for naam, reeks in (("bedrijfswinst", ebit), ("winst", netto_winst)):
         nu_w, vorig_w = (_w(reeks, nu_jaar), _w(reeks, jaren[-2])) if len(jaren) >= 2 else (None, None)
         if nu_w is not None and vorig_w is not None and nu_w > 0:
@@ -2663,7 +2721,7 @@ def fundamentele_rij(ticker: str) -> dict:
     # --- groei: ingeprijsd, verwacht, werkelijk ------------------------------------------
     rij["omzetgroei"] = _cagr(omzet)
     if not financieel:
-        rij["ingeprijsd"], rij["ingeprijsd_teken"] = ingeprijsde_groei(_w(fcf, nu_jaar), mcap_nu)
+        rij["ingeprijsd"], rij["ingeprijsd_teken"] = ingeprijsde_groei(nu_p["fcf"], mcap_nu)
     rij.update(_analisten(d.get("analisten", {})))
     if rij["forward_kw"] and rij.get("winst_jr") and rij["winst_jr"] > 0:
         rij["peg"] = rij["forward_kw"] / (rij["winst_jr"] * 100)
@@ -2763,7 +2821,8 @@ def scores(f: dict) -> dict:
     s = {}
     # waarde
     # = in hoeveel procent van de maanden het aandeel duurder was dan nu
-    delen = [f[k]["goedkoper"] * 100 for k in VERHOUDINGEN if isinstance(f.get(k), dict)]
+    delen = [f[k]["goedkoper"] * 100 for k in VERHOUDINGEN
+             if isinstance(f.get(k), dict) and "goedkoper" in f[k]]
     s["waarde"] = sum(delen) / len(delen) if delen else None
     s["waarde_label"] = (None if s["waarde"] is None else "goedkoop" if s["waarde"] >= 65
                          else "duur" if s["waarde"] <= 35 else "normaal")
@@ -2912,10 +2971,28 @@ def _bandbreedte(v: dict) -> str:
 
 
 def _verhouding_html(k: str, v: dict) -> str:
+    """Eén verhouding: altijd het getal van nu (als dat kan), plus de vergelijking met
+    de afgelopen maanden als daar genoeg maanden met winst voor zijn."""
     naam, waarvan = VERHOUDINGEN[k]
+    afgevallen = []
+    if v["verlies"]:
+        afgevallen.append(f"{v['verlies']} met {'negatieve kasstroom' if k == 'p_fcf' else 'verlies'}")
+    if v["ontbreekt"]:
+        afgevallen.append(f"{v['ontbreekt']} zonder cijfers")
+    afgevallen = f" ({' en '.join(afgevallen)} niet meegeteld)" if afgevallen else ""
+
+    if v["nu"] is None:
+        reden = ("is nu negatief, dus 'keer de winst' bestaat niet" if v["nu_verlies"]
+                 else "ontbreekt bij Yahoo")
+        return _rij(naam, "–", f"Niet te berekenen: {waarvan} {reden}.")
+    if "goedkoper" not in v:
+        return (f'<div class="fk-rij"><span>{naam}</span><span><b>{_maal(v["nu"])}</b> {waarvan}</span></div>'
+                f'<div class="fk-uitleg">Je betaalt nu {_maal(v["nu"])} {waarvan}. Geen vergelijking met vroeger: '
+                f'maar {v["n"]} van de {v["totaal"]} maanden bruikbaar{afgevallen}; minimaal '
+                f'{MIN_MAANDEN_VERGELIJKING} nodig.</div>')
     deel = round(v["goedkoper"] * v["n"])
     zin = (f"Je betaalt nu {_maal(v['nu'])} {waarvan}; normaal (mediaan) was dat {_maal(v['normaal'])}. "
-           f"Goedkoper dan in {deel} van de {v['n']} maanden.")
+           f"Goedkoper dan in {deel} van de {v['n']} bruikbare maanden{afgevallen}.")
     return (f'<div class="fk-rij"><span>{naam}</span><span><b>{_maal(v["nu"])}</b> {waarvan} · '
             f'normaal {_maal(v["normaal"])}</span></div>{_bandbreedte(v)}<div class="fk-uitleg">{zin}</div>')
 
@@ -2977,6 +3054,9 @@ def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf) -> str:
     else:
         # Waarde
         inh = "".join(_verhouding_html(k, f[k]) for k in VERHOUDINGEN if isinstance(f.get(k), dict))
+        if inh and f.get("bron_nu"):
+            inh += (f'<div class="fk-uitleg" style="margin-top:-4px">Cijfers van nu: {f["bron_nu"]}. '
+                    f'Vergeleken met elke maand van de afgelopen {WAARDE_HISTORIE_JAREN} jaar.</div>')
         if f.get("forward_kw"):
             kw_nu = f["kw"]["nu"] if isinstance(f.get("kw"), dict) else None
             extra = (f" Lager dan nu ({_maal(kw_nu)}) = analisten verwachten winstgroei."
