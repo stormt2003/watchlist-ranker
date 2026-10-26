@@ -2777,7 +2777,20 @@ def fundamentele_rij(ticker: str) -> dict:
         rij["omzetgroei_bron"] = (f"per jaar {r.index[0].year}–{r.index[-1].year}"
                                   if len(r) >= 2 else "")
     if not financieel:
-        rij["ingeprijsd"], rij["ingeprijsd_teken"] = ingeprijsde_groei(nu_p["fcf"], mcap_nu)
+        # Reverse DCF vanaf de vrije kasstroom. Is die negatief of nul (bv. door zware
+        # investeringen, zoals bij Amazon), dan als reserve vanaf de winst: die smeert
+        # investeringen uit over de jaren in plaats van ze in één keer af te trekken.
+        basis_fcf, basis_ni = nu_p["fcf"], nu_p["ni"]
+        if basis_fcf is not None and basis_fcf > 0:
+            rij["ingeprijsd"], rij["ingeprijsd_teken"] = ingeprijsde_groei(basis_fcf, mcap_nu)
+            rij["ingeprijsd_basis"] = "kasstroom"
+        elif basis_ni is not None and basis_ni > 0:
+            rij["ingeprijsd"], rij["ingeprijsd_teken"] = ingeprijsde_groei(basis_ni, mcap_nu)
+            rij["ingeprijsd_basis"] = "winst"
+            rij["ingeprijsd_reden"] = ("vrije kasstroom negatief door investeringen"
+                                       if basis_fcf is not None else "geen kasstroomcijfers")
+        else:
+            rij["ingeprijsd"], rij["ingeprijsd_teken"] = None, ""
     rij.update(_analisten(d.get("analisten", {})))
     if rij["forward_kw"] and rij.get("winst_jr") and rij["winst_jr"] > 0:
         rij["peg"] = rij["forward_kw"] / (rij["winst_jr"] * 100)
@@ -3049,10 +3062,10 @@ def punten(f: dict, s: dict) -> tuple:
     if ing is not None and verwacht is not None:
         if lab == "beter":
             sterk.append((f"Verwacht {_p(verwacht, 0, True)} groei, markt rekent op {_p(ing, 0, True)}",
-                          "per jaar"))
+                          "per jaar" + (", op winst" if f.get("ingeprijsd_basis") == "winst" else "")))
         elif lab == "minder":
             let_op.append((f"Markt rekent op {_p(ing, 0, True)}, verwacht maar {_p(verwacht, 0, True)}",
-                           "per jaar"))
+                           "per jaar" + (", op winst" if f.get("ingeprijsd_basis") == "winst" else "")))
     elif lab == "sterk":
         sterk.append(("Sterke verwachte groei", f"{_p(verwacht, 0, True)} per jaar"))
     elif lab == "zwak":
@@ -3172,7 +3185,8 @@ def cijfers_html(f: dict, mf) -> str:
     rijen = []
     if f.get("ingeprijsd") is not None:
         rijen.append(("Ingeprijsd door markt", f.get("ingeprijsd_teken", "") + _p(f["ingeprijsd"], 0, True),
-                      "wat de koers verwacht"))
+                      f"op winst: {f.get('ingeprijsd_reden', '')}" if f.get("ingeprijsd_basis") == "winst"
+                      else "op vrije kasstroom"))
     if verwacht is not None and bron == "analisten":
         rijen.append(("Verwacht (omzet)", _p(verwacht, 0, True), "analisten"))
     if f.get("omzetgroei") is not None:
@@ -3222,9 +3236,10 @@ def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf) -> str:
               f'{"–" if eind is None else f"{eind:.0f}"}</div>')
     mom_tekst = "" if mom is None else f" · 1 mnd {_pct_nl(mom, 1)}{' ↗' if mom > 0 else ' ↘'}"
     groeiregel = ""
+    op_winst = " (op winst)" if f.get("ingeprijsd_basis") == "winst" else ""
     if ing is not None and verwacht is not None and s.get("groei_label") in LABEL_KLEUR:
         groeiregel = (f'<div style="font-size:0.8rem;margin-top:5px;opacity:0.85">Markt rekent op '
-                      f'<b>{teken}{_p(ing, 0, True)}</b> · verwacht <b style="color:'
+                      f'<b>{teken}{_p(ing, 0, True)}</b>{op_winst} · verwacht <b style="color:'
                       f'{KLEUR[LABEL_KLEUR[s["groei_label"]]][0]}">{_p(verwacht, 0, True)}</b> per jaar</div>')
     chips = []
     for deel, titel in (("waarde", "Waarde"), ("groei", "Groei"), ("kwaliteit", "Kwaliteit")):
@@ -3271,7 +3286,7 @@ HOE_LEES_IK_DIT = f"""
 - **Prijs voor groei** = PEG: forward K/W gedeeld door de verwachte winstgroei. Rond 1 of lager is redelijk
 - **Goedkoop + rendabel** = Magic Formula (Greenblatt): rang binnen jouw lijst
 
-**Groei**: *ingeprijsd* = de jaarlijkse groei van de vrije kasstroom die de koers rechtvaardigt (reverse DCF: {DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%}). *Verwacht* = omzetgroei volgend jaar volgens analisten. *Werkelijk* = omzetgroei per kwartaal t.o.v. hetzelfde kwartaal een jaar eerder, gemiddeld over de laatste kwartalen (zonder kwartaalcijfers: gemiddeld per jaar). Verwacht hoger dan ingeprijsd = ruimte in de koers.
+**Groei**: *ingeprijsd* = de jaarlijkse groei van de vrije kasstroom die de koers rechtvaardigt (reverse DCF: {DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%}). Is de vrije kasstroom negatief, bijvoorbeeld omdat een bedrijf zwaar investeert in fabrieken of datacenters, dan rekent de code vanaf de winst; dan staat er *(op winst)*. Winst verdeelt grote investeringen over de jaren dat ze gebruikt worden, terwijl de vrije kasstroom ze in één keer aftrekt. Is ook de winst negatief, dan is er niets om vanaf te rekenen en staat er niets. *Verwacht* = omzetgroei volgend jaar volgens analisten. *Werkelijk* = omzetgroei per kwartaal t.o.v. hetzelfde kwartaal een jaar eerder, gemiddeld over de laatste kwartalen (zonder kwartaalcijfers: gemiddeld per jaar). Verwacht hoger dan ingeprijsd = ruimte in de koers.
 
 **Kwaliteit**
 - **Marges**: van elke 100 omzet wat er overblijft na inkoop (bruto) en als winst (netto)
