@@ -2414,16 +2414,27 @@ def fetch_jaarcijfers(ticker: str) -> dict:
     return {
         **stukken, "slot": slot, "analisten": analisten, "kwartaal": kwartaal,
         "info": {k: info.get(k) for k in ("sector", "industry", "financialCurrency",
-                                           "currency", "marketCap", "sharesOutstanding", "forwardPE")},
+                                           "currency", "marketCap", "sharesOutstanding", "forwardPE",
+                                           "trailingPE", "freeCashflow")},
     }
 
 
 def _regel(df: pd.DataFrame, *namen) -> pd.Series:
-    """Eerste regel die bestaat (Yahoo gebruikt niet altijd dezelfde namen)."""
+    """De regel onder de eerste naam die bestaat; lege plekken worden aangevuld uit de
+    volgende namen (Yahoo gebruikt niet altijd dezelfde naam, ook niet per kwartaal)."""
+    uit = None
     for n in namen:
-        if n in df.index:
-            return pd.to_numeric(df.loc[n], errors="coerce")
-    return pd.Series(dtype=float)
+        if df is not None and n in df.index:
+            r = pd.to_numeric(df.loc[n], errors="coerce")
+            uit = r if uit is None else uit.combine_first(r)
+    return uit if uit is not None else pd.Series(dtype=float)
+
+
+def _vrije_kasstroom(kas: pd.DataFrame) -> pd.Series:
+    """Free Cash Flow, of anders operationele kasstroom + investeringen (die zijn negatief)."""
+    fcf = _regel(kas, "Free Cash Flow")
+    berekend = _regel(kas, "Operating Cash Flow") + _regel(kas, "Capital Expenditure")
+    return fcf.combine_first(berekend) if not berekend.empty else fcf
 
 
 def _w(reeks: pd.Series, datum):
@@ -2600,7 +2611,7 @@ def fundamentele_rij(ticker: str) -> dict:
     schuld = _regel(bal, "Total Debt")
     kasgeld = _regel(bal, "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents")
     ebit = _regel(res, "EBIT", "Operating Income")
-    fcf = _regel(kas, "Free Cash Flow")
+    fcf = _vrije_kasstroom(kas)
     cfo = _regel(kas, "Operating Cash Flow")
     eigen_vermogen = _regel(bal, "Stockholders Equity", "Common Stock Equity")
     netto_winst = _regel(res, "Net Income", "Net Income Common Stockholders")
@@ -2622,7 +2633,7 @@ def fundamentele_rij(ticker: str) -> dict:
         k_res, k_kas, k_bal = kw["resultaat"], kw["kasstroom"], kw.get("balans", pd.DataFrame())
         k_ebit, k_ni = _regel(k_res, "EBIT", "Operating Income"), _regel(k_res, "Net Income",
                                                                           "Net Income Common Stockholders")
-        k_fcf = _regel(k_kas, "Free Cash Flow")
+        k_fcf = _vrije_kasstroom(k_kas)
         k_eq = _regel(k_bal, "Stockholders Equity", "Common Stock Equity") if not k_bal.empty else pd.Series(dtype=float)
         k_schuld = _regel(k_bal, "Total Debt") if not k_bal.empty else pd.Series(dtype=float)
         k_kasg = (_regel(k_bal, "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents")
@@ -2645,9 +2656,27 @@ def fundamentele_rij(ticker: str) -> dict:
                              "kas": _w(k_kasg, q), "aandelen": _w(k_aand, q)})
     # bij dezelfde datum wint TTM (vollediger), daarna gewoon de nieuwste
     periodes.sort(key=lambda p: (p["datum"], p["bron"] == "ttm"))
-    nu_p = periodes[-1]
-    rij["bron_nu"] = (f"laatste 12 maanden t/m {_maand(nu_p['datum'])}" if nu_p["bron"] == "ttm"
-                      else f"boekjaar t/m {_maand(nu_p['datum'])}")
+
+    def samengesteld(kandidaten):
+        """Per cijfer de nieuwste periode die dat cijfer heeft (laatste 12 maanden,
+        anders het laatste boekjaar). Zo maakt één leeg kwartaal niet alles leeg."""
+        if not kandidaten:
+            return None
+        uit = {"bronnen": {}}
+        for veld in ("ebit", "ni", "fcf", "eq", "schuld", "kas", "aandelen"):
+            for p in reversed(kandidaten):
+                if p[veld] is not None:
+                    uit[veld] = p[veld]
+                    uit["bronnen"][veld] = p
+                    break
+            else:
+                uit[veld] = None
+        return uit
+
+    nu_p = samengesteld(periodes)
+    bron = nu_p["bronnen"].get("ni") or nu_p["bronnen"].get("ebit") or periodes[-1]
+    rij["bron_nu"] = (f"laatste 12 maanden t/m {_maand(bron['datum'])}" if bron["bron"] == "ttm"
+                      else f"boekjaar t/m {_maand(bron['datum'])}")
     ref_aandelen = nu_p["aandelen"] or laatste_aandelen
 
     def marktwaarde_op(datum, periode):
@@ -2678,14 +2707,22 @@ def fundamentele_rij(ticker: str) -> dict:
         return {"ev_ebit": maal(ev, p["ebit"]), "kw": maal(mcap, p["ni"]), "p_fcf": maal(mcap, p["fcf"])}
 
     nu = verhoudingen(mcap_nu, nu_p)
+    rij["reserve"] = []
+    if not financieel:
+        tpe, yfcf = info.get("trailingPE"), info.get("freeCashflow")
+        if nu.get("kw") is None and isinstance(tpe, (int, float)) and 0 < tpe < 2000:
+            nu["kw"] = float(tpe)
+            rij["reserve"].append("winst")
+        if nu.get("p_fcf") is None and isinstance(yfcf, (int, float)):
+            nu["p_fcf"] = mcap_nu / yfcf if yfcf > 0 else "verlies"
+            rij["reserve"].append("kasstroom")
     laatste_dag = slot.index[-1]
     n_maanden = WAARDE_HISTORIE_JAREN * 12
     punten = []
     for i in range(1, n_maanden + 1):
         maand = laatste_dag - pd.DateOffset(months=i)
-        bekend = [p for p in periodes if p["vanaf"] <= maand]
         # de cijfers die op dat moment het laatst bekend waren
-        p = bekend[-1] if bekend else None
+        p = samengesteld([p for p in periodes if p["vanaf"] <= maand])
         punten.append(verhoudingen(marktwaarde_op(maand, p) if p else None, p))
     rij["maanden"] = n_maanden
     for k, v_nu in nu.items():
@@ -3126,7 +3163,9 @@ def cijfers_html(f: dict, mf) -> str:
         rijen.append(("Goedkoop + rendabel", f"#{mf[0]}", f"van {mf[1]}"))
     if rijen:
         voet = (f"Normaal = mediaan van de maanden met winst in de afgelopen {WAARDE_HISTORIE_JAREN} jaar."
-                + (f" Cijfers: {f['bron_nu']}." if f.get("bron_nu") else ""))
+                + (f" Cijfers: {f['bron_nu']}." if f.get("bron_nu") else "")
+                + (f" × {' en × '.join(f['reserve'])} nu uit Yahoo's eigen samenvatting (jaarcijfers ontbraken)."
+                   if f.get("reserve") else ""))
         delen.append(f'<div class="fk-sec">Waarde</div>{_tabel(rijen)}<div class="fk-voet">{voet}</div>')
     # groei
     verwacht, bron = verwachte_groei(f)
