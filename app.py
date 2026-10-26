@@ -3224,7 +3224,23 @@ def cijfers_html(f: dict, mf) -> str:
     return "".join(delen) or '<div class="fk-voet">Geen cijfers beschikbaar.</div>'
 
 
-def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf) -> str:
+def _koers_tekst(ranking: pd.DataFrame, ticker: str) -> str:
+    """Actuele koers uit de ranglijst: euro-aandelen in euro, al het andere in dollars
+    (yen, Hongkongse dollars, ponden enz. omgerekend, met ≈ ervoor)."""
+    if ranking is None or ranking.empty or "ticker" not in ranking:
+        return ""
+    r = ranking.loc[ranking["ticker"] == ticker]
+    if r.empty:
+        return ""
+    valuta = fetch_meta(ticker)["valuta"]
+    cur = "EUR" if valuta == "EUR" else "USD"
+    v = r.iloc[0].get(f"prijs_{cur.lower()}")
+    if v is None or pd.isna(v):
+        return ""
+    return ("" if valuta in ("EUR", "USD") else "≈ ") + format_price(float(v), cur)
+
+
+def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf, koers: str = "") -> str:
     verwacht, _ = verwachte_groei(f)
     ing, teken = f.get("ingeprijsd"), f.get("ingeprijsd_teken", "")
 
@@ -3251,8 +3267,12 @@ def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf) -> str:
         chips.append(_chip(s["veiligheid_label"].capitalize(), LABEL_KLEUR[s["veiligheid_label"]]))
     kop = (f'<div style="display:flex;align-items:center;gap:8px">'
            f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rang}</span>'
-           f'<div style="flex:1;min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;'
-           f'text-overflow:ellipsis">{html.escape(naam)}</div><div style="font-size:0.78rem;opacity:0.6">'
+           f'<div style="flex:1;min-width:0"><div style="display:flex;gap:6px;align-items:baseline">'
+           f'<span style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
+           f'{html.escape(naam)}</span>'
+           + (f'<span style="font-size:0.85rem;white-space:nowrap;flex-shrink:0;opacity:0.8;'
+              f'font-variant-numeric:tabular-nums">{html.escape(koers)}</span>' if koers else "")
+           + f'</div><div style="font-size:0.78rem;opacity:0.6">'
            f'{html.escape(f["ticker"])}{mom_tekst}</div></div>{cirkel}'
            f'<span class="fk-pijl" style="opacity:0.45;font-size:0.8rem">▾</span></div>'
            f'{groeiregel}<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">{"".join(chips)}</div>')
@@ -3300,7 +3320,7 @@ Cyclische bedrijven (bv. chips, grondstoffen) lijken op het hoogtepunt van hun c
 """
 
 
-def render_fundamenteel(tickers: list):
+def render_fundamenteel(tickers: list, weights: dict, modus: str):
     """Ranglijst van losse aandelen op de eindscore, met per aandeel uitklapbare details."""
     aandelen = [t for t in tickers if str(fetch_meta(t).get("soort") or "").upper() != "ETF"]
     if not aandelen:
@@ -3318,13 +3338,18 @@ def render_fundamenteel(tickers: list):
         mom = [(m or {}).get("pct") for m in parallel(momentum_rij, aandelen)]
 
     mf = magic_formula([f for f in fund if "fout" not in f])
+    try:  # actuele koersen uit hetzelfde gedeelde geheugen als de ranglijst (geen extra verzoeken)
+        ranking, _, _, _ = laad_ranking(tickers, weights, modus == "watchlist")
+    except Exception:  # noqa: BLE001
+        ranking = None
     lijst = [(f, scores(f), m) for f, m in zip(fund, mom)]
     lijst.sort(key=lambda x: -1 if x[1]["eind"] is None else x[1]["eind"], reverse=True)
 
     st.caption("Tik op een aandeel voor de sterke punten en aandachtspunten. ETF's tellen niet mee.")
     st.markdown(FUND_CSS, unsafe_allow_html=True)
     st.markdown(RASTER.format("".join(
-        fund_kaart_html(i + 1, fetch_meta(f["ticker"])["naam"], f, s, m, mf.get(f["ticker"]))
+        fund_kaart_html(i + 1, fetch_meta(f["ticker"])["naam"], f, s, m, mf.get(f["ticker"]),
+                        _koers_tekst(ranking, f["ticker"]))
         for i, (f, s, m) in enumerate(lijst))), unsafe_allow_html=True)
     g = SCORE_GEWICHTEN
     if st.toggle("Hoe lees ik dit?", key="fund_uitleg"):
@@ -3340,7 +3365,7 @@ st.fragment(run_every=interval if auto else None)(render_live_boven)(
 if soort == "aandelen" and lijst:
     # Buiten de fragmenten: ververst niet elke paar seconden (slotkoersen volstaan)
     with st.expander("📊 Aandelenanalyse: waarde, groei, kwaliteit en veiligheid"):
-        render_fundamenteel(lijst)
+        render_fundamenteel(lijst, weights, modus)
 if soort == "crypto":
     # Buiten de fragmenten: cycluskaart en grafiek verversen niet elke paar
     # seconden mee, zodat inzoomen blijft staan. De data wordt 6 uur bewaard.
