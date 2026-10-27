@@ -65,6 +65,9 @@ DEFAULT_WATCHLIST = [
     "CEG", "VST", "GEV", "CCJ", "ENR.DE", "RR.L", "OKLO", "SMR",
     # Quantum, ruimtevaart, drones & robotica
     "IONQ", "RGTI", "QBTS", "RKLB", "ASTS", "RHM.DE", "AVAV", "SYM", "ISRG", "JOBY",
+    # Uit 'My Top 11 Investing Opportunities for 2027' (PLTR, GOOGL, NVDA en MSFT
+    # staan hierboven al, AMZN en TSLA zitten in je portefeuille)
+    "ARM", "APP", "CRWD", "BE", "ZETA",
 ]
 
 # Sector- en thema-ETF's: altijd bovenaan de stijgers & dalers in de watchlist
@@ -149,6 +152,11 @@ NAMES = {
     "AMD": "AMD",
     "NOW": "ServiceNow",
     "PLTR": "Palantir",
+    "ARM": "Arm Holdings",
+    "APP": "AppLovin",
+    "CRWD": "CrowdStrike",
+    "BE": "Bloom Energy",
+    "ZETA": "Zeta Global",
     "LTC-USD": "Litecoin",
     "000660.KS": "SK Hynix",
     "005930.KS": "Samsung Electronics",
