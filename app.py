@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_TICKERS = [
     # Aandelen & ETF's
     "VWRL.AS", "AMZN", "ACHR", "BESI.AS", "BSX", "MU", "NFLX", "MSTR", "TSLA", "PATH",
-    "NBIS",
+    "NBIS", "APP",
     # Crypto (Yahoo gebruikt bij naamconflicten een nummer, bv. HYPE32196-USD)
     "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "HYPE32196-USD",
     "NEAR-USD", "AAVE-USD", "ONDO-USD", "INJ-USD", "VIRTUAL-USD",
@@ -66,8 +66,8 @@ DEFAULT_WATCHLIST = [
     # Quantum, ruimtevaart, drones & robotica
     "IONQ", "RGTI", "QBTS", "RKLB", "ASTS", "RHM.DE", "AVAV", "SYM", "ISRG", "JOBY",
     # Uit 'My Top 11 Investing Opportunities for 2027' (PLTR, GOOGL, NVDA en MSFT
-    # staan hierboven al, AMZN en TSLA zitten in je portefeuille)
-    "ARM", "APP", "CRWD", "BE", "ZETA",
+    # staan hierboven al; AMZN, TSLA en APP zitten in je portefeuille)
+    "ARM", "CRWD",
 ]
 
 # Sector- en thema-ETF's: altijd bovenaan de stijgers & dalers in de watchlist
