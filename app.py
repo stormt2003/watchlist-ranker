@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_TICKERS = [
     # Aandelen & ETF's
     "VWRL.AS", "AMZN", "ACHR", "BESI.AS", "BSX", "MU", "NFLX", "MSTR", "TSLA", "PATH",
-    "NBIS", "APP",
+    "NBIS",
     # Crypto (Yahoo gebruikt bij naamconflicten een nummer, bv. HYPE32196-USD)
     "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "HYPE32196-USD",
     "NEAR-USD", "AAVE-USD", "ONDO-USD", "INJ-USD", "VIRTUAL-USD",
@@ -65,9 +65,6 @@ DEFAULT_WATCHLIST = [
     "CEG", "VST", "GEV", "CCJ", "ENR.DE", "RR.L", "OKLO", "SMR",
     # Quantum, ruimtevaart, drones & robotica
     "IONQ", "RGTI", "QBTS", "RKLB", "ASTS", "RHM.DE", "AVAV", "SYM", "ISRG", "JOBY",
-    # Uit 'My Top 11 Investing Opportunities for 2027' (PLTR, GOOGL, NVDA en MSFT
-    # staan hierboven al; AMZN, TSLA en APP zitten in je portefeuille)
-    "ARM", "CRWD",
 ]
 
 # Sector- en thema-ETF's: altijd bovenaan de stijgers & dalers in de watchlist
@@ -152,11 +149,6 @@ NAMES = {
     "AMD": "AMD",
     "NOW": "ServiceNow",
     "PLTR": "Palantir",
-    "ARM": "Arm Holdings",
-    "APP": "AppLovin",
-    "CRWD": "CrowdStrike",
-    "BE": "Bloom Energy",
-    "ZETA": "Zeta Global",
     "LTC-USD": "Litecoin",
     "000660.KS": "SK Hynix",
     "005930.KS": "Samsung Electronics",
@@ -2355,6 +2347,8 @@ MIN_MAANDEN_VERGELIJKING = 12
 VERHOUDINGEN = {"ev_ebit": ("EV/EBIT", "de bedrijfswinst"), "kw": ("K/W", "de winst"),
                 "p_fcf": ("Koers/vrije kasstroom", "de vrije kasstroom"),
                 "p_b": ("Koers/boekwaarde", "de boekwaarde")}
+# Groeiscore: zoveel procentpunt verwacht boven (onder) ingeprijsd geeft 100 (0); gelijk = 50
+GROEI_BEREIK = 0.25
 # Weging van de eindscore (wordt herschaald als een onderdeel ontbreekt)
 SCORE_GEWICHTEN = {"waarde": 0.35, "kwaliteit": 0.35, "groei": 0.20, "veiligheid": 0.10}
 # Mohanram G-score: het origineel vergelijkt met de mediaan van de bedrijfstak. Die
@@ -2911,7 +2905,7 @@ def scores(f: dict) -> dict:
     ing = f.get("ingeprijsd")
     if ing is not None and verwacht is not None:
         verschil = verwacht - ing
-        s["groei"] = _lin(verschil, -0.10, 0.10)
+        s["groei"] = _lin(verschil, -GROEI_BEREIK, GROEI_BEREIK)
         s["groei_label"] = "beter" if verschil >= 0.02 else "minder" if verschil <= -0.02 else "gelijk"
     elif verwacht is not None:
         s["groei"] = _lin(verwacht, -0.05, 0.20)
@@ -3052,7 +3046,7 @@ def punten(f: dict, s: dict) -> tuple:
     verwacht, bron = verwachte_groei(f)
     ing = f.get("ingeprijsd")
     pio, moh = f.get("piotroski") or [], f.get("mohanram") or []
-    trends = [f.get(f"marge_{m}_trend") for m in ("bruto", "netto")]
+    trends = [f.get(f"marge_{m}_trend") for m in ("bruto", "operationeel", "netto")]
     z = f.get("altman")
 
     # waarde
@@ -3096,9 +3090,9 @@ def punten(f: dict, s: dict) -> tuple:
     if "net_winstgevend" in f.get("waarschuwingen", []):
         let_op.append(("Pas net winstgevend", "vorig jaar nog verlies"))
     # kwaliteit
-    if trends and all(t == 1 for t in trends):
+    if sum(t == 1 for t in trends) >= 2:
         sterk.append(("Marges stijgen", f"netto {_p(f.get('marge_netto'))}"))
-    elif trends and all(t == -1 for t in trends):
+    elif sum(t == -1 for t in trends) >= 2:
         let_op.append(("Marges dalen", f"netto {_p(f.get('marge_netto'))}"))
     r = f.get("rendement_nu")
     if r is not None and r >= 0.15:
@@ -3206,13 +3200,15 @@ def cijfers_html(f: dict, mf) -> str:
         delen.append(f'<div class="fk-sec">Groei per jaar</div>{_tabel(rijen)}')
     # kwaliteit
     rijen = []
-    marges = [f.get(f"marge_{m}") for m in ("bruto", "netto")]
+    marges = [f.get(f"marge_{m}") for m in ("bruto", "operationeel", "netto")]
     if any(m is not None for m in marges):
-        trends = [f.get(f"marge_{m}_trend") for m in ("bruto", "netto")]
-        richting = {(1, 1): "beide stijgend", (-1, -1): "beide dalend", (0, 0): "gelijk"}.get(
-            tuple(trends), " / ".join({1: "stijgt", -1: "daalt", 0: "gelijk"}.get(t, "–") for t in trends))
-        rijen.append(("Marge bruto / netto",
-                      " / ".join("–" if m is None else f"{m * 100:.0f}%" for m in marges), richting))
+        trends = [t for t in (f.get(f"marge_{m}_trend") for m in ("bruto", "operationeel", "netto"))
+                  if t is not None]
+        richting = ("alle stijgend" if trends and all(t == 1 for t in trends)
+                    else "alle dalend" if trends and all(t == -1 for t in trends)
+                    else f"{sum(t == 1 for t in trends)} van {len(trends)} stijgend" if trends else "")
+        rijen.append(("Marge bruto / oper. / netto",
+                      "/".join("–" if m is None else f"{m * 100:.0f}" for m in marges) + "%", richting))
     if f.get("rendement_nu") is not None:
         rijen.append(("Rendement op vermogen" if fin else "Rendement op kapitaal", _p(f["rendement_nu"]),
                       f"bereik {_p(f['rendement_min'])} tot {_p(f['rendement_max'])}"))
@@ -3317,7 +3313,7 @@ HOE_LEES_IK_DIT = f"""
 **Groei**: *ingeprijsd* = de jaarlijkse groei van de vrije kasstroom die de koers rechtvaardigt (reverse DCF: {DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%}). Is de vrije kasstroom negatief, bijvoorbeeld omdat een bedrijf zwaar investeert in fabrieken of datacenters, dan rekent de code vanaf de winst; dan staat er *(op winst)*. Winst verdeelt grote investeringen over de jaren dat ze gebruikt worden, terwijl de vrije kasstroom ze in één keer aftrekt. Is ook de winst negatief, dan is er niets om vanaf te rekenen en staat er niets. *Verwacht* = omzetgroei volgend jaar volgens analisten. *Werkelijk* = omzetgroei per kwartaal t.o.v. hetzelfde kwartaal een jaar eerder, gemiddeld over de laatste kwartalen (zonder kwartaalcijfers: gemiddeld per jaar). Verwacht hoger dan ingeprijsd = ruimte in de koers.
 
 **Kwaliteit**
-- **Marges**: van elke 100 omzet wat er overblijft na inkoop (bruto) en als winst (netto)
+- **Marges**: van elke 100 omzet wat er overblijft na inkoop (bruto), na alle bedrijfskosten (operationeel) en als winst (netto)
 - **Rendement op kapitaal** = ROIC (bedrijfswinst na belasting ÷ schuld + eigen vermogen); bij banken rendement op eigen vermogen (ROE). Boven 15% is sterk
 - **Verbetering** = Piotroski F-score: 9 tests of het bedrijf beter wordt dan vorig jaar. Tik erop voor de tests
 - **Groeikwaliteit** = Mohanram G-score: rendabel, stabiel en investeert. Benaderd met vaste drempels. Tik erop voor de tests
