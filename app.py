@@ -2350,7 +2350,12 @@ VERHOUDINGEN = {"ev_ebit": ("EV/EBIT", "de bedrijfswinst"), "kw": ("K/W", "de wi
 # Groeiscore: zoveel procentpunt verwacht boven (onder) ingeprijsd geeft 100 (0); gelijk = 50
 GROEI_BEREIK = 0.25
 # Weging van de eindscore (wordt herschaald als een onderdeel ontbreekt)
-SCORE_GEWICHTEN = {"waarde": 0.35, "kwaliteit": 0.35, "groei": 0.20, "veiligheid": 0.10}
+SCORE_GEWICHTEN = {"waarde": 0.25, "kwaliteit": 0.25, "groei": 0.20, "stabiliteit": 0.20,
+                   "veiligheid": 0.10}
+# Stabiliteit: winst nu ÷ gemiddelde winst. Tot STABIEL_TOT× = 100, vanaf PIEK_VANAF× = 0
+STABIEL_TOT, PIEK_VANAF = 1.2, 2.5
+# Schommeling nettomarge (standaardafwijking): tot 2 procentpunt = 100, vanaf 15 = 0
+MARGE_RUSTIG, MARGE_WILD = 0.02, 0.15
 # Mohanram G-score: het origineel vergelijkt met de mediaan van de bedrijfstak. Die
 # vergelijkingsgroep hebben we niet, dus vaste drempels (pas aan naar smaak).
 G_DREMPELS = {"roa": 0.06, "cfo_roa": 0.06, "roa_spreiding": 0.03,
@@ -2753,6 +2758,23 @@ def fundamentele_rij(ticker: str) -> dict:
                 break
     rij["waarschuwingen"] = waarschuwingen
 
+    # --- stabiliteit: is de winst van nu normaal, of een piek of dal? -------------------
+    winsten = [v for v in (_w(netto_winst, j) for j in jaren) if v is not None]
+    if len(winsten) >= 3:
+        gem = sum(winsten) / len(winsten)
+        rij["winst_gem_jaren"] = len(winsten)
+        if gem > 0:
+            rij["kw_gem"] = mcap_nu / gem  # 'je betaalt × gemiddelde winst'
+            if nu_p["ni"] is not None:
+                rij["piekfactor"] = nu_p["ni"] / gem
+        else:
+            rij["gem_negatief"] = True
+    netto_marges = [_deel(_w(netto_winst, j), _w(omzet, j)) for j in jaren]
+    rij["marge_spreiding"] = _std(netto_marges)
+    verlies = [rij[k]["verlies"] for k in ("kw", "ev_ebit", "p_b") if isinstance(rij.get(k), dict)]
+    if verlies:
+        rij["verlies_maanden"] = max(verlies)
+
     # forward K/W (koers ÷ verwachte winst volgend jaar) en PEG
     fpe = info.get("forwardPE")
     rij["forward_kw"] = float(fpe) if isinstance(fpe, (int, float)) and 0 < fpe < 1000 else None
@@ -2934,6 +2956,22 @@ def scores(f: dict) -> dict:
     s["veiligheid"] = _lin(z, 1.0, 4.0)
     s["veiligheid_label"] = (None if z is None else "veilig" if z > 2.99
                              else "grijs gebied" if z >= 1.81 else "risico hoog")
+    # stabiliteit: winst t.o.v. eigen gemiddelde, schommeling van de marge, verliesmaanden
+    delen = []
+    p = f.get("piekfactor")
+    if f.get("gem_negatief") or (p is not None and p <= 0):
+        delen.append(0.0)  # gemiddeld verlies of nu verlies: niet stabiel
+    elif p is not None:
+        afwijking = max(p, 1 / p)  # piek (2× het gemiddelde) en dal (½×) tellen even zwaar
+        delen.append(_lin(afwijking, PIEK_VANAF, STABIEL_TOT))
+    if f.get("marge_spreiding") is not None:
+        delen.append(_lin(f["marge_spreiding"], MARGE_WILD, MARGE_RUSTIG))
+    if f.get("verlies_maanden") is not None:
+        delen.append(_lin(f["verlies_maanden"] / f.get("maanden", 36), 0.5, 0.0))
+    s["stabiliteit"] = sum(delen) / len(delen) if delen else None
+    st_ = s["stabiliteit"]
+    s["stabiliteit_label"] = (None if st_ is None else "stabiel" if st_ >= 65 else "wisselend" if st_ >= 40
+                              else "piekend" if (p or 0) >= 1.5 else "onrustig")
     # eindscore, herschaald over de onderdelen die er zijn
     beschikbaar = {k: w for k, w in SCORE_GEWICHTEN.items() if s.get(k) is not None}
     s["eind"] = (sum(s[k] * w for k, w in beschikbaar.items()) / sum(beschikbaar.values())
@@ -2964,7 +3002,8 @@ KLEUR = {  # (tekst, achtergrond): leesbaar in licht en donker thema
 LABEL_KLEUR = {"goedkoop": "groen", "normaal": "geel", "duur": "rood",
                "beter": "groen", "gelijk": "geel", "minder": "rood",
                "sterk": "groen", "gemiddeld": "geel", "zwak": "rood",
-               "veilig": "groen", "grijs gebied": "geel", "risico hoog": "rood"}
+               "veilig": "groen", "grijs gebied": "geel", "risico hoog": "rood",
+               "stabiel": "groen", "wisselend": "geel", "piekend": "rood", "onrustig": "rood"}
 GROEI_TEKST = {"beter": "beter dan ingeprijsd", "gelijk": "zoals ingeprijsd", "minder": "minder dan ingeprijsd"}
 # Namen in gewone taal (de vakterm staat in 'Hoe lees ik dit?')
 WAARVAN = {"kw": "winst", "ev_ebit": "bedrijfswinst", "p_fcf": "kasstroom", "p_b": "boekwaarde"}
@@ -3085,8 +3124,16 @@ def punten(f: dict, s: dict) -> tuple:
     if n_verlies >= 6 or (len(moh) > 3 and moh[3] is False):
         let_op.append(("Winst schommelt sterk",
                        f"{n_verlies} van {f.get('maanden', 36)} maanden verlies" if n_verlies else "wisselende jaren"))
-    if "verdubbeld" in f.get("waarschuwingen", []):
+    p = f.get("piekfactor")
+    piek = s.get("stabiliteit_label") == "piekend" and p is not None
+    if piek:
+        let_op.append(("Winst ver boven eigen gemiddelde: piek?",
+                       f"{p:.1f}× het gemiddelde".replace(".", ",")
+                       + (f", je betaalt {_maal(f['kw_gem'])} de gemiddelde winst" if f.get("kw_gem") else "")))
+    elif "verdubbeld" in f.get("waarschuwingen", []):
         let_op.append(("Winst net verdubbeld: piek of blijvend?", ""))
+    if s.get("stabiliteit_label") == "stabiel":
+        sterk.append(("Stabiele winst", "rond het eigen gemiddelde, weinig schommeling"))
     if "net_winstgevend" in f.get("waarschuwingen", []):
         let_op.append(("Pas net winstgevend", "vorig jaar nog verlies"))
     # kwaliteit
@@ -3176,6 +3223,9 @@ def cijfers_html(f: dict, mf) -> str:
                       f"prijs voor groei {f['peg']:.1f}".replace(".", ",") if f.get("peg") is not None else ""))
     if mf:
         rijen.append(("Goedkoop + rendabel", f"#{mf[0]}", f"van {mf[1]}"))
+    if f.get("kw_gem"):
+        rijen.insert(1, ("Je betaalt × gemiddelde winst", _maal(f["kw_gem"]),
+                         f"gem. {f['winst_gem_jaren']} jaar"))
     if rijen:
         voet = (f"Normaal = mediaan van de maanden met winst in de afgelopen {WAARDE_HISTORIE_JAREN} jaar."
                 + (f" Cijfers: {f['bron_nu']}." if f.get("bron_nu") else "")
@@ -3216,6 +3266,20 @@ def cijfers_html(f: dict, mf) -> str:
         ("Verbetering", PIOTROSKI_NAMEN, "piotroski"), ("Groeikwaliteit", MOHANRAM_NAMEN, "mohanram")))
     if rijen or tests:
         delen.append(f'<div class="fk-sec">Kwaliteit</div>{_tabel(rijen) if rijen else ""}{tests}')
+    # stabiliteit
+    rijen = []
+    p = f.get("piekfactor")
+    if p is not None:
+        rijen.append(("Winst nu t.o.v. gemiddelde", _maal(p), "stabiel rond 1×"))
+    elif f.get("gem_negatief"):
+        rijen.append(("Winst nu t.o.v. gemiddelde", "–", "gemiddeld verlies"))
+    if f.get("marge_spreiding") is not None:
+        rijen.append(("Schommeling nettomarge", f"±{f['marge_spreiding'] * 100:.0f} pt",
+                      f"rustig onder {MARGE_RUSTIG * 100:.0f} pt"))
+    if f.get("verlies_maanden") is not None:
+        rijen.append(("Maanden met verlies", f"{f['verlies_maanden']}/{f.get('maanden', 36)}", "afgelopen 3 jaar"))
+    if rijen:
+        delen.append(f'<div class="fk-sec">Stabiliteit</div>{_tabel(rijen)}')
     # veiligheid
     z = f.get("altman")
     if z is not None:
@@ -3267,6 +3331,8 @@ def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf, koers: str 
         if lab:
             chips.append(_chip(f"{titel}: {GROEI_TEKST.get(lab, lab) if deel == 'groei' else lab}",
                                LABEL_KLEUR[lab]))
+    if s.get("stabiliteit_label"):
+        chips.append(_chip(f"Winst: {s['stabiliteit_label']}", LABEL_KLEUR[s["stabiliteit_label"]]))
     if s.get("veiligheid_label"):
         chips.append(_chip(s["veiligheid_label"].capitalize(), LABEL_KLEUR[s["veiligheid_label"]]))
     kop = (f'<div style="display:flex;align-items:center;gap:8px">'
@@ -3299,7 +3365,7 @@ def fund_kaart_html(rang: int, naam: str, f: dict, s: dict, mom, mf, koers: str 
 
 
 HOE_LEES_IK_DIT = f"""
-**Eindscore (0–100)**: waarde {{w}}, kwaliteit {{k}}, groei {{g}}, veiligheid {{v}}. Ontbreekt een onderdeel, dan tellen de andere naar verhouding zwaarder.
+**Eindscore (0–100)**: waarde {{w}}, kwaliteit {{k}}, groei {{g}}, stabiliteit {{s}}, veiligheid {{v}}. Ontbreekt een onderdeel, dan tellen de andere naar verhouding zwaarder.
 
 **Waarde: "je betaalt X× ..."**: hoeveel jaar winst je betaalt voor het aandeel, en vergeleken met elke maand van de afgelopen {WAARDE_HISTORIE_JAREN} jaar ('normaal' = de mediaan). Lager dan normaal = goedkoper.
 - **Je betaalt × de winst** = koers/winst (K/W, P/E)
@@ -3317,6 +3383,8 @@ HOE_LEES_IK_DIT = f"""
 - **Rendement op kapitaal** = ROIC (bedrijfswinst na belasting ÷ schuld + eigen vermogen); bij banken rendement op eigen vermogen (ROE). Boven 15% is sterk
 - **Verbetering** = Piotroski F-score: 9 tests of het bedrijf beter wordt dan vorig jaar. Tik erop voor de tests
 - **Groeikwaliteit** = Mohanram G-score: rendabel, stabiel en investeert. Benaderd met vaste drempels. Tik erop voor de tests
+
+**Stabiliteit**: is de winst van nu normaal, of een piek of dal? Drie metingen: de winst nu gedeeld door de gemiddelde winst van de afgelopen jaren (rond 1× = stabiel, 2,5× of meer = piek, ½× = dal), hoe sterk de nettomarge door de jaren schommelt, en het aantal maanden met verlies. Op het kaartje: *Winst: stabiel / wisselend / piekend / onrustig*. Bij waarde staat ook **Je betaalt × gemiddelde winst** (zoals Benjamin Graham deed bij cyclische bedrijven): is dat veel hoger dan × de winst van nu, dan lijkt het aandeel vooral goedkoop door een tijdelijk hoge winst.
 
 **Veiligheid: faillissementsrisico** = Altman Z-score. Boven 3 veilig, 1,8–3 grijs gebied, daaronder verhoogd. Hoog risico kan ook hoge opbrengst betekenen.
 
@@ -3358,7 +3426,8 @@ def render_fundamenteel(tickers: list, weights: dict, modus: str):
     g = SCORE_GEWICHTEN
     if st.toggle("Hoe lees ik dit?", key="fund_uitleg"):
         st.markdown(HOE_LEES_IK_DIT.format(w=f"{g['waarde']:.0%}", k=f"{g['kwaliteit']:.0%}",
-                                           g=f"{g['groei']:.0%}", v=f"{g['veiligheid']:.0%}"))
+                                           g=f"{g['groei']:.0%}", s=f"{g['stabiliteit']:.0%}",
+                                           v=f"{g['veiligheid']:.0%}"))
 
 
 # Twee fragmenten die elk in hun eigen tempo verversen. Alleen de tickers van
