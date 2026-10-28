@@ -2354,6 +2354,10 @@ SCORE_GEWICHTEN = {"waarde": 0.25, "kwaliteit": 0.25, "groei": 0.20, "stabilitei
                    "veiligheid": 0.10}
 # Stabiliteit: winst nu ÷ gemiddelde winst. Tot STABIEL_TOT× = 100, vanaf PIEK_VANAF× = 0
 STABIEL_TOT, PIEK_VANAF = 1.2, 2.5
+# Verwachten analisten dat een hoge winst aanhoudt, dan wordt de piekmeting verzacht:
+# winstgroei volgend jaar ≥ 0% geeft deze maximale verzachting, −20% of slechter geen.
+# Niet 100%: op een cyclische piek zijn analisten vaak te optimistisch.
+MAX_VERZACHTING = 0.5
 # Schommeling nettomarge (standaardafwijking): tot 2 procentpunt = 100, vanaf 15 = 0
 MARGE_RUSTIG, MARGE_WILD = 0.02, 0.15
 # Mohanram G-score: het origineel vergelijkt met de mediaan van de bedrijfstak. Die
@@ -2963,7 +2967,12 @@ def scores(f: dict) -> dict:
         delen.append(0.0)  # gemiddeld verlies of nu verlies: niet stabiel
     elif p is not None:
         afwijking = max(p, 1 / p)  # piek (2× het gemiddelde) en dal (½×) tellen even zwaar
-        delen.append(_lin(afwijking, PIEK_VANAF, STABIEL_TOT))
+        piekscore = _lin(afwijking, PIEK_VANAF, STABIEL_TOT)
+        # Hoge winst die volgens de verwachtingen aanhoudt is (deels) geen piek
+        if p > STABIEL_TOT and f.get("winst_jr") is not None:
+            s["verzachting"] = _lin(f["winst_jr"], -0.20, 0.0) / 100 * MAX_VERZACHTING
+            piekscore += (100 - piekscore) * s["verzachting"]
+        delen.append(piekscore)
     if f.get("marge_spreiding") is not None:
         delen.append(_lin(f["marge_spreiding"], MARGE_WILD, MARGE_RUSTIG))
     if f.get("verlies_maanden") is not None:
@@ -3125,11 +3134,18 @@ def punten(f: dict, s: dict) -> tuple:
         let_op.append(("Winst schommelt sterk",
                        f"{n_verlies} van {f.get('maanden', 36)} maanden verlies" if n_verlies else "wisselende jaren"))
     p = f.get("piekfactor")
-    piek = s.get("stabiliteit_label") == "piekend" and p is not None
-    if piek:
-        let_op.append(("Winst ver boven eigen gemiddelde: piek?",
-                       f"{p:.1f}× het gemiddelde".replace(".", ",")
-                       + (f", je betaalt {_maal(f['kw_gem'])} de gemiddelde winst" if f.get("kw_gem") else "")))
+    if p is not None and p >= 1.5:
+        verw = f.get("winst_jr")
+        if s.get("verzachting"):
+            let_op.append(("Winst ver boven eigen gemiddelde",
+                           f"{p:.1f}× het gemiddelde, maar analisten verwachten ".replace(".", ",")
+                           + f"{_p(verw, 0, True)} volgend jaar: lijkt (deels) aan te houden"))
+        else:
+            let_op.append(("Winst ver boven eigen gemiddelde: piek?",
+                           f"{p:.1f}× het gemiddelde".replace(".", ",")
+                           + (f", verwacht volgend jaar {_p(verw, 0, True)}" if verw is not None
+                              else f", je betaalt {_maal(f['kw_gem'])} de gemiddelde winst" if f.get("kw_gem")
+                              else "")))
     elif "verdubbeld" in f.get("waarschuwingen", []):
         let_op.append(("Winst net verdubbeld: piek of blijvend?", ""))
     if s.get("stabiliteit_label") == "stabiel":
@@ -3271,6 +3287,10 @@ def cijfers_html(f: dict, mf) -> str:
     p = f.get("piekfactor")
     if p is not None:
         rijen.append(("Winst nu t.o.v. gemiddelde", _maal(p), "stabiel rond 1×"))
+        if p > STABIEL_TOT and f.get("winst_jr") is not None:
+            verz = _lin(f["winst_jr"], -0.20, 0.0) / 100 * MAX_VERZACHTING
+            rijen.append(("Verwachte winstgroei volgend jaar", _p(f["winst_jr"], 0, True),
+                          f"piek {verz * 100:.0f}% verzacht" if verz else "geen verzachting"))
     elif f.get("gem_negatief"):
         rijen.append(("Winst nu t.o.v. gemiddelde", "–", "gemiddeld verlies"))
     if f.get("marge_spreiding") is not None:
@@ -3384,7 +3404,7 @@ HOE_LEES_IK_DIT = f"""
 - **Verbetering** = Piotroski F-score: 9 tests of het bedrijf beter wordt dan vorig jaar. Tik erop voor de tests
 - **Groeikwaliteit** = Mohanram G-score: rendabel, stabiel en investeert. Benaderd met vaste drempels. Tik erop voor de tests
 
-**Stabiliteit**: is de winst van nu normaal, of een piek of dal? Drie metingen: de winst nu gedeeld door de gemiddelde winst van de afgelopen jaren (rond 1× = stabiel, 2,5× of meer = piek, ½× = dal), hoe sterk de nettomarge door de jaren schommelt, en het aantal maanden met verlies. Op het kaartje: *Winst: stabiel / wisselend / piekend / onrustig*. Bij waarde staat ook **Je betaalt × gemiddelde winst** (zoals Benjamin Graham deed bij cyclische bedrijven): is dat veel hoger dan × de winst van nu, dan lijkt het aandeel vooral goedkoop door een tijdelijk hoge winst.
+**Stabiliteit**: is de winst van nu normaal, of een piek of dal? Drie metingen: de winst nu gedeeld door de gemiddelde winst van de afgelopen jaren (rond 1× = stabiel, 2,5× of meer = piek, ½× = dal), hoe sterk de nettomarge door de jaren schommelt, en het aantal maanden met verlies. Ligt de winst boven het gemiddelde maar verwachten analisten volgend jaar nog evenveel of meer winst, dan wordt de piekmeting tot de helft verzacht (bij een verwachte daling van 20% of meer niet). Niet helemaal, omdat analisten op een cyclische piek vaak te optimistisch zijn. Op het kaartje: *Winst: stabiel / wisselend / piekend / onrustig*. Bij waarde staat ook **Je betaalt × gemiddelde winst** (zoals Benjamin Graham deed bij cyclische bedrijven): is dat veel hoger dan × de winst van nu, dan lijkt het aandeel vooral goedkoop door een tijdelijk hoge winst.
 
 **Veiligheid: faillissementsrisico** = Altman Z-score. Boven 3 veilig, 1,8–3 grijs gebied, daaronder verhoogd. Hoog risico kan ook hoge opbrengst betekenen.
 
