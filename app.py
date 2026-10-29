@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_TICKERS = [
     # Aandelen & ETF's
     "VWRL.AS", "AMZN", "ACHR", "BESI.AS", "BSX", "MU", "NFLX", "MSTR", "TSLA", "PATH",
-    "NBIS",
+    "NBIS"", "GOOGL",
     # Crypto (Yahoo gebruikt bij naamconflicten een nummer, bv. HYPE32196-USD)
     "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "HYPE32196-USD",
     "NEAR-USD", "AAVE-USD", "ONDO-USD", "INJ-USD", "VIRTUAL-USD",
