@@ -48,12 +48,14 @@ DEFAULT_TICKERS = [
 ]
 
 # Vaste watchlist bij het openen. Tickers die al in je portefeuille staan
-# (bv. AMZN, TSLA, BESI) hoeven hier niet: die komen er automatisch bij.
+# (bv. AMZN, NVDA, BESI) hoeven hier niet: die komen er automatisch bij.
 DEFAULT_WATCHLIST = [
     # Gevraagd
     "ASML.AS", "NVDA", "BABA", "META",
-    # Rest van de 'Magnificent 7' (AMZN en TSLA zitten al in je portefeuille)
+    # Rest van de 'Magnificent 7' (AMZN zit al in je portefeuille)
     "AAPL", "MSFT", "GOOGL", "TSLA",
+    # Uit je portefeuille gehaald, maar nog wel volgen
+    "ACHR", "ONDO-USD",
     # Grootste bedrijven ter wereld naar beurswaarde (top 20)
     "AVGO", "TSM", "BRK-B", "LLY", "WMT", "JPM", "2222.SR", "V", "ORCL",
     "0700.HK", "XOM", "MA", "JNJ",
@@ -121,6 +123,7 @@ NAMES = {
     "ONDO-USD": "Ondo",
     "INJ-USD": "Injective",
     "VIRTUAL-USD": "Virtuals Protocol",
+    "LIT39125-USD": "Lighter",
     # Watchlist
     "ASML.AS": "ASML",
     "NVDA": "NVIDIA",
