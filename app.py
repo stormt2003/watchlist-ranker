@@ -10,6 +10,8 @@ Lokaal draaien:
     streamlit run app.py
 """
 
+import hashlib
+import hmac
 import html
 import math
 import re
@@ -575,6 +577,90 @@ def fetch_crypto_fear_greed() -> dict:
     d = resp.json()["data"][0]
     return {"waarde": int(d["value"]), "classificatie": d["value_classification"],
             "bron": "alternative.me", "zones": "standaard", "fouten": fouten}
+
+
+# ---------------------------------------------------------------------------
+# BITVAVO: je crypto-wallet (alleen lezen)
+# ---------------------------------------------------------------------------
+# Sleutel in .streamlit/secrets.toml (of Streamlit Cloud -> Settings -> Secrets):
+#   BITVAVO_API_KEY = "..."
+#   BITVAVO_API_SECRET = "..."
+# Gebruik een sleutel met ALLEEN 'View access'. Zonder sleutel werkt alles zoals
+# vroeger: dan komt 'Mijn crypto' uit het tekstveld in de zijbalk.
+BITVAVO_URL = "https://api.bitvavo.com/v2"
+# Munt op Bitvavo -> ticker op Yahoo. Standaard wordt dat <MUNT>-USD; alleen
+# munten waarvoor Yahoo een nummer gebruikt (naamconflict) moeten hier staan.
+BITVAVO_YAHOO = {"HYPE": "HYPE32196-USD", "LIT": "LIT39125-USD"}
+BITVAVO_MIN_WAARDE = 1.0  # posities onder € 1 (stof van oude trades) niet tonen
+
+
+def _bitvavo_sleutel():
+    try:
+        key, secret = st.secrets.get("BITVAVO_API_KEY"), st.secrets.get("BITVAVO_API_SECRET")
+    except Exception:  # noqa: BLE001  (geen secrets.toml)
+        return None
+    return (key, secret) if key and secret else None
+
+
+def _bitvavo_privé(pad: str):
+    """GET met Bitvavo's handtekening: HMAC-SHA256 over tijd + methode + pad."""
+    sleutel = _bitvavo_sleutel()
+    if not sleutel:
+        raise ValueError("geen Bitvavo-sleutel in de geheime instellingen")
+    key, secret = sleutel
+    tijd = str(int(time.time() * 1000))
+    handtekening = hmac.new(secret.encode(), f"{tijd}GET/v2{pad}".encode(), hashlib.sha256).hexdigest()
+    resp = requests.get(BITVAVO_URL + pad, timeout=10, headers={
+        "Bitvavo-Access-Key": key, "Bitvavo-Access-Signature": handtekening,
+        "Bitvavo-Access-Timestamp": tijd, "Bitvavo-Access-Window": "10000",
+    })
+    if resp.status_code != 200:
+        try:
+            melding = resp.json().get("error", resp.text)
+        except Exception:  # noqa: BLE001
+            melding = resp.text
+        raise ValueError(f"Bitvavo {resp.status_code}: {melding}")
+    return resp.json()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_bitvavo_saldo() -> dict:
+    """{munt: aantal} (beschikbaar + in orders), 1 minuut bewaard."""
+    return {r["symbol"]: float(r["available"]) + float(r["inOrder"])
+            for r in _bitvavo_privé("/balance")
+            if float(r["available"]) + float(r["inOrder"]) > 0}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_bitvavo_koersen() -> dict:
+    """Openbare koersen van Bitvavo, {markt: prijs}, 30 seconden bewaard."""
+    resp = requests.get(BITVAVO_URL + "/ticker/price", timeout=10)
+    resp.raise_for_status()
+    return {r["market"]: float(r["price"]) for r in resp.json() if r.get("price")}
+
+
+def bitvavo_wallet():
+    """None zonder sleutel. Anders {'posities': [...], 'euro': x} of {'fout': '...'}.
+    Elke positie: munt, Yahoo-ticker, aantal, koers en waarde in euro."""
+    if not _bitvavo_sleutel():
+        return None
+    try:
+        saldo = fetch_bitvavo_saldo()
+        koersen = fetch_bitvavo_koersen()
+    except Exception as e:  # noqa: BLE001
+        return {"fout": str(e)}
+    posities = []
+    for munt, aantal in saldo.items():
+        if munt == "EUR":
+            continue
+        koers = koersen.get(f"{munt}-EUR")
+        waarde = aantal * koers if koers else None
+        if waarde is not None and waarde < BITVAVO_MIN_WAARDE:
+            continue
+        posities.append({"munt": munt, "ticker": BITVAVO_YAHOO.get(munt, f"{munt}-USD"),
+                         "aantal": aantal, "koers": koers, "waarde": waarde})
+    posities.sort(key=lambda p: p["waarde"] or 0, reverse=True)
+    return {"posities": posities, "euro": saldo.get("EUR", 0.0)}
 
 
 CMC_FNG_HISTORICAL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
@@ -1310,9 +1396,16 @@ def card_html(rank: int, row: pd.Series, in_bezit: bool = False) -> str:
     )
 
 
-def holding_card_html(row: pd.Series) -> str:
+def _aantal_nl(x: float) -> str:
+    """0.06000000 -> '0,06', 1234.5 -> '1.234,5' (max. 8 decimalen)."""
+    txt = f"{x:,.8f}".rstrip("0").rstrip(".")
+    return txt.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def holding_card_html(row: pd.Series, bezit: dict = None) -> str:
     """Kaartje voor een positie in de portefeuille: koers in TradingView-stijl
-    rechts, koersverloop (1u/7d/30d) onderaan, geen score."""
+    rechts, koersverloop (1u/7d/30d) onderaan, geen score. Met `bezit` (uit
+    Bitvavo) ook hoeveel je hebt, wat het waard is en welk deel van je wallet."""
     chips = "".join(
         change_chip(lbl, row[col]) for lbl, col in [("1u", "%_1u"), ("7d", "%_7d"), ("30d", "%_30d")]
     )
@@ -1321,11 +1414,20 @@ def holding_card_html(row: pd.Series) -> str:
         f'<div style="font-size:0.78rem;opacity:0.6;font-variant-numeric:tabular-nums;'
         f'margin-top:1px">{andere}</div>' if andere else ""
     )
+    bezit_html = ""
+    if bezit:
+        waarde = (format_price(bezit["waarde"], "EUR") if bezit.get("waarde") is not None else "–")
+        deel = f' · {bezit["aandeel"]:.1f}%'.replace(".", ",") if bezit.get("aandeel") is not None else ""
+        bezit_html = (
+            f'<div style="font-size:0.82rem;margin-top:3px;font-variant-numeric:tabular-nums">'
+            f'<span style="opacity:0.65">{_aantal_nl(bezit["aantal"])} {html.escape(bezit["munt"])}</span>'
+            f' · <b>{waarde}</b><span style="opacity:0.55">{deel}</span></div>'
+        )
     return (
         f'<div style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;'
         f'padding:7px 10px 6px;margin-bottom:6px">'
         f'<div style="display:flex;align-items:center;gap:8px">'
-        f'<div style="flex:1;min-width:0">{title_html(row)}{andere_html}</div>'
+        f'<div style="flex:1;min-width:0">{title_html(row)}{andere_html}{bezit_html}</div>'
         f'{koers_blok_html(row, "%_24u")}'
         f"</div>"
         f'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;font-size:0.72rem;'
@@ -2037,6 +2139,13 @@ with st.sidebar:
     )
     if dubbel:
         st.caption(f"Al in je portefeuille, dus overgeslagen: {', '.join(dubbel)}")
+    wallet = bitvavo_wallet()
+    bitvavo_tickers = [p["ticker"] for p in wallet["posities"]] if wallet and "posities" in wallet else []
+    if wallet and "fout" in wallet:
+        st.warning(f"Bitvavo niet bereikbaar, 'Mijn crypto' komt uit het tekstveld: {wallet['fout']}")
+    elif wallet is not None:
+        st.caption(f"🔗 'Mijn crypto' komt automatisch uit je Bitvavo-wallet ({len(bitvavo_tickers)} munten). "
+                   "De crypto in het veld hierboven telt daar niet mee.")
 
     with st.expander("Watchlist-score: gewichten"):
         weights = {
@@ -2058,9 +2167,11 @@ with st.sidebar:
         wis_data_geheugen()
 
 watchlist = portefeuille + extra
+alle_tickers = list(dict.fromkeys(watchlist + bitvavo_tickers))
 with st.spinner("Tickers indelen…"):
-    vooraf_ophalen(fetch_meta, watchlist)
-    indeling = {t: ("crypto" if is_crypto(t) else "aandelen") for t in watchlist}
+    vooraf_ophalen(fetch_meta, alle_tickers)
+    indeling = {t: ("crypto" if is_crypto(t) else "aandelen") for t in alle_tickers}
+    indeling.update({t: "crypto" for t in bitvavo_tickers})  # van Bitvavo = altijd crypto
 
 
 def per_soort(tickers: list) -> dict:
@@ -2068,6 +2179,9 @@ def per_soort(tickers: list) -> dict:
 
 
 port_per_soort = per_soort(portefeuille)
+if bitvavo_tickers:
+    port_per_soort["crypto"] = bitvavo_tickers  # 'Mijn crypto' = wat er echt op Bitvavo staat
+in_bezit = tuple(dict.fromkeys(portefeuille + bitvavo_tickers))
 wl_per_soort = per_soort(watchlist)
 
 # Drie tabbladen. De portefeuille is per soort gesplitst; de watchlist
@@ -2230,6 +2344,54 @@ RASTER = ('<div style="display:grid;grid-template-columns:repeat(auto-fill,minma
           'column-gap:10px">{}</div>')
 
 
+WALLET_PERIODES = [("24u", "%_24u"), ("7d", "%_7d"), ("30d", "%_30d")]
+
+
+def render_wallet(ranking: pd.DataFrame, wallet: dict):
+    """Totale waarde van de Bitvavo-wallet en wat je huidige munten de afgelopen
+    24 uur, 7 en 30 dagen deden (in euro en procent)."""
+    posities = wallet["posities"]
+    crypto = sum(p["waarde"] or 0 for p in posities)
+    totaal = crypto + wallet["euro"]
+    pct = ranking.set_index("ticker") if not ranking.empty else pd.DataFrame()
+    chips, ontbreekt = [], set()
+    for label, kolom in WALLET_PERIODES:
+        verschil = basis = 0.0
+        for p in posities:
+            v = pct.at[p["ticker"], kolom] if p["ticker"] in pct.index else None
+            if p["waarde"] is None or v is None or pd.isna(v):
+                ontbreekt.add(p["munt"])
+                continue
+            toen = p["waarde"] / (1 + v / 100)  # wat deze munten toen waard waren
+            verschil += p["waarde"] - toen
+            basis += toen
+        if basis:
+            kleur = "#2e9e58" if verschil >= 0 else "#d64545"
+            chips.append(
+                f'<div style="flex:1;min-width:90px"><div style="font-size:0.72rem;opacity:0.6">{label}</div>'
+                f'<div style="color:{kleur};font-weight:700;font-variant-numeric:tabular-nums">'
+                f'{_procent(verschil / basis * 100)}</div>'
+                f'<div style="color:{kleur};font-size:0.8rem;font-variant-numeric:tabular-nums">'
+                f'{"+" if verschil >= 0 else "−"}{format_price(abs(verschil), "EUR")}</div></div>')
+    st.markdown(
+        '<div style="border:1px solid rgba(128,128,128,0.22);border-radius:10px;padding:10px 14px;margin:4px 0 10px">'
+        '<div style="font-size:0.8rem;opacity:0.65">🔗 Mijn Bitvavo-wallet</div>'
+        f'<div style="font-size:1.6rem;font-weight:800;font-variant-numeric:tabular-nums">'
+        f'{format_price(totaal, "EUR")}</div>'
+        f'<div style="font-size:0.8rem;opacity:0.65;font-variant-numeric:tabular-nums">'
+        f'crypto {format_price(crypto, "EUR")} · euro {format_price(wallet["euro"], "EUR")}</div>'
+        f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">{"".join(chips)}</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Verandering van de munten die je nu hebt: wat ze 24 uur, 7 en 30 dagen geleden waard waren "
+        "tegenover nu. Aankopen en verkopen in die periode tellen niet mee. Waarde tegen Bitvavo-koersen."
+        + (f" Niet in elke periode meegeteld (geen koersverloop bij Yahoo): {', '.join(sorted(ontbreekt))}. "
+           "Ontbreekt een munt steeds, voeg dan de juiste Yahoo-ticker toe in BITVAVO_YAHOO."
+           if ontbreekt else "")
+    )
+
+
 def render_live_boven(tickers: list, weights: dict, soort: str, modus: str):
     """Snel deel, bovenaan: meldingen en de twee graadmeters."""
     cfg = SOORTEN[soort]
@@ -2259,6 +2421,11 @@ def render_live_boven(tickers: list, weights: dict, soort: str, modus: str):
         render_gauge(cfg["fetch"], cfg["gauge"], cfg["fout"])
         return
 
+    if modus == "portefeuille" and crypto:
+        wallet = bitvavo_wallet()
+        if wallet and "posities" in wallet:
+            render_wallet(ranking, wallet)
+
     # Bovenaan: de twee graadmeters naast elkaar
     g1, g2 = st.columns(2, gap="large")
     with g1:
@@ -2284,8 +2451,18 @@ def render_live_onder(tickers: list, weights: dict, soort: str, modus: str, in_b
         st.divider()
         st.subheader("Mijn posities")
         st.caption("≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
-        posities = ranking.sort_values("naam", key=lambda s: s.str.lower())
-        st.markdown(RASTER.format("".join(holding_card_html(r) for _, r in posities.iterrows())),
+        wallet = bitvavo_wallet() if crypto else None
+        bezit = {}
+        if wallet and "posities" in wallet:
+            totaal = sum(p["waarde"] or 0 for p in wallet["posities"]) + wallet["euro"]
+            bezit = {p["ticker"]: {**p, "aandeel": p["waarde"] / totaal * 100 if p["waarde"] and totaal else None}
+                     for p in wallet["posities"]}
+            volgorde = {t: i for i, t in enumerate(bezit)}  # al gesorteerd op waarde
+            posities = ranking.sort_values("ticker", key=lambda s: s.map(volgorde).fillna(len(volgorde)))
+        else:
+            posities = ranking.sort_values("naam", key=lambda s: s.str.lower())
+        st.markdown(RASTER.format("".join(holding_card_html(r, bezit.get(r["ticker"]))
+                                          for _, r in posities.iterrows())),
                     unsafe_allow_html=True)
         with st.expander("Ruwe tabel"):
             st.dataframe(ranking, width="stretch", hide_index=True)
@@ -3469,10 +3646,10 @@ if soort == "crypto":
     with st.expander("📈 BTC-prijs, Fear & Greed en RSI (dagbasis)"):
         st.fragment(render_fng_grafiek)()  # klikken in de grafiek ververst alleen de grafiek
 st.fragment(run_every=interval if auto else None)(render_live_onder)(
-    lijst, weights, soort, modus, tuple(portefeuille)
+    lijst, weights, soort, modus, in_bezit
 )
 
 if modus == "watchlist":
     st.fragment(run_every=rang_interval if auto else None)(render_ranglijst)(
-        lijst, weights, soort, tuple(portefeuille), rang_interval if auto else None
+        lijst, weights, soort, in_bezit, rang_interval if auto else None
     )
