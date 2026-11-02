@@ -593,6 +593,9 @@ BITVAVO_URL = "https://api.bitvavo.com/v2"
 # munten waarvoor Yahoo een nummer gebruikt (naamconflict) moeten hier staan.
 BITVAVO_YAHOO = {"HYPE": "HYPE32196-USD", "LIGHTER": "LIT39125-USD", "LIT": "LIT39125-USD"}
 BITVAVO_MIN_WAARDE = 1.0  # posities onder € 1 (stof van oude trades) niet tonen
+# Hoe lang saldo, staking en koersen van Bitvavo bewaard blijven (seconden). Lager = vaker
+# vers. Elke ronde kost ~11 van de (ruim) 1.000 'gewichtspunten' per minuut die Bitvavo toestaat.
+BITVAVO_VERS_SEC = 15
 
 
 def _bitvavo_sleutel():
@@ -624,9 +627,9 @@ def _bitvavo_privé(pad: str):
     return resp.json()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=BITVAVO_VERS_SEC, show_spinner=False)
 def fetch_bitvavo_saldo() -> dict:
-    """{munt: (beschikbaar, in orders)}, 1 minuut bewaard. Vaste staking zit hier niet in."""
+    """{munt: (beschikbaar, in orders)}, BITVAVO_VERS_SEC bewaard. Vaste staking zit hier niet in."""
     uit = {}
     for r in _bitvavo_privé("/balance"):
         beschikbaar, in_order = float(r.get("available") or 0), float(r.get("inOrder") or 0)
@@ -635,9 +638,9 @@ def fetch_bitvavo_saldo() -> dict:
     return uit
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=BITVAVO_VERS_SEC, show_spinner=False)
 def fetch_bitvavo_staking() -> dict:
-    """{munt: aantal in vaste staking}, 1 minuut bewaard (GET /stakingBalance)."""
+    """{munt: aantal in vaste staking}, BITVAVO_VERS_SEC bewaard (GET /stakingBalance)."""
     uit = {}
     for r in _bitvavo_privé("/stakingBalance"):
         aantal = float(r.get("amount") or 0)
@@ -646,9 +649,9 @@ def fetch_bitvavo_staking() -> dict:
     return uit
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=BITVAVO_VERS_SEC, show_spinner=False)
 def fetch_bitvavo_koersen() -> dict:
-    """Openbare koersen van Bitvavo, {markt: prijs}, 30 seconden bewaard."""
+    """Openbare koersen van Bitvavo, {markt: prijs}, BITVAVO_VERS_SEC bewaard."""
     resp = requests.get(BITVAVO_URL + "/ticker/price", timeout=10)
     resp.raise_for_status()
     return {r["market"]: float(r["price"]) for r in resp.json() if r.get("price")}
