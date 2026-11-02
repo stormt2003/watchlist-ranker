@@ -44,7 +44,7 @@ DEFAULT_TICKERS = [
     "NBIS", "GOOGL", "NVDA",
     # Crypto (Yahoo gebruikt bij naamconflicten een nummer, bv. HYPE32196-USD)
     "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "HYPE32196-USD",
-    "NEAR-USD", "AAVE-USD", "INJ-USD", "VIRTUAL-USD",
+    "NEAR-USD", "AAVE-USD", "INJ-USD", "VIRTUAL-USD", "LIT39125-USD",
 ]
 
 # Vaste watchlist bij het openen. Tickers die al in je portefeuille staan
