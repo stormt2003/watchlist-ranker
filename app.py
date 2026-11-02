@@ -2374,6 +2374,50 @@ RASTER = ('<div style="display:grid;grid-template-columns:repeat(auto-fill,minma
 WALLET_PERIODES = [("24u", "%_24u"), ("7d", "%_7d"), ("30d", "%_30d")]
 
 
+def wallet_rij_html(rang: int, p: dict, rij, kolom: str, totaal: float, euro: bool = False) -> str:
+    """Eén positie in de stijl van de stijgers/dalers: naam met lampje links (munt, aantal en
+    aandeel klein eronder), rechts de waarde en de winst/verlies in euro en procent."""
+    waarde = p.get("waarde")
+    deel = f"{waarde / totaal * 100:.1f}%".replace(".", ",") if waarde and totaal else ""
+    if euro:
+        naam_html = '<span style="font-weight:650;font-size:0.88rem">Euro</span>'
+        sub = "saldo" + (f" · {deel}" if deel else "")
+    else:
+        naam = html.escape(str(rij["naam"]) if rij is not None else p["munt"])
+        lampje = lampje_html(rij) if rij is not None else ""
+        naam_html = (f'<span style="display:inline-flex;align-items:center;gap:6px;min-width:0">{lampje}'
+                     f'<span style="font-weight:650;font-size:0.88rem;white-space:nowrap;overflow:hidden;'
+                     f'text-overflow:ellipsis">{naam}</span></span>')
+        delen = [html.escape(p["munt"]), _aantal_nl(p["aantal"])]
+        if p.get("gestaked"):
+            delen.append(f"{_aantal_nl(p['gestaked'])} gestaked")
+        if deel:
+            delen.append(deel)
+        sub = " · ".join(delen)
+
+    rechts = f'{format_price(waarde, "EUR") if waarde is not None else "geen koers"}'
+    v = rij[kolom] if rij is not None and kolom in rij else None
+    if waarde is not None and _getal(v):
+        effect = waarde - waarde / (1 + v / 100)  # wat deze positie in de periode deed, in euro
+        kleur = "#2e9e58" if effect >= 0 else "#d64545"
+        onder = (f'<span style="color:{kleur};font-weight:600">{"+" if effect >= 0 else "−"}'
+                 f'{format_price(abs(effect), "EUR")}&nbsp;&nbsp;{_procent(v)}</span>')
+    else:
+        onder = '<span style="opacity:0.4">–</span>' if not euro else ""
+    return (
+        '<div style="border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px">'
+        '<div style="display:flex;align-items:center;gap:8px;padding:5px 9px">'
+        f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rang}</span>'
+        f'<div style="flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.2">{naam_html}'
+        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis">{sub}</span></div>'
+        '<div style="text-align:right;flex-shrink:0;line-height:1.15">'
+        f'<div style="font-weight:750;font-size:0.98rem;font-variant-numeric:tabular-nums;white-space:nowrap">'
+        f'{rechts}</div><div style="font-size:0.74rem;white-space:nowrap;margin-top:2px;'
+        f'font-variant-numeric:tabular-nums">{onder}</div></div></div></div>'
+    )
+
+
 def render_wallet(ranking: pd.DataFrame, wallet: dict):
     """Totale waarde van de Bitvavo-wallet en wat je huidige munten de afgelopen
     24 uur, 7 en 30 dagen deden (in euro en procent)."""
@@ -2411,36 +2455,17 @@ def render_wallet(ranking: pd.DataFrame, wallet: dict):
         unsafe_allow_html=True,
     )
     with st.expander(f"Alle posities ({len(posities)}), gesorteerd op waarde"):
-        rijen = []
-        for p in posities:
-            herkomst = [f"{_aantal_nl(x)} {naam}" for x, naam in
-                        ((p["gestaked"], "vast gestaked"), (p["in_order"], "in orders")) if x]
-            deel = f"{p['waarde'] / totaal * 100:.1f}%".replace(".", ",") if p["waarde"] and totaal else "–"
-            rijen.append(
-                '<tr style="border-top:1px solid rgba(128,128,128,0.18)">'
-                f'<td style="padding:5px 4px"><b>{html.escape(p["munt"])}</b>'
-                + (f'<div style="font-size:0.72rem;opacity:0.55">waarvan {", ".join(herkomst)}</div>'
-                   if herkomst else "")
-                + f'</td><td style="padding:5px 4px;text-align:right">{_aantal_nl(p["aantal"])}</td>'
-                f'<td style="padding:5px 4px;text-align:right;font-weight:600">'
-                f'{format_price(p["waarde"], "EUR") if p["waarde"] is not None else "geen koers"}</td>'
-                f'<td style="padding:5px 4px;text-align:right;opacity:0.6">{deel}</td></tr>')
-        if wallet["euro"] and totaal:
-            euro_deel = f"{wallet['euro'] / totaal * 100:.1f}%".replace(".", ",")
-            rijen.append(
-                '<tr style="border-top:1px solid rgba(128,128,128,0.18)"><td style="padding:5px 4px">'
-                '<b>EUR</b></td><td></td><td style="padding:5px 4px;text-align:right;font-weight:600">'
-                f'{format_price(wallet["euro"], "EUR")}</td>'
-                f'<td style="padding:5px 4px;text-align:right;opacity:0.6">{euro_deel}</td></tr>')
-        st.markdown(
-            '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.85rem;'
-            'font-variant-numeric:tabular-nums"><tr style="opacity:0.55;font-size:0.75rem">'
-            '<td style="padding:2px 4px">Munt</td><td style="padding:2px 4px;text-align:right">Aantal</td>'
-            '<td style="padding:2px 4px;text-align:right">Waarde</td><td style="padding:2px 4px;text-align:right">'
-            'Aandeel</td></tr>' + "".join(rijen) + "</table></div>",
-            unsafe_allow_html=True,
-        )
-        st.caption("Aantal = beschikbaar + in openstaande orders + vaste staking, rechtstreeks uit Bitvavo.")
+        periode = st.radio("Periode", [l for l, _ in WALLET_PERIODES], horizontal=True,
+                           key="wallet_periode", label_visibility="collapsed")
+        kolom = dict(WALLET_PERIODES)[periode]
+        rijen = [wallet_rij_html(i + 1, p, pct.loc[p["ticker"]] if p["ticker"] in pct.index else None,
+                                 kolom, totaal) for i, p in enumerate(posities)]
+        if wallet["euro"]:
+            rijen.append(wallet_rij_html(len(posities) + 1, {"munt": "EUR", "waarde": wallet["euro"]},
+                                         None, kolom, totaal, euro=True))
+        st.markdown("".join(rijen), unsafe_allow_html=True)
+        st.caption("Rechts: waarde van de positie, en daaronder wat die positie in deze periode aan je "
+                   "wallet toevoegde of kostte. Aantallen inclusief openstaande orders en vaste staking.")
     st.caption(
         "Verandering van de munten die je nu hebt: wat ze 24 uur, 7 en 30 dagen geleden waard waren "
         "tegenover nu. Aankopen en verkopen in die periode tellen niet mee. Waarde tegen Bitvavo-koersen."
