@@ -585,12 +585,13 @@ def fetch_crypto_fear_greed() -> dict:
 # Sleutel in .streamlit/secrets.toml (of Streamlit Cloud -> Settings -> Secrets):
 #   BITVAVO_API_KEY = "..."
 #   BITVAVO_API_SECRET = "..."
+# Munten in vaste staking komen automatisch mee via /stakingBalance.
 # Gebruik een sleutel met ALLEEN 'View access'. Zonder sleutel werkt alles zoals
 # vroeger: dan komt 'Mijn crypto' uit het tekstveld in de zijbalk.
 BITVAVO_URL = "https://api.bitvavo.com/v2"
 # Munt op Bitvavo -> ticker op Yahoo. Standaard wordt dat <MUNT>-USD; alleen
 # munten waarvoor Yahoo een nummer gebruikt (naamconflict) moeten hier staan.
-BITVAVO_YAHOO = {"HYPE": "HYPE32196-USD", "LIT": "LIT39125-USD"}
+BITVAVO_YAHOO = {"HYPE": "HYPE32196-USD", "LIGHTER": "LIT39125-USD", "LIT": "LIT39125-USD"}
 BITVAVO_MIN_WAARDE = 1.0  # posities onder € 1 (stof van oude trades) niet tonen
 
 
@@ -625,10 +626,24 @@ def _bitvavo_privé(pad: str):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_bitvavo_saldo() -> dict:
-    """{munt: aantal} (beschikbaar + in orders), 1 minuut bewaard."""
-    return {r["symbol"]: float(r["available"]) + float(r["inOrder"])
-            for r in _bitvavo_privé("/balance")
-            if float(r["available"]) + float(r["inOrder"]) > 0}
+    """{munt: (beschikbaar, in orders)}, 1 minuut bewaard. Vaste staking zit hier niet in."""
+    uit = {}
+    for r in _bitvavo_privé("/balance"):
+        beschikbaar, in_order = float(r.get("available") or 0), float(r.get("inOrder") or 0)
+        if beschikbaar + in_order > 0:
+            uit[r["symbol"]] = (beschikbaar, in_order)
+    return uit
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_bitvavo_staking() -> dict:
+    """{munt: aantal in vaste staking}, 1 minuut bewaard (GET /stakingBalance)."""
+    uit = {}
+    for r in _bitvavo_privé("/stakingBalance"):
+        aantal = float(r.get("amount") or 0)
+        if aantal > 0:
+            uit[r["symbol"]] = uit.get(r["symbol"], 0.0) + aantal
+    return uit
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -640,8 +655,9 @@ def fetch_bitvavo_koersen() -> dict:
 
 
 def bitvavo_wallet():
-    """None zonder sleutel. Anders {'posities': [...], 'euro': x} of {'fout': '...'}.
-    Elke positie: munt, Yahoo-ticker, aantal, koers en waarde in euro."""
+    """None zonder sleutel. Anders {'posities': [...], 'euro': x, 'geen_koers': [...]} of {'fout': '...'}.
+    Elke positie: munt, Yahoo-ticker, aantal (wallet + in orders + vaste staking), koers en waarde
+    in euro. Lukt de staking-opvraag niet, dan staat de reden in 'staking_fout'."""
     if not _bitvavo_sleutel():
         return None
     try:
@@ -649,18 +665,29 @@ def bitvavo_wallet():
         koersen = fetch_bitvavo_koersen()
     except Exception as e:  # noqa: BLE001
         return {"fout": str(e)}
-    posities = []
-    for munt, aantal in saldo.items():
+    try:
+        staking, staking_fout = fetch_bitvavo_staking(), None
+    except Exception as e:  # noqa: BLE001
+        staking, staking_fout = {}, str(e)
+    posities, geen_koers = [], []
+    for munt in sorted(set(saldo) | set(staking)):
         if munt == "EUR":
             continue
+        beschikbaar, in_order = saldo.get(munt, (0.0, 0.0))
+        gestaked = staking.get(munt, 0.0)
+        aantal = beschikbaar + in_order + gestaked
         koers = koersen.get(f"{munt}-EUR")
         waarde = aantal * koers if koers else None
-        if waarde is not None and waarde < BITVAVO_MIN_WAARDE:
+        if waarde is None:
+            geen_koers.append(munt)
+        elif waarde < BITVAVO_MIN_WAARDE:
             continue
         posities.append({"munt": munt, "ticker": BITVAVO_YAHOO.get(munt, f"{munt}-USD"),
-                         "aantal": aantal, "koers": koers, "waarde": waarde})
+                         "aantal": aantal, "beschikbaar": beschikbaar, "in_order": in_order,
+                         "gestaked": gestaked, "koers": koers, "waarde": waarde})
     posities.sort(key=lambda p: p["waarde"] or 0, reverse=True)
-    return {"posities": posities, "euro": saldo.get("EUR", 0.0)}
+    return {"posities": posities, "euro": sum(saldo.get("EUR", (0.0, 0.0))), "geen_koers": geen_koers,
+            "staking_fout": staking_fout}
 
 
 CMC_FNG_HISTORICAL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
@@ -2383,12 +2410,47 @@ def render_wallet(ranking: pd.DataFrame, wallet: dict):
         f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">{"".join(chips)}</div></div>',
         unsafe_allow_html=True,
     )
+    with st.expander(f"Alle posities ({len(posities)}), gesorteerd op waarde"):
+        rijen = []
+        for p in posities:
+            herkomst = [f"{_aantal_nl(x)} {naam}" for x, naam in
+                        ((p["gestaked"], "vast gestaked"), (p["in_order"], "in orders")) if x]
+            deel = f"{p['waarde'] / totaal * 100:.1f}%".replace(".", ",") if p["waarde"] and totaal else "–"
+            rijen.append(
+                '<tr style="border-top:1px solid rgba(128,128,128,0.18)">'
+                f'<td style="padding:5px 4px"><b>{html.escape(p["munt"])}</b>'
+                + (f'<div style="font-size:0.72rem;opacity:0.55">waarvan {", ".join(herkomst)}</div>'
+                   if herkomst else "")
+                + f'</td><td style="padding:5px 4px;text-align:right">{_aantal_nl(p["aantal"])}</td>'
+                f'<td style="padding:5px 4px;text-align:right;font-weight:600">'
+                f'{format_price(p["waarde"], "EUR") if p["waarde"] is not None else "geen koers"}</td>'
+                f'<td style="padding:5px 4px;text-align:right;opacity:0.6">{deel}</td></tr>')
+        if wallet["euro"] and totaal:
+            euro_deel = f"{wallet['euro'] / totaal * 100:.1f}%".replace(".", ",")
+            rijen.append(
+                '<tr style="border-top:1px solid rgba(128,128,128,0.18)"><td style="padding:5px 4px">'
+                '<b>EUR</b></td><td></td><td style="padding:5px 4px;text-align:right;font-weight:600">'
+                f'{format_price(wallet["euro"], "EUR")}</td>'
+                f'<td style="padding:5px 4px;text-align:right;opacity:0.6">{euro_deel}</td></tr>')
+        st.markdown(
+            '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.85rem;'
+            'font-variant-numeric:tabular-nums"><tr style="opacity:0.55;font-size:0.75rem">'
+            '<td style="padding:2px 4px">Munt</td><td style="padding:2px 4px;text-align:right">Aantal</td>'
+            '<td style="padding:2px 4px;text-align:right">Waarde</td><td style="padding:2px 4px;text-align:right">'
+            'Aandeel</td></tr>' + "".join(rijen) + "</table></div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Aantal = beschikbaar + in openstaande orders + vaste staking, rechtstreeks uit Bitvavo.")
     st.caption(
         "Verandering van de munten die je nu hebt: wat ze 24 uur, 7 en 30 dagen geleden waard waren "
         "tegenover nu. Aankopen en verkopen in die periode tellen niet mee. Waarde tegen Bitvavo-koersen."
         + (f" Niet in elke periode meegeteld (geen koersverloop bij Yahoo): {', '.join(sorted(ontbreekt))}. "
            "Ontbreekt een munt steeds, voeg dan de juiste Yahoo-ticker toe in BITVAVO_YAHOO."
            if ontbreekt else "")
+        + (f" Geen euro-koers op Bitvavo, dus niet in de totale waarde: {', '.join(wallet['geen_koers'])}."
+           if wallet.get("geen_koers") else "")
+        + (f" ⚠ Vaste staking niet opgehaald, dus niet in het totaal: {wallet['staking_fout']}"
+           if wallet.get("staking_fout") else "")
     )
 
 
