@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover
 
 DEFAULT_TICKERS = [
     # Aandelen & ETF's
-    "VWRL.AS", "AMZN", "ACHR", "BESI.AS", "BSX", "MU", "NFLX", "MSTR", "TSLA", "PATH",
+    "VWRL.AS", "AMZN", "NOW", "BESI.AS", "BSX", "MU", "NFLX", "MSTR", "PATH",
     "NBIS", "GOOGL",
     # Crypto (Yahoo gebruikt bij naamconflicten een nummer, bv. HYPE32196-USD)
     "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "HYPE32196-USD",
@@ -53,7 +53,7 @@ DEFAULT_WATCHLIST = [
     # Gevraagd
     "ASML.AS", "NVDA", "BABA", "META",
     # Rest van de 'Magnificent 7' (AMZN en TSLA zitten al in je portefeuille)
-    "AAPL", "MSFT", "GOOGL",
+    "AAPL", "MSFT", "GOOGL", "TSLA",
     # Grootste bedrijven ter wereld naar beurswaarde (top 20)
     "AVGO", "TSM", "BRK-B", "LLY", "WMT", "JPM", "2222.SR", "V", "ORCL",
     "0700.HK", "XOM", "MA", "JNJ",
