@@ -1438,6 +1438,18 @@ def card_html(rank: int, row: pd.Series, in_bezit: bool = False) -> str:
     )
 
 
+def _aantal_kort(x: float) -> str:
+    """Aantal leesbaar afgerond: 27,26240314 -> '27,26', 2211,41 -> '2.211,41',
+    0,04026513 -> '0,04027' (onder de 1: vier significante cijfers)."""
+    if x >= 1:
+        txt = f"{x:,.2f}"
+    else:
+        dec = max(2, 3 - math.floor(math.log10(x))) if x > 0 else 2
+        txt = f"{x:.{dec}f}"
+    txt = txt.rstrip("0").rstrip(".") if "." in txt else txt
+    return txt.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
 def _aantal_nl(x: float) -> str:
     """0.06000000 -> '0,06', 1234.5 -> '1.234,5' (max. 8 decimalen)."""
     txt = f"{x:,.8f}".rstrip("0").rstrip(".")
@@ -2394,6 +2406,7 @@ def wallet_rij_html(rang: int, p: dict, rij, kolom: str, totaal: float, euro: bo
     aandeel klein eronder), rechts de waarde en de winst/verlies in euro en procent."""
     waarde = p.get("waarde")
     deel = f"{waarde / totaal * 100:.1f}%".replace(".", ",") if waarde and totaal else ""
+    sub2 = ""
     if euro:
         naam_html = '<span style="font-weight:650;font-size:0.88rem">Euro</span>'
         sub = "saldo" + (f" · {deel}" if deel else "")
@@ -2403,12 +2416,20 @@ def wallet_rij_html(rang: int, p: dict, rij, kolom: str, totaal: float, euro: bo
         naam_html = (f'<span style="display:inline-flex;align-items:center;gap:6px;min-width:0">{lampje}'
                      f'<span style="font-weight:650;font-size:0.88rem;white-space:nowrap;overflow:hidden;'
                      f'text-overflow:ellipsis">{naam}</span></span>')
-        delen = [html.escape(p["munt"]), _aantal_nl(p["aantal"])]
+        if p.get("koers"):
+            usd = rij.get("prijs_usd") if rij is not None else None
+            som = (f'{_aantal_kort(p["aantal"])} × {format_price(p["koers"], "EUR")}'
+                   + (f' <span style="opacity:0.6">({format_price(float(usd), "USD")})</span>'
+                      if _getal(usd) else ""))
+        else:
+            som = f'{_aantal_kort(p["aantal"])} {html.escape(p["munt"])} · geen euro-koers'
+        delen = [html.escape(p["munt"])]
         if p.get("gestaked"):
-            delen.append(f"{_aantal_nl(p['gestaked'])} gestaked")
+            delen.append(f"{_aantal_kort(p['gestaked'])} gestaked")
         if deel:
             delen.append(deel)
-        sub = " · ".join(delen)
+        sub = som
+        sub2 = " · ".join(delen)
 
     rechts = f'{format_price(waarde, "EUR") if waarde is not None else "geen koers"}'
     v = rij[kolom] if rij is not None and kolom in rij else None
@@ -2423,10 +2444,12 @@ def wallet_rij_html(rang: int, p: dict, rij, kolom: str, totaal: float, euro: bo
         '<div style="border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px">'
         '<div style="display:flex;align-items:center;gap:8px;padding:5px 9px">'
         f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rang}</span>'
-        f'<div style="flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.2">{naam_html}'
-        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap;overflow:hidden;'
-        f'text-overflow:ellipsis">{sub}</span></div>'
-        '<div style="text-align:right;flex-shrink:0;line-height:1.15">'
+        f'<div style="flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.25">{naam_html}'
+        f'<span style="font-size:0.74rem;opacity:0.7;white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis;font-variant-numeric:tabular-nums">{sub}</span>'
+        + (f'<span style="font-size:0.68rem;opacity:0.5;white-space:nowrap;overflow:hidden;'
+           f'text-overflow:ellipsis">{sub2}</span>' if sub2 else "")
+        + '</div><div style="text-align:right;flex-shrink:0;line-height:1.15">'
         f'<div style="font-weight:750;font-size:0.98rem;font-variant-numeric:tabular-nums;white-space:nowrap">'
         f'{rechts}</div><div style="font-size:0.74rem;white-space:nowrap;margin-top:2px;'
         f'font-variant-numeric:tabular-nums">{onder}</div></div></div></div>'
@@ -2602,7 +2625,17 @@ def aandeel_rij_html(rang: int, p: dict, kolom: str, totaal: float) -> str:
     naam_html = (f'<span style="display:inline-flex;align-items:center;gap:6px;min-width:0">{lampje_html(r)}'
                  f'<span style="font-weight:650;font-size:0.88rem;white-space:nowrap;overflow:hidden;'
                  f'text-overflow:ellipsis">{html.escape(str(r["naam"]))}</span></span>')
-    sub = " · ".join(x for x in (html.escape(p["ticker"]), f"{_aantal_nl(p['aantal'])} stuks", deel) if x)
+    # prijs per stuk in de handelsvaluta (zoals DEGIRO); tijdens voor-/nabeurs die koers met label
+    if p["sessie"] and _getal(r.get("ext_prijs")):
+        prijs = f'{hoofdprijs(r, "ext_prijs")} {_sessie_label(p["sessie"])}'
+    elif r.get("markt") == "dicht":
+        prijs = f'{hoofdprijs(r)} <span style="opacity:0.6">slot</span>'
+    else:
+        prijs = hoofdprijs(r)
+    sub = " · ".join(x for x in (
+        f'<span style="opacity:0.7">{html.escape(p["ticker"])}</span>',
+        f'{_aantal_nl(p["aantal"])} × {prijs}',
+        f'<span style="opacity:0.7">{deel}</span>' if deel else "") if x)
     regel = '<div style="font-size:0.74rem;white-space:nowrap;margin-top:2px;font-variant-numeric:tabular-nums">'
     onder = []
     if kolom == "%_24u":
@@ -2632,8 +2665,8 @@ def aandeel_rij_html(rang: int, p: dict, kolom: str, totaal: float) -> str:
         '<div style="display:flex;align-items:center;gap:8px;padding:5px 9px">'
         f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rang}</span>'
         f'<div style="flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.2">{naam_html}'
-        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap;overflow:hidden;'
-        f'text-overflow:ellipsis">{sub}</span></div>'
+        f'<span style="font-size:0.74rem;color:inherit;white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis;font-variant-numeric:tabular-nums"><span style="opacity:0.85">{sub}</span></span></div>'
         '<div style="text-align:right;flex-shrink:0;line-height:1.15">'
         f'<div style="font-weight:750;font-size:0.98rem;font-variant-numeric:tabular-nums;white-space:nowrap">'
         f'{format_price(p["waarde"], "EUR")}</div>{"".join(onder)}</div></div></div>'
