@@ -212,7 +212,6 @@ EXT_MAX_AGE = pd.Timedelta(minutes=60)  # oudere voor-/nabeurskoers = niet meer 
 
 FX_TICKER = "EURUSD=X"  # euro/dollar-wisselkoers (dollars per euro) voor het omrekenen
 
-BAR_CAP_PCT = 50  # balk is "vol" bij ±50% afstand tot de MA
 
 # ---------------------------------------------------------------------------
 # MARKTTHERMOMETER: waardering op basis van de afstand tot de 200-weeks MA
@@ -1165,29 +1164,6 @@ def gauge_svg(value, title: str, zones=ZONES, label=None, ticks=None,
     )
 
 
-def ma_bar_html(label: str, pct) -> str:
-    if pct is None or pd.isna(pct):
-        fill, txt = "", '<span title="te weinig historie voor dit gemiddelde" style="opacity:0.5">–</span>'
-    else:
-        width = min(abs(pct), BAR_CAP_PCT) / BAR_CAP_PCT * 50
-        side = "right:50%" if pct < 0 else "left:50%"
-        color = "#d64545" if pct < 0 else "#2e9e58"
-        fill = (
-            f'<div style="position:absolute;top:0;bottom:0;{side};width:{width:.1f}%;'
-            f'background:{color};border-radius:2px"></div>'
-        )
-        txt = f"{pct:+.1f}%".replace(".", ",")
-    return (
-        f'<div style="display:flex;align-items:center;gap:6px;font-size:0.7rem;margin:1px 0">'
-        f'<span style="width:30px;opacity:0.6">{label}</span>'
-        f'<div style="position:relative;flex:1;height:5px;background:rgba(128,128,128,0.16);border-radius:2px">'
-        f'{fill}<div style="position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;'
-        f'background:currentColor;opacity:0.4"></div></div>'
-        f'<span style="width:56px;text-align:right;opacity:0.85;font-variant-numeric:tabular-nums">{txt}</span>'
-        f"</div>"
-    )
-
-
 CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "GBp": "p "}
 
 
@@ -1393,51 +1369,6 @@ def other_prices(row: pd.Series) -> list:
     return out
 
 
-def score_html(score: float) -> str:
-    """Score rechts op de kaart. Positief (onder de MA's) = groen."""
-    color = "#2e9e58" if score > 0 else "#d64545" if score < 0 else "inherit"
-    txt = f"{score:+.1f}".replace(".", ",")
-    return (
-        f'<div style="text-align:right;flex-shrink:0;line-height:1">'
-        f'<div style="font-size:1.3rem;font-weight:800;color:{color};'
-        f'font-variant-numeric:tabular-nums">{txt}</div>'
-        f'<div style="font-size:0.62rem;opacity:0.5;margin-top:2px">score</div></div>'
-    )
-
-
-def card_html(rank: int, row: pd.Series, in_bezit: bool = False) -> str:
-    crypto = is_crypto(row["ticker"])
-    bars = "".join(ma_bar_html(k, row[f"%_vs_{k}"]) for k in DEFAULT_WEIGHTS)
-    chips = "".join(
-        change_chip(lbl, row[col])
-        for lbl, col in [("1u", "%_1u"), ("24u" if crypto else "dag", "%_24u"), ("7d", "%_7d")]
-    )
-    andere = "".join(
-        f'<span style="font-size:0.8rem;opacity:0.6;font-variant-numeric:tabular-nums">{p}</span>'
-        for p in other_prices(row)
-    )
-    return (
-        f'<div style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;'
-        f'padding:7px 10px 6px;margin-bottom:6px">'
-        # kop: rang, naam (ticker klein), score rechts
-        f'<div style="display:flex;align-items:center;gap:8px">'
-        f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rank}</span>'
-        f'<div style="flex:1;min-width:0">{title_html(row, tag="in bezit" if in_bezit else "")}'
-        # prijs met euro-prijs en eventueel voor-/nabeurs ernaast
-        f'<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:1px">'
-        f'<span style="font-weight:700;font-size:0.92rem;font-variant-numeric:tabular-nums">'
-        f'{hoofdprijs(row)}</span>{andere}{ext_chip_html(row)}</div></div>'
-        f'{score_html(row["score"])}'
-        f"</div>"
-        # wijzigingen + tijdstip op één regel
-        f'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;font-size:0.72rem;'
-        f'margin:4px 0 3px 22px">{chips}'
-        f'<span style="margin-left:auto;opacity:0.45;font-variant-numeric:tabular-nums">'
-        f'{row["bijgewerkt"]}</span></div>'
-        f'<div style="margin-left:22px">{bars}</div></div>'
-    )
-
-
 def _aantal_kort(x: float) -> str:
     """Aantal leesbaar afgerond: 27,26240314 -> '27,26', 2211,41 -> '2.211,41',
     0,04026513 -> '0,04027' (onder de 1: vier significante cijfers)."""
@@ -1454,41 +1385,6 @@ def _aantal_nl(x: float) -> str:
     """0.06000000 -> '0,06', 1234.5 -> '1.234,5' (max. 8 decimalen)."""
     txt = f"{x:,.8f}".rstrip("0").rstrip(".")
     return txt.replace(",", "_").replace(".", ",").replace("_", ".")
-
-
-def holding_card_html(row: pd.Series, bezit: dict = None) -> str:
-    """Kaartje voor een positie in de portefeuille: koers in TradingView-stijl
-    rechts, koersverloop (1u/7d/30d) onderaan, geen score. Met `bezit` (uit
-    Bitvavo) ook hoeveel je hebt, wat het waard is en welk deel van je wallet."""
-    chips = "".join(
-        change_chip(lbl, row[col]) for lbl, col in [("1u", "%_1u"), ("7d", "%_7d"), ("30d", "%_30d")]
-    )
-    andere = " · ".join(other_prices(row))
-    andere_html = (
-        f'<div style="font-size:0.78rem;opacity:0.6;font-variant-numeric:tabular-nums;'
-        f'margin-top:1px">{andere}</div>' if andere else ""
-    )
-    bezit_html = ""
-    if bezit:
-        waarde = (format_price(bezit["waarde"], "EUR") if bezit.get("waarde") is not None else "–")
-        deel = f' · {bezit["aandeel"]:.1f}%'.replace(".", ",") if bezit.get("aandeel") is not None else ""
-        bezit_html = (
-            f'<div style="font-size:0.82rem;margin-top:3px;font-variant-numeric:tabular-nums">'
-            f'<span style="opacity:0.65">{_aantal_nl(bezit["aantal"])} {html.escape(bezit["munt"])}</span>'
-            f' · <b>{waarde}</b><span style="opacity:0.55">{deel}</span></div>'
-        )
-    return (
-        f'<div style="border:1px solid rgba(128,128,128,0.22);border-radius:8px;'
-        f'padding:7px 10px 6px;margin-bottom:6px">'
-        f'<div style="display:flex;align-items:center;gap:8px">'
-        f'<div style="flex:1;min-width:0">{title_html(row)}{andere_html}{bezit_html}</div>'
-        f'{koers_blok_html(row, "%_24u")}'
-        f"</div>"
-        f'<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;font-size:0.72rem;'
-        f'margin-top:5px">{chips}'
-        f'<span style="margin-left:auto;opacity:0.45;font-variant-numeric:tabular-nums">'
-        f'{row["bijgewerkt"]}</span></div></div>'
-    )
 
 
 # Per soort een eigen label voor de korte periode: crypto handelt 24/7,
@@ -2201,20 +2097,12 @@ with st.sidebar:
         st.caption(f"🔗 'Mijn crypto' komt automatisch uit je Bitvavo-wallet ({len(bitvavo_tickers)} munten). "
                    "De crypto in het veld hierboven telt daar niet mee.")
 
-    with st.expander("Watchlist-score: gewichten"):
-        weights = {
-            k: st.slider(f"{k} MA", 0.0, 3.0, v, 0.25) for k, v in DEFAULT_WEIGHTS.items()
-        }
+    weights = dict(DEFAULT_WEIGHTS)  # MA-gewichten (de ranglijst is weg; nodig voor de koersdata)
     st.subheader("Verversen")
     auto = st.toggle("Automatisch verversen", value=True)
     interval = st.select_slider(
         "Koersen en stijgers/dalers: elke … seconden", options=[15, 30, 60], value=15,
         disabled=not auto,
-    )
-    rang_interval = st.select_slider(
-        "Watchlist-ranglijst: elke … seconden", options=[30, 60, 120], value=30,
-        disabled=not auto,
-        help="De ranglijst is het zwaarste deel van de pagina, dus die ververst rustiger.",
     )
     if st.button("Nu verversen"):
         st.cache_data.clear()
@@ -2786,7 +2674,7 @@ def render_live_boven(tickers: list, weights: dict, soort: str, modus: str):
 
 
 def render_live_onder(tickers: list, weights: dict, soort: str, modus: str, in_bezit: tuple):
-    """Snel deel, onder de grafieken: stijgers/dalers en (portefeuille) de posities.
+    """Snel deel, onder de grafieken: de stijgers en dalers.
     De koersen komen uit hetzelfde gedeelde geheugen als render_live_boven."""
     crypto = SOORTEN[soort]["crypto"]
     if not tickers:
@@ -2798,59 +2686,6 @@ def render_live_onder(tickers: list, weights: dict, soort: str, modus: str, in_b
     st.divider()
     render_movers(ranking, crypto, etfs)
 
-    if modus == "portefeuille":
-        st.divider()
-        st.subheader("Mijn posities")
-        st.caption("≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
-        wallet = bitvavo_wallet() if crypto else None
-        bezit = {}
-        if wallet and "posities" in wallet:
-            totaal = sum(p["waarde"] or 0 for p in wallet["posities"]) + wallet["euro"]
-            bezit = {p["ticker"]: {**p, "aandeel": p["waarde"] / totaal * 100 if p["waarde"] and totaal else None}
-                     for p in wallet["posities"]}
-            volgorde = {t: i for i, t in enumerate(bezit)}  # al gesorteerd op waarde
-            posities = ranking.sort_values("ticker", key=lambda s: s.map(volgorde).fillna(len(volgorde)))
-        elif not crypto:
-            eigen = aandelen_posities(ranking)
-            totaal = sum(p["waarde"] for p in eigen)
-            bezit = {p["ticker"]: {"munt": "stuks", "aantal": p["aantal"], "waarde": p["waarde"],
-                                   "aandeel": p["waarde"] / totaal * 100 if totaal else None}
-                     for p in eigen}
-            volgorde = {p["ticker"]: i for i, p in enumerate(eigen)}  # op waarde
-            posities = ranking.sort_values("ticker", key=lambda s: s.map(volgorde).fillna(len(volgorde)))
-        else:
-            posities = ranking.sort_values("naam", key=lambda s: s.str.lower())
-        st.markdown(RASTER.format("".join(holding_card_html(r, bezit.get(r["ticker"]))
-                                          for _, r in posities.iterrows())),
-                    unsafe_allow_html=True)
-        with st.expander("Ruwe tabel"):
-            st.dataframe(ranking, width="stretch", hide_index=True)
-
-
-def render_ranglijst(tickers: list, weights: dict, soort: str, in_bezit: tuple, elke):
-    """Het rustige deel: de watchlist-ranglijst met scores (veel kaartjes)."""
-    if not tickers:
-        return
-    crypto = SOORTEN[soort]["crypto"]
-    ranking, _, _, tijd = laad_ranking(tickers, weights, not crypto)
-    if ranking.empty:
-        return
-    st.divider()
-    st.subheader("Ranglijst")
-    uitleg = (f"Koersen van {_klok(tijd)}" + (f", ververst elke {elke} s. " if elke else ". ")
-              + "Hoogste score = verste onder de MA's. Balk links (rood) = onder de MA. "
-              "1u toont – als er niet gehandeld wordt. "
-              "≈ voor een prijs = omgerekend met de actuele euro/dollar-koers.")
-    if not crypto:
-        uitleg += (" 'Dag' is de verandering t.o.v. de vorige slotkoers. Tijdens voor- of nabeurs (alleen VS) "
-                   "staat die koers klein naast de prijs; de score blijft op de reguliere koers.")
-    st.caption(uitleg)
-    st.markdown(
-        RASTER.format("".join(card_html(i + 1, r, r["ticker"] in in_bezit) for i, r in ranking.iterrows())),
-        unsafe_allow_html=True,
-    )
-    with st.expander("Ruwe tabel"):
-        st.dataframe(ranking, width="stretch", hide_index=True)
 
 
 MOMENTUM_MAANDEN = 1
@@ -3130,6 +2965,24 @@ def _std(waarden: list):
     return float(pd.Series(w).std()) if len(w) >= 3 else None
 
 
+def _jaar_op_jaar(reeks: pd.Series) -> list:
+    """Per kwartaal de groei t.o.v. hetzelfde kwartaal een jaar eerder: [(kwartaal, groei)].
+    Groei is None als het jaar ervoor 0 of negatief was (dan zegt een percentage niets);
+    'omslag' = van verlies (of 0) naar winst."""
+    uit = []
+    r = reeks.dropna()
+    for q, waarde in r.items():
+        eerder = [(abs((q - p_).days - 365), v) for p_, v in r.items() if 330 <= (q - p_).days <= 400]
+        if not eerder:
+            continue
+        vorig = min(eerder)[1]
+        if vorig > 0:
+            uit.append((q, waarde / vorig - 1))
+        else:
+            uit.append((q, "omslag" if waarde > 0 else None))
+    return uit
+
+
 def fundamentele_rij(ticker: str) -> dict:
     """Alle cijfers voor één aandeel. Bedragen worden omgerekend naar de valuta van
     de jaarcijfers (bv. Tencent: koers in HKD, cijfers in CNY)."""
@@ -3343,6 +3196,39 @@ def fundamentele_rij(ticker: str) -> dict:
         r = omzet.dropna()
         rij["omzetgroei_bron"] = (f"per jaar {r.index[0].year}–{r.index[-1].year}"
                                   if len(r) >= 2 else "")
+
+    # Winst per aandeel (EPS), jaar op jaar: zelfde aanpak als de omzet hierboven
+    k_eps = (_regel(kw["resultaat"], "Diluted EPS", "Basic EPS")
+             if "resultaat" in kw else pd.Series(dtype=float))
+    eps = [g for _, g in _jaar_op_jaar(k_eps)][-KWARTALEN_GEMIDDELD:]
+    if eps:
+        if eps[-1] == "omslag":
+            rij["eps_omslag"] = True  # laatste kwartaal: van verlies naar winst
+        cijfers = [g for g in eps if isinstance(g, float)]
+        if cijfers:
+            rij["eps_groei"] = sum(cijfers) / len(cijfers)
+            rij["eps_groei_bron"] = (f"gem. laatste {len(cijfers)} kwartalen" if len(cijfers) > 1
+                                     else "laatste kwartaal")
+    else:  # geen kwartaalcijfers: laatste boekjaar t.o.v. het jaar ervoor
+        j_eps = _regel(res, "Diluted EPS", "Basic EPS").dropna()
+        if len(j_eps) >= 2:
+            nu_e, vorig_e = float(j_eps.iloc[-1]), float(j_eps.iloc[-2])
+            if vorig_e > 0:
+                rij["eps_groei"] = nu_e / vorig_e - 1
+                rij["eps_groei_bron"] = f"boekjaar {j_eps.index[-1].year}"
+            elif nu_e > 0:
+                rij["eps_omslag"] = True
+
+    # Rule of 40 (alleen software): omzetgroei + vrije-kasstroommarge over 12 maanden
+    rij["software"] = "software" in str(info.get("industry") or "").lower()
+    if rij["software"] and not financieel and rij.get("omzetgroei") is not None:
+        kols = list(k_omzet.index)
+        omzet_12m = (float(k_omzet.iloc[-4:].sum())
+                     if len(kols) >= 4 and 240 <= (kols[-1] - kols[-4]).days <= 300
+                     else _w(omzet, omzet.last_valid_index()) if not omzet.dropna().empty else None)
+        if omzet_12m and omzet_12m > 0 and nu_p["fcf"] is not None:
+            rij["r40_groei"], rij["r40_marge"] = rij["omzetgroei"], nu_p["fcf"] / omzet_12m
+            rij["r40"] = rij["r40_groei"] + rij["r40_marge"]
     if not financieel:
         # Reverse DCF vanaf de vrije kasstroom. Is die negatief of nul (bv. door zware
         # investeringen, zoals bij Amazon), dan als reserve vanaf de winst: die smeert
@@ -3482,9 +3368,13 @@ def scores(f: dict) -> dict:
     p, n = _telling(f.get("piotroski"))
     if n >= 5:
         delen.append(p / n * 100)
-    g, n = _telling(f.get("mohanram"))
-    if n >= 4:
-        delen.append(g / n * 100)
+    if f.get("r40") is not None:
+        # software: Rule of 40 vervangt de Mohanram-score (0 = 0, 20 = 50, 40 of meer = 100)
+        delen.append(_lin(f["r40"], 0.0, 0.40))
+    else:
+        g, n = _telling(f.get("mohanram"))
+        if n >= 4:
+            delen.append(g / n * 100)
     if f.get("rendement_nu") is not None:
         delen.append(_lin(f["rendement_nu"], 0.0, 0.20))
     trends = [f.get(f"marge_{m}_trend") for m in ("bruto", "operationeel", "netto")]
@@ -3659,6 +3549,13 @@ def punten(f: dict, s: dict) -> tuple:
         sterk.append(("Sterke verwachte groei", f"{_p(verwacht, 0, True)} per jaar"))
     elif lab == "zwak":
         let_op.append(("Weinig groei verwacht", f"{_p(verwacht, 0, True)} per jaar"))
+    r40 = f.get("r40")
+    if r40 is not None:
+        som = f"{r40 * 100:.0f} ({_p(f['r40_groei'])} groei + {_p(f['r40_marge'])} marge)"
+        if r40 >= 0.40:
+            sterk.append(("Haalt de Rule of 40", som))
+        elif r40 < 0.20:
+            let_op.append(("Haalt de Rule of 40 niet", som))
     # veiligheid
     if z is not None:
         if z > 2.99:
@@ -3687,7 +3584,7 @@ def punten(f: dict, s: dict) -> tuple:
                               else "")))
     elif "verdubbeld" in f.get("waarschuwingen", []):
         let_op.append(("Winst net verdubbeld: piek of blijvend?", ""))
-    if s.get("stabiliteit_label") == "stabiel":
+    if s.get("stabiliteit_label") == "stabiel" and not (p is not None and p >= 1.5):
         sterk.append(("Stabiele winst", "rond het eigen gemiddelde, weinig schommeling"))
     if "net_winstgevend" in f.get("waarschuwingen", []):
         let_op.append(("Pas net winstgevend", "vorig jaar nog verlies"))
@@ -3706,6 +3603,18 @@ def punten(f: dict, s: dict) -> tuple:
         let_op.append(("Bedrijf verslechtert", f"maar {p} van {n} tests"))
     if f.get("kwartalen") and f.get("verslagen") == f["kwartalen"]:
         sterk.append(("Versloeg steeds de verwachtingen", f"{f['verslagen']} van {f['kwartalen']} kwartalen"))
+    eg, og = f.get("eps_groei"), f.get("omzetgroei")
+    if eg is not None and og is not None:
+        if og > 0 and eg >= 0.10 and eg >= og - 0.05 and eg <= og + 0.30:
+            sterk.append(("Winst per aandeel groeit mee", f"{_p(eg, 0, True)} (omzet {_p(og, 0, True)})"))
+        elif og > 0.05 and eg < 0:
+            let_op.append(("Omzet groeit, winst per aandeel daalt",
+                           f"winst {_p(eg, 0, True)}, omzet {_p(og, 0, True)}: marges of verwatering?"))
+        elif eg > 0.30 and eg > og + 0.30:
+            let_op.append(("Winst per aandeel groeit veel harder dan omzet",
+                           f"{_p(eg, 0, True)} tegen {_p(og, 0, True)}: besparing, inkoop of eenmalig?"))
+    elif f.get("eps_omslag"):
+        sterk.append(("Van verlies naar winst", "winst per aandeel nu positief"))
     if f.get("peg") is not None and f["peg"] <= 1:
         sterk.append(("Redelijke prijs voor de groei", f"prijs voor groei {f['peg']:.1f}".replace(".", ",")))
     # losse tests die er echt toe doen, in gewone taal
@@ -3799,6 +3708,11 @@ def cijfers_html(f: dict, mf) -> str:
     if f.get("omzetgroei") is not None:
         rijen.append(("Werkelijk (omzet)", _p(f["omzetgroei"], 0, True),
                       f.get("omzetgroei_bron") or "afgelopen periode"))
+    if f.get("eps_groei") is not None:
+        rijen.append(("Werkelijk (winst per aandeel)", _p(f["eps_groei"], 0, True),
+                      f.get("eps_groei_bron") or "afgelopen periode"))
+    elif f.get("eps_omslag"):
+        rijen.append(("Werkelijk (winst per aandeel)", "omslag", "van verlies naar winst"))
     if f.get("kwartalen"):
         rijen.append(("Verwachting verslagen", f"{f['verslagen']}/{f['kwartalen']}", "kwartalen"))
     if rijen:
@@ -3817,8 +3731,12 @@ def cijfers_html(f: dict, mf) -> str:
     if f.get("rendement_nu") is not None:
         rijen.append(("Rendement op vermogen" if fin else "Rendement op kapitaal", _p(f["rendement_nu"]),
                       f"bereik {_p(f['rendement_min'])} tot {_p(f['rendement_max'])}"))
+    if f.get("r40") is not None:
+        rijen.append(("Rule of 40 (software)", f"{f['r40'] * 100:.0f}",
+                      f"groei {_p(f['r40_groei'])} + marge {_p(f['r40_marge'])}"))
     tests = "".join(_tests_html(titel, namen, f.get(sleutel)) for titel, namen, sleutel in (
-        ("Verbetering", PIOTROSKI_NAMEN, "piotroski"), ("Groeikwaliteit", MOHANRAM_NAMEN, "mohanram")))
+        ("Verbetering", PIOTROSKI_NAMEN, "piotroski"),
+        *([] if f.get("r40") is not None else [("Groeikwaliteit", MOHANRAM_NAMEN, "mohanram")])))
     if rijen or tests:
         delen.append(f'<div class="fk-sec">Kwaliteit</div>{_tabel(rijen) if rijen else ""}{tests}')
     # stabiliteit
@@ -3935,13 +3853,14 @@ HOE_LEES_IK_DIT = f"""
 - **Prijs voor groei** = PEG: forward K/W gedeeld door de verwachte winstgroei. Rond 1 of lager is redelijk
 - **Goedkoop + rendabel** = Magic Formula (Greenblatt): rang binnen jouw lijst
 
-**Groei**: *ingeprijsd* = de jaarlijkse groei van de vrije kasstroom die de koers rechtvaardigt (reverse DCF: {DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%}). Is de vrije kasstroom negatief, bijvoorbeeld omdat een bedrijf zwaar investeert in fabrieken of datacenters, dan rekent de code vanaf de winst; dan staat er *(op winst)*. Winst verdeelt grote investeringen over de jaren dat ze gebruikt worden, terwijl de vrije kasstroom ze in één keer aftrekt. Is ook de winst negatief, dan is er niets om vanaf te rekenen en staat er niets. *Verwacht* = omzetgroei volgend jaar volgens analisten. *Werkelijk* = omzetgroei per kwartaal t.o.v. hetzelfde kwartaal een jaar eerder, gemiddeld over de laatste kwartalen (zonder kwartaalcijfers: gemiddeld per jaar). Verwacht hoger dan ingeprijsd = ruimte in de koers.
+**Groei**: *ingeprijsd* = de jaarlijkse groei van de vrije kasstroom die de koers rechtvaardigt (reverse DCF: {DCF_RENDEMENT:.0%} rendement, {DCF_JAREN} jaar, daarna {DCF_EINDGROEI:.1%}). Is de vrije kasstroom negatief, bijvoorbeeld omdat een bedrijf zwaar investeert in fabrieken of datacenters, dan rekent de code vanaf de winst; dan staat er *(op winst)*. Winst verdeelt grote investeringen over de jaren dat ze gebruikt worden, terwijl de vrije kasstroom ze in één keer aftrekt. Is ook de winst negatief, dan is er niets om vanaf te rekenen en staat er niets. *Verwacht* = omzetgroei volgend jaar volgens analisten. *Werkelijk (winst per aandeel)* = EPS jaar op jaar, net als de omzet per kwartaal t.o.v. een jaar eerder (officiële GAAP-cijfers, die vaak lager zijn dan de 'aangepaste' cijfers uit presentaties); telt niet mee in de score, wel in de sterke en aandachtspunten. *Werkelijk* = omzetgroei per kwartaal t.o.v. hetzelfde kwartaal een jaar eerder, gemiddeld over de laatste kwartalen (zonder kwartaalcijfers: gemiddeld per jaar). Verwacht hoger dan ingeprijsd = ruimte in de koers.
 
 **Kwaliteit**
 - **Marges**: van elke 100 omzet wat er overblijft na inkoop (bruto), na alle bedrijfskosten (operationeel) en als winst (netto)
 - **Rendement op kapitaal** = ROIC (bedrijfswinst na belasting ÷ schuld + eigen vermogen); bij banken rendement op eigen vermogen (ROE). Boven 15% is sterk
 - **Verbetering** = Piotroski F-score: 9 tests of het bedrijf beter wordt dan vorig jaar. Tik erop voor de tests
 - **Groeikwaliteit** = Mohanram G-score: rendabel, stabiel en investeert. Benaderd met vaste drempels. Tik erop voor de tests
+- **Rule of 40** (alleen softwarebedrijven): omzetgroei + vrije-kasstroommarge over de laatste 12 maanden. 40 of meer is sterk, onder de 20 zwak. Bij software telt dit in de kwaliteitsscore in plaats van de groeikwaliteit
 
 **Stabiliteit**: is de winst van nu normaal, of een piek of dal? Drie metingen: de winst nu gedeeld door de gemiddelde winst van de afgelopen jaren (rond 1× = stabiel, 2,5× of meer = piek, ½× = dal), hoe sterk de nettomarge door de jaren schommelt, en het aantal maanden met verlies. Ligt de winst boven het gemiddelde maar verwachten analisten volgend jaar nog evenveel of meer winst, dan wordt de piekmeting tot de helft verzacht (bij een verwachte daling van 20% of meer niet). Niet helemaal, omdat analisten op een cyclische piek vaak te optimistisch zijn. Op het kaartje: *Winst: stabiel / wisselend / piekend / onrustig*. Bij waarde staat ook **Je betaalt × gemiddelde winst** (zoals Benjamin Graham deed bij cyclische bedrijven): is dat veel hoger dan × de winst van nu, dan lijkt het aandeel vooral goedkoop door een tijdelijk hoge winst.
 
@@ -4010,7 +3929,3 @@ st.fragment(run_every=interval if auto else None)(render_live_onder)(
     lijst, weights, soort, modus, in_bezit
 )
 
-if modus == "watchlist":
-    st.fragment(run_every=rang_interval if auto else None)(render_ranglijst)(
-        lijst, weights, soort, in_bezit, rang_interval if auto else None
-    )
