@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_TICKERS = [
     # Aandelen & ETF's
     "VWRL.AS", "AMZN", "NOW", "BESI.AS", "BSX", "MU", "NFLX", "MSTR", "PATH",
-    "NBIS", "GOOGL", "NVDA",
+    "NBIS", "GOOGL", "NVDA", "APP",
     # Crypto (Yahoo gebruikt bij naamconflicten een nummer, bv. HYPE32196-USD)
     "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "HYPE32196-USD",
     "NEAR-USD", "AAVE-USD", "INJ-USD", "VIRTUAL-USD", "LIT39125-USD",
@@ -69,7 +69,16 @@ DEFAULT_WATCHLIST = [
     "CEG", "VST", "GEV", "CCJ", "ENR.DE", "RR.L", "OKLO", "SMR",
     # Quantum, ruimtevaart, drones & robotica
     "IONQ", "RGTI", "QBTS", "RKLB", "ASTS", "RHM.DE", "AVAV", "SYM", "ISRG", "JOBY",
+    # Uit 'My Top 11 Investing Opportunities for 2027'
+    "ARM", "CRWD",
 ]
+
+# Aantal stukken per aandeel/ETF in je portefeuille (uit DEGIRO). In de app kun je ze
+# aanpassen onder 'Aantallen aanpassen'; daar staat ook de regel om hier te plakken.
+DEFAULT_AANTALLEN = {
+    "VWRL.AS": 82, "GOOGL": 1, "AMZN": 2, "APP": 1, "BESI.AS": 2, "BSX": 6, "MU": 1,
+    "NBIS": 1, "NFLX": 4, "NVDA": 2, "NOW": 2, "MSTR": 5, "PATH": 9,
+}
 
 # Sector- en thema-ETF's: altijd bovenaan de stijgers & dalers in de watchlist
 # (aandelen). Amerikaanse fondsen: ideaal om te volgen, voor NL-beleggers vaak
@@ -154,6 +163,9 @@ NAMES = {
     "AMD": "AMD",
     "NOW": "ServiceNow",
     "PLTR": "Palantir",
+    "APP": "AppLovin",
+    "ARM": "Arm Holdings",
+    "CRWD": "CrowdStrike",
     "LTC-USD": "Litecoin",
     "000660.KS": "SK Hynix",
     "005930.KS": "Samsung Electronics",
@@ -2482,6 +2494,220 @@ def render_wallet(ranking: pd.DataFrame, wallet: dict):
     )
 
 
+# ---------------------------------------------------------------------------
+# MIJN AANDELEN: aantallen (zelf ingevuld) en de waarde van de portefeuille
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _aantallen_geheugen() -> dict:
+    """Aantallen die je in de app aanpast. Blijven bewaard zolang de app draait
+    (ook na herladen); na een herstart gelden weer de DEFAULT_AANTALLEN."""
+    return {"lock": threading.Lock(), "aantallen": dict(DEFAULT_AANTALLEN)}
+
+
+def mijn_aantallen() -> dict:
+    geh = _aantallen_geheugen()
+    with geh["lock"]:
+        return dict(geh["aantallen"])
+
+
+def _zet_aantal(ticker: str):
+    geh = _aantallen_geheugen()
+    with geh["lock"]:
+        geh["aantallen"][ticker] = st.session_state[f"aantal_{ticker}"]
+
+
+def render_aantallen_editor(tickers: list):
+    """Uitklapper met per aandeel een getalveld (met − en +). Staat buiten het
+    automatisch verversen, zodat de pagina niet ververst terwijl je typt."""
+    aantallen = mijn_aantallen()
+    with st.expander("✏️ Aantallen aanpassen"):
+        st.caption("Aantal stukken per positie. Typ een getal of gebruik − en +.")
+        kolommen = st.columns(2)
+        for i, t in enumerate(tickers):
+            with kolommen[i % 2]:
+                st.number_input(
+                    f"{fetch_meta(t)['naam']} ({t})", min_value=0, step=1,
+                    value=int(aantallen.get(t, 0)), key=f"aantal_{t}",
+                    on_change=_zet_aantal, args=(t,),
+                )
+        nu = mijn_aantallen()
+        regel = ", ".join(f'"{t}": {int(nu.get(t, 0))}' for t in tickers if nu.get(t))
+        st.caption("Wijzigingen blijven bewaard tot de app herstart. Blijvend opslaan: vervang "
+                   "DEFAULT_AANTALLEN in app.py door deze regel.")
+        st.code("DEFAULT_AANTALLEN = {" + regel + "}", language="python")
+        if st.button("Terug naar de aantallen uit de code"):
+            geh = _aantallen_geheugen()
+            with geh["lock"]:
+                geh["aantallen"] = dict(DEFAULT_AANTALLEN)
+            for t in tickers:
+                st.session_state.pop(f"aantal_{t}", None)
+            st.rerun()
+
+
+def aandelen_posities(ranking: pd.DataFrame) -> list:
+    """Per positie met een aantal: waarde in euro op de reguliere koers, en (als de
+    voor- of nabeurs loopt) de waarde op die koers. Gesorteerd op waarde."""
+    aantallen = mijn_aantallen()
+    uit = []
+    for _, r in ranking.iterrows():
+        n = aantallen.get(r["ticker"], 0)
+        eur = r.get("prijs_eur")
+        if not n or not _getal(eur):
+            continue
+        regulier = n * float(eur)
+        live, sessie = regulier, None
+        if isinstance(r.get("ext_sessie"), str) and _getal(r.get("ext_prijs")) and r["prijs"]:
+            live = regulier * float(r["ext_prijs"]) / float(r["prijs"])
+            sessie = r["ext_sessie"]
+        uit.append({"ticker": r["ticker"], "munt": r["ticker"], "aantal": n, "rij": r,
+                    "regulier": regulier, "waarde": live, "sessie": sessie})
+    uit.sort(key=lambda p: p["waarde"], reverse=True)
+    return uit
+
+
+def _verandering(p: dict, kolom: str):
+    """(verschil in euro, waarde aan het begin) voor één positie, of None.
+    Dag: reguliere dagbeweging plus de voor-/nabeurs erbovenop. In de voorbeurs is er
+    nog geen dagbeweging: dan telt alleen de voorbeurs t.o.v. de vorige slotkoers.
+    Geen handel vandaag (beurs dicht): geen verandering."""
+    r = p["rij"]
+    v = r.get(kolom)
+    if kolom == "%_24u" and not _getal(v):
+        if r.get("dag_actueel") is False:
+            return p["waarde"] - p["regulier"], p["regulier"]  # alleen voorbeurs (of 0)
+        return None
+    if not _getal(v):
+        return None
+    toen = p["regulier"] / (1 + v / 100)
+    return p["waarde"] - toen, toen
+
+
+def _bedrag_html(x: float) -> str:
+    kleur = "#2e9e58" if x >= 0 else "#d64545"
+    return (f'<span style="color:{kleur};font-weight:600">{"+" if x >= 0 else "−"}'
+            f'{format_price(abs(x), "EUR")}</span>')
+
+
+def _sessie_label(sessie: str) -> str:
+    label, kleur, icoon = SESSIE_STIJL[sessie]
+    return f'<span style="color:{kleur};font-weight:800;font-size:0.92em">{icoon} {label}</span>'
+
+
+def aandeel_rij_html(rang: int, p: dict, kolom: str, totaal: float) -> str:
+    """Eén positie: naam met lampje, aantal en aandeel klein eronder; rechts de waarde en
+    wat de positie in de periode deed. Tijdens voor-/nabeurs een extra regel daarvoor."""
+    r = p["rij"]
+    deel = f"{p['waarde'] / totaal * 100:.1f}%".replace(".", ",") if totaal else ""
+    naam_html = (f'<span style="display:inline-flex;align-items:center;gap:6px;min-width:0">{lampje_html(r)}'
+                 f'<span style="font-weight:650;font-size:0.88rem;white-space:nowrap;overflow:hidden;'
+                 f'text-overflow:ellipsis">{html.escape(str(r["naam"]))}</span></span>')
+    sub = " · ".join(x for x in (html.escape(p["ticker"]), f"{_aantal_nl(p['aantal'])} stuks", deel) if x)
+    regel = '<div style="font-size:0.74rem;white-space:nowrap;margin-top:2px;font-variant-numeric:tabular-nums">'
+    onder = []
+    if kolom == "%_24u":
+        dag = r.get("%_24u")
+        if _getal(dag):
+            effect = p["regulier"] - p["regulier"] / (1 + dag / 100)
+            onder.append(f"{regel}{_bedrag_html(effect)}&nbsp;&nbsp;"
+                         f'<span style="color:{"#2e9e58" if dag >= 0 else "#d64545"}">{_procent(dag)}</span></div>')
+        if p["sessie"]:
+            e = r.get("%_ext")
+            onder.append(f"{regel}{_sessie_label(p['sessie'])}&nbsp;{_bedrag_html(p['waarde'] - p['regulier'])}"
+                         + (f'&nbsp;&nbsp;<span style="color:{"#2e9e58" if e >= 0 else "#d64545"}">{_procent(e)}</span>'
+                            if _getal(e) else "") + "</div>")
+        if not onder:
+            onder.append(f'{regel}<span style="opacity:0.45">beurs dicht</span></div>')
+    else:
+        ver = _verandering(p, kolom)
+        if ver:
+            verschil, toen = ver
+            pct = verschil / toen * 100 if toen else 0
+            onder.append(f"{regel}{_bedrag_html(verschil)}&nbsp;&nbsp;"
+                         f'<span style="color:{"#2e9e58" if pct >= 0 else "#d64545"}">{_procent(pct)}</span></div>')
+        else:
+            onder.append(f'{regel}<span style="opacity:0.4">–</span></div>')
+    return (
+        '<div style="border:1px solid rgba(128,128,128,0.18);border-radius:7px;margin-bottom:4px">'
+        '<div style="display:flex;align-items:center;gap:8px;padding:5px 9px">'
+        f'<span style="opacity:0.45;font-size:0.75rem;width:14px;flex-shrink:0">{rang}</span>'
+        f'<div style="flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.2">{naam_html}'
+        f'<span style="font-size:0.7rem;opacity:0.5;white-space:nowrap;overflow:hidden;'
+        f'text-overflow:ellipsis">{sub}</span></div>'
+        '<div style="text-align:right;flex-shrink:0;line-height:1.15">'
+        f'<div style="font-weight:750;font-size:0.98rem;font-variant-numeric:tabular-nums;white-space:nowrap">'
+        f'{format_price(p["waarde"], "EUR")}</div>{"".join(onder)}</div></div></div>'
+    )
+
+
+AANDELEN_PERIODES = [("Dag", "%_24u"), ("7d", "%_7d"), ("30d", "%_30d")]
+
+
+def render_aandelen_overzicht(ranking: pd.DataFrame):
+    """Totale waarde van je aandelen en ETF's (aantal × koers), zoals het
+    Bitvavo-blok bij crypto. Loopt de voor- of nabeurs, dan beweegt de waarde
+    mee en staat er een oranje/blauw lampje met hoeveel posities dat betreft."""
+    posities = aandelen_posities(ranking)
+    if not posities:
+        st.info("Nog geen aantallen ingevuld. Vul ze in onder '✏️ Aantallen aanpassen'.")
+        return
+    totaal = sum(p["waarde"] for p in posities)
+    regulier = sum(p["regulier"] for p in posities)
+    ext = [p for p in posities if p["sessie"]]
+
+    chips = []
+    for label, kolom in AANDELEN_PERIODES:
+        delen = [v for v in (_verandering(p, kolom) for p in posities) if v]
+        verschil = sum(v[0] for v in delen)
+        basis = sum(v[1] for v in delen)
+        if kolom == "%_24u" and not any(_getal(p["rij"].get("%_24u")) or p["sessie"] for p in posities):
+            inhoud = '<div style="opacity:0.5;font-size:0.85rem">beurs dicht</div>'
+        elif basis:
+            kleur = "#2e9e58" if verschil >= 0 else "#d64545"
+            inhoud = (f'<div style="color:{kleur};font-weight:700;font-variant-numeric:tabular-nums">'
+                      f'{_procent(verschil / basis * 100)}</div>'
+                      f'<div style="color:{kleur};font-size:0.8rem;font-variant-numeric:tabular-nums">'
+                      f'{"+" if verschil >= 0 else "−"}{format_price(abs(verschil), "EUR")}</div>')
+        else:
+            inhoud = '<div style="opacity:0.5">–</div>'
+        chips.append(f'<div style="flex:1;min-width:90px"><div style="font-size:0.72rem;opacity:0.6">'
+                     f'{label}</div>{inhoud}</div>')
+
+    ext_html = ""
+    if ext:
+        sessie = ext[0]["sessie"]
+        naam = "voorbeurs" if sessie == "pre" else "nabeurs"
+        lampje = lampje_html(pd.Series({"markt": sessie}))
+        ext_html = (
+            f'<div style="display:flex;align-items:center;gap:7px;font-size:0.8rem;margin-top:4px;'
+            f'font-variant-numeric:tabular-nums">{lampje}<span>{_sessie_label(sessie)} '
+            f'<span style="opacity:0.75">deels {naam}: {len(ext)} van {len(posities)} posities, '
+            f'</span>{_bedrag_html(totaal - regulier)}<span style="opacity:0.75"> t.o.v. de slotkoers '
+            f'({format_price(regulier, "EUR")})</span></span></div>'
+        )
+    st.markdown(
+        '<div style="border:1px solid rgba(128,128,128,0.22);border-radius:10px;padding:10px 14px;margin:4px 0 10px">'
+        '<div style="font-size:0.8rem;opacity:0.65">💼 Mijn aandelen &amp; ETF\'s</div>'
+        f'<div style="font-size:1.6rem;font-weight:800;font-variant-numeric:tabular-nums">'
+        f'{format_price(totaal, "EUR")}</div>'
+        f'<div style="font-size:0.8rem;opacity:0.65">{len(posities)} posities</div>{ext_html}'
+        f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">{"".join(chips)}</div></div>',
+        unsafe_allow_html=True,
+    )
+    with st.expander(f"Alle posities ({len(posities)}), gesorteerd op waarde"):
+        periode = st.radio("Periode", [l for l, _ in AANDELEN_PERIODES], horizontal=True,
+                           key="aandelen_periode", label_visibility="collapsed")
+        kolom = dict(AANDELEN_PERIODES)[periode]
+        st.markdown("".join(aandeel_rij_html(i + 1, p, kolom, totaal) for i, p in enumerate(posities)),
+                    unsafe_allow_html=True)
+    st.caption(
+        "Waarde = aantal × koers in euro (dollarkoersen omgerekend met de actuele wisselkoers). "
+        "Dag = t.o.v. de vorige slotkoers; tijdens voor- of nabeurs (alleen VS) beweegt de waarde mee "
+        "met die koers, ook al kun je er bij je broker meestal niet op handelen. 7d en 30d: wat je "
+        "huidige posities toen waard waren tegenover nu. Vrij geld bij je broker telt niet mee."
+    )
+
+
 def render_live_boven(tickers: list, weights: dict, soort: str, modus: str):
     """Snel deel, bovenaan: meldingen en de twee graadmeters."""
     cfg = SOORTEN[soort]
@@ -2515,6 +2741,8 @@ def render_live_boven(tickers: list, weights: dict, soort: str, modus: str):
         wallet = bitvavo_wallet()
         if wallet and "posities" in wallet:
             render_wallet(ranking, wallet)
+    if modus == "portefeuille" and not crypto:
+        render_aandelen_overzicht(ranking)
 
     # Bovenaan: de twee graadmeters naast elkaar
     g1, g2 = st.columns(2, gap="large")
@@ -2548,6 +2776,14 @@ def render_live_onder(tickers: list, weights: dict, soort: str, modus: str, in_b
             bezit = {p["ticker"]: {**p, "aandeel": p["waarde"] / totaal * 100 if p["waarde"] and totaal else None}
                      for p in wallet["posities"]}
             volgorde = {t: i for i, t in enumerate(bezit)}  # al gesorteerd op waarde
+            posities = ranking.sort_values("ticker", key=lambda s: s.map(volgorde).fillna(len(volgorde)))
+        elif not crypto:
+            eigen = aandelen_posities(ranking)
+            totaal = sum(p["waarde"] for p in eigen)
+            bezit = {p["ticker"]: {"munt": "stuks", "aantal": p["aantal"], "waarde": p["waarde"],
+                                   "aandeel": p["waarde"] / totaal * 100 if totaal else None}
+                     for p in eigen}
+            volgorde = {p["ticker"]: i for i, p in enumerate(eigen)}  # op waarde
             posities = ranking.sort_values("ticker", key=lambda s: s.map(volgorde).fillna(len(volgorde)))
         else:
             posities = ranking.sort_values("naam", key=lambda s: s.str.lower())
@@ -3725,6 +3961,8 @@ def render_fundamenteel(tickers: list, weights: dict, modus: str):
 st.fragment(run_every=interval if auto else None)(render_live_boven)(
     lijst, weights, soort, modus
 )
+if weergave == "port_aandelen" and lijst:
+    render_aantallen_editor(lijst)
 if soort == "aandelen" and lijst:
     # Buiten de fragmenten: ververst niet elke paar seconden (slotkoersen volstaan)
     with st.expander("📊 Aandelenanalyse: waarde, groei, kwaliteit en veiligheid"):
