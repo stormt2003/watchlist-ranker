@@ -201,23 +201,14 @@ NAMES.update({t: naam for t, naam, _ in SECTOR_ETFS})
 
 CRYPTO_SUFFIXES = ("-USD", "-EUR", "-USDT")
 
-# Voor-, nabeurs en overnight: alleen VS-beurzen hebben die op Yahoo.
+# Voor- en nabeurs: alleen VS-beurzen hebben die op Yahoo.
 # Handelstijden in Eastern Time, als minuten na middernacht.
-# Overnight (24-uurshandel via o.a. Blue Ocean ATS): zo t/m do 20:00 tot 04:00
-# de volgende ochtend. Vrijdagavond en het weekend is er geen overnight.
 US_TZ = "America/New_York"
 US_PRE_START = 4 * 60          # 04:00 voorbeurs begint
 US_OPEN = 9 * 60 + 30          # 09:30 reguliere handel
 US_CLOSE = 16 * 60             # 16:00 nabeurs begint
 US_POST_END = 20 * 60          # 20:00 nabeurs eindigt
 EXT_MAX_AGE = pd.Timedelta(minutes=60)  # oudere voor-/nabeurskoers = niet meer actief
-# 's Nachts wordt er veel minder gehandeld: een koers mag daar ouder zijn.
-EXT_MAX_AGE_OVERNIGHT = pd.Timedelta(hours=2)
-# Staan de overnight-koersen niet in de 5-minutenbars, dan halen we ze uit
-# Yahoo's quote (ticker.info). Dat kost per VS-aandeel een extra verzoek,
-# alleen tijdens de overnight-sessie, en wordt OVERNIGHT_INFO_TTL sec bewaard.
-OVERNIGHT_VIA_INFO = True
-OVERNIGHT_INFO_TTL = 120
 
 FX_TICKER = "EURUSD=X"  # euro/dollar-wisselkoers (dollars per euro) voor het omrekenen
 
@@ -397,67 +388,18 @@ def _fetch_meta_cached(ticker: str) -> dict:
 
 
 def us_session(ts: pd.Timestamp) -> str:
-    """'pre', 'regulier', 'post', 'overnight' of 'dicht' voor een tijdstip
-    (VS-handelstijden). Overnight loopt zo t/m do vanaf 20:00 tot 04:00."""
+    """'pre', 'regulier', 'post' of 'dicht' voor een tijdstip (VS-handelstijden)."""
     t = ts.tz_convert(US_TZ)
-    dag, m = t.weekday(), t.hour * 60 + t.minute  # ma = 0 ... zo = 6
-    if m >= US_POST_END:  # avond: overnight begint (zo t/m do)
-        return "overnight" if dag in (6, 0, 1, 2, 3) else "dicht"
-    if m < US_PRE_START:  # nacht: overnight loopt nog (ma t/m vr)
-        return "overnight" if dag <= 4 else "dicht"
-    if dag >= 5:
+    if t.weekday() >= 5:
         return "dicht"
-    if m < US_OPEN:
+    m = t.hour * 60 + t.minute
+    if US_PRE_START <= m < US_OPEN:
         return "pre"
-    if m < US_CLOSE:
+    if US_OPEN <= m < US_CLOSE:
         return "regulier"
-    return "post"
-
-
-def _ext_max_age(sessie: str) -> pd.Timedelta:
-    return EXT_MAX_AGE_OVERNIGHT if sessie == "overnight" else EXT_MAX_AGE
-
-
-@st.cache_data(ttl=OVERNIGHT_INFO_TTL, max_entries=300, show_spinner=False)
-def _yahoo_overnight(ticker: str) -> tuple:
-    """(prijs, tijdstip in UTC) van de overnight-handel volgens Yahoo's quote.
-    Fouten (en 'geen overnight-koers') worden niet gecachet."""
-    try:
-        info = yf.Ticker(ticker).info or {}
-    except YFRateLimitError:
-        _markeer_rate_limit()
-        raise
-    prijs = info.get("overnightMarketPrice")
-    tijd = info.get("overnightMarketTime")
-    if not prijs:  # Yahoo noemt velden soms net anders: zoek ruim
-        for k, v in info.items():
-            kl = k.lower()
-            if "overnight" in kl and "price" in kl and isinstance(v, (int, float)) and v > 0:
-                prijs = v
-            elif "overnight" in kl and "time" in kl and isinstance(v, (int, float)):
-                tijd = tijd or v
-    if not prijs:
-        raise ValueError("geen overnight-koers van Yahoo")
-    ts = pd.Timestamp(tijd, unit="s", tz="UTC") if tijd else None
-    return float(prijs), ts
-
-
-def overnight_quote(ticker: str):
-    """(prijs, tijdstip) of None als Yahoo nu geen overnight-koers geeft."""
-    if not OVERNIGHT_VIA_INFO:
-        return None
-    try:
-        return _yahoo_overnight(ticker)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def heeft_verse_overnight_bar(serie: pd.Series, nu: pd.Timestamp) -> bool:
-    """Staat er in de 5-minutenbars al een verse overnight-koers?"""
-    if serie is None or serie.empty:
-        return False
-    ts = serie.index[-1]
-    return us_session(ts) == "overnight" and nu - ts.tz_convert("UTC") < EXT_MAX_AGE_OVERNIGHT
+    if US_CLOSE <= m < US_POST_END:
+        return "post"
+    return "dicht"
 
 
 MAX_THREADS = 6  # totaal voor de hele app, over alle sessies en fragmenten heen
@@ -967,30 +909,20 @@ def compute_row(ticker: str, weights: dict, intraday_map: dict) -> dict:
     if not crypto and not live and daily.index[-1].date() == last_date:
         price = float(daily.iloc[-1])
 
-    # Voor-/nabeurs/overnight: alleen tonen als die sessie nu loopt en de koers vers is.
-    # Eerst uit de 5-minutenbars; overnight zo nodig uit Yahoo's quote.
+    # Voor-/nabeurs: alleen tonen als die sessie nu loopt en de koers vers is.
     ext_sessie = ext_prijs = ext_pct = None
-    nu_sessie = us_session(now_utc)
-    ext_ts = None
-    if us_stock and nu_sessie in ("pre", "post", "overnight"):
-        if not ext_bars.empty:
-            ts = ext_bars.index[-1]
-            if (us_session(ts) == nu_sessie
-                    and now_utc - ts.tz_convert("UTC") < _ext_max_age(nu_sessie)):
-                ext_prijs, ext_ts = float(ext_bars.iloc[-1]), ts
-        if ext_prijs is None and nu_sessie == "overnight":
-            q = overnight_quote(ticker)
-            if q is not None:
-                q_prijs, q_ts = q
-                # Zonder tijdstip vertrouwen we Yahoo; met tijdstip moet het van nu zijn.
-                if q_ts is None or (us_session(q_ts) == "overnight"
-                                    and now_utc - q_ts < EXT_MAX_AGE_OVERNIGHT):
-                    ext_prijs, ext_ts = q_prijs, q_ts
-        if ext_prijs is not None:
+    if us_stock and not ext_bars.empty:
+        nu_sessie = us_session(now_utc)
+        ext_ts = ext_bars.index[-1]
+        if (
+            nu_sessie in ("pre", "post")
+            and us_session(ext_ts) == nu_sessie
+            and now_utc - ext_ts.tz_convert("UTC") < EXT_MAX_AGE
+        ):
             ext_sessie = nu_sessie
+            ext_prijs = float(ext_bars.iloc[-1])
             ext_pct = _pct(ext_prijs, price)  # t.o.v. de laatste slotkoers
-            if ext_ts is not None:
-                updated = ext_ts.tz_convert("Europe/Amsterdam").strftime("%d-%m %H:%M")
+            updated = ext_ts.tz_convert("Europe/Amsterdam").strftime("%d-%m %H:%M")
 
     # Marktstatus voor het lampje: open (reguliere handel), voor-/nabeurs, of dicht.
     if crypto:
@@ -1124,16 +1056,6 @@ def build_ranking(tickers: list, weights: dict):
         intraday_map = {}  # val terug op dagdata
 
     vooraf_ophalen(daily_stats, tickers)  # 5 jaar historie + MA's, gelijktijdig
-
-    # Overnight: VS-aandelen zonder verse overnight-bar alvast tegelijk ophalen
-    # via Yahoo's quote, zodat compute_row ze daarna uit de cache haalt.
-    nu = pd.Timestamp.now(tz="UTC")
-    if OVERNIGHT_VIA_INFO and us_session(nu) == "overnight":
-        nodig = [t for t in tickers
-                 if not is_crypto(t) and fetch_meta(t)["tz"] == US_TZ
-                 and not heeft_verse_overnight_bar(intraday_map.get(t), nu)]
-        vooraf_ophalen(overnight_quote, nodig)
-
     rows, errors = [], []
     for t in tickers:
         try:
@@ -1274,8 +1196,6 @@ def hoofdprijs(row: pd.Series, kolom: str = "prijs") -> str:
 EXT_LABELS = {
     "pre": ("Voorbeurs", "Koers in de voorbeurs (04:00–09:30 New Yorkse tijd), t.o.v. de vorige slotkoers"),
     "post": ("Nabeurs", "Koers in de nabeurs (16:00–20:00 New Yorkse tijd), t.o.v. de slotkoers van vandaag"),
-    "overnight": ("Overnight", "Koers in de overnight-handel (20:00–04:00 New Yorkse tijd), "
-                  "t.o.v. de laatste slotkoers"),
 }
 
 
@@ -1308,7 +1228,6 @@ LAMPJES = {  # status: (kleur, pulseren, uitleg)
     "open": ("#2e9e58", True, "Live: er wordt nu gehandeld"),
     "pre": ("#e0a030", True, "Voorbeurs: handel buiten de reguliere uren"),
     "post": ("#e0a030", True, "Nabeurs: handel buiten de reguliere uren"),
-    "overnight": ("#9b7fd4", True, "Overnight: nachtelijke handel buiten de reguliere uren"),
     "dicht": ("#888888", False, "Beurs dicht: laatste koers is de slotkoers"),
 }
 
@@ -1327,18 +1246,11 @@ MAAN_SVG = (
     '<svg width="11" height="11" viewBox="0 0 24 24" style="vertical-align:-1px">'
     '<path fill="currentColor" d="M21 14.5A9 9 0 0 1 9.5 3a9 9 0 1 0 11.5 11.5z"/></svg>'
 )
-STER_SVG = (
-    '<svg width="11" height="11" viewBox="0 0 24 24" style="vertical-align:-1px">'
-    '<path fill="currentColor" d="M12 2l2.9 6.6 7.1.6-5.4 4.7 1.6 7.1L12 17.3 5.8 21l1.6-7.1L2 9.2l7.1-.6z"/></svg>'
-)
 NABEURS_KLEUR = "#5b9bd5"
-OVERNIGHT_KLEUR = LAMPJES["overnight"][0]
 SESSIE_STIJL = {  # sessie: (label, kleur, icoon)
     "pre": ("PRE", VOORBEURS_KLEUR, ZON_SVG),
     "post": ("POST", NABEURS_KLEUR, MAAN_SVG),
-    "overnight": ("NACHT", OVERNIGHT_KLEUR, STER_SVG),
 }
-SESSIE_NAMEN = {"pre": "voorbeurs", "post": "nabeurs", "overnight": "overnight"}
 DAG_KOLOMMEN = ("%_24u", "%_dag_rang")
 
 
@@ -1530,16 +1442,15 @@ def render_mover_list(titel: str, part: pd.DataFrame, col: str, leeg: str, alles
 
 def _dag_rangwaarde(row: pd.Series):
     """Waarde waarop de dag-lijst sorteert:
-    - voorbeurs / overnight na middernacht (nog geen handel vandaag): alleen die sessie;
-    - nabeurs / overnight vóór middernacht: reguliere dag en de sessie samen
-      (t.o.v. de vorige slotkoers);
+    - voorbeurs (nog geen handel vandaag): alleen de voorbeurs;
+    - nabeurs: reguliere dag en nabeurs samen (t.o.v. de vorige slotkoers);
     - anders: de gewone dagverandering (crypto: 24 uur)."""
     dag, e, sessie = row.get("%_24u"), row.get("%_ext"), row.get("ext_sessie")
     heeft_dag = dag is not None and pd.notna(dag)
     heeft_ext = isinstance(sessie, str) and e is not None and pd.notna(e)
-    if heeft_ext and heeft_dag:
+    if heeft_ext and sessie == "post" and heeft_dag:
         return ((1 + dag / 100) * (1 + e / 100) - 1) * 100
-    if heeft_ext:
+    if heeft_ext and sessie == "pre" and not heeft_dag:
         return e
     return dag if heeft_dag else None
 
@@ -1581,8 +1492,7 @@ def render_movers(ranking: pd.DataFrame, crypto: bool, etfs=None):
     if col == "%_24u":
         st.caption("Laatste 24 uur." if crypto else
                    "Reguliere handel t.o.v. de vorige slotkoers. Voorbeurs (VS): gesorteerd op de "
-                   "voorbeurs. Nabeurs en overnight: dag en sessie staan apart, gesorteerd op "
-                   "beide samen (na middernacht New Yorkse tijd telt alleen de overnight).")
+                   "voorbeurs. Nabeurs: dag en nabeurs staan apart, gesorteerd op beide samen.")
 
     if etfs is not None and not etfs.empty:
         st.markdown("##### Sectoren & thema's")
@@ -2687,7 +2597,7 @@ def render_aandelen_overzicht(ranking: pd.DataFrame):
     ext_html = ""
     if ext:
         sessie = ext[0]["sessie"]
-        naam = SESSIE_NAMEN.get(sessie, sessie)
+        naam = "voorbeurs" if sessie == "pre" else "nabeurs"
         lampje = lampje_html(pd.Series({"markt": sessie}))
         ext_html = (
             f'<div style="display:flex;align-items:center;gap:7px;font-size:0.8rem;margin-top:4px;'
@@ -2713,7 +2623,7 @@ def render_aandelen_overzicht(ranking: pd.DataFrame):
                     unsafe_allow_html=True)
     st.caption(
         "Waarde = aantal × koers in euro (dollarkoersen omgerekend met de actuele wisselkoers). "
-        "Dag = t.o.v. de vorige slotkoers; tijdens voor-, nabeurs of overnight (alleen VS) beweegt de waarde mee "
+        "Dag = t.o.v. de vorige slotkoers; tijdens voor- of nabeurs (alleen VS) beweegt de waarde mee "
         "met die koers, ook al kun je er bij je broker meestal niet op handelen. 7d en 30d: wat je "
         "huidige posities toen waard waren tegenover nu. Vrij geld bij je broker telt niet mee."
     )
