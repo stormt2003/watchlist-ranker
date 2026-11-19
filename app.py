@@ -75,7 +75,9 @@ DEFAULT_WATCHLIST = [
 
 # Aantal stukken per aandeel/ETF in je portefeuille (uit DEGIRO). In de app kun je ze
 # aanpassen onder 'Aantallen aanpassen'; daar staat ook de regel om hier te plakken.
-    DEFAULT_AANTALLEN = {"VWRL.AS": 69, "NOW": 2, "BESI.AS": 2, "MU": 2, "NFLX": 4, "MSTR": 7, "NBIS": 3, "GOOGL": 1, "NVDA": 16}
+    DEFAULT_AANTALLEN = {
+    "VWRL.AS": 69, "NOW": 2, "BESI.AS": 2, "MU": 2, "NFLX": 4, "MSTR": 7, "NBIS": 3, "GOOGL": 1, "NVDA": 16, 
+    }
 
 
 # Sector- en thema-ETF's: altijd bovenaan de stijgers & dalers in de watchlist
