@@ -2051,6 +2051,191 @@ def render_fng_grafiek():
     )
 
 # ---------------------------------------------------------------------------
+# AANDELEN: CNN Fear & Greed naast koersen (S&P 500, VWRL, CNDX, ...)
+# ---------------------------------------------------------------------------
+
+# Vaste vinkjes: (ticker, naam). CNDX.AS = iShares Nasdaq 100 op Euronext Amsterdam.
+MARKT_VINKJES = [("^GSPC", "S&P 500"), ("VWRL.AS", "VWRL"), ("CNDX.AS", "CNDX (Nasdaq 100)")]
+MARKT_KLEUREN = ["#2a78d6", "#2e9e58", "#6250d6", "#d6a12a", "#d64545", "#1aa3a3",
+                 "#a0522d", "#c2185b", "#555555", "#7cb342"]
+MARKT_PERIODES = {"6 mnd": 182, "1 jaar": 365, "2 jaar": 730, "5 jaar": 1826}
+CNN_FNG_START = "2020-07-15"  # CNN geeft ongeveer vanaf medio 2020 dagwaarden
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_stock_fear_greed_historie() -> pd.DataFrame:
+    """Dagwaarden van de CNN Fear & Greed (aandelen). Kolommen: datum, fng.
+    Zelfde onofficiële endpoint als de meter; met een startdatum erachter geeft
+    CNN een langere reeks. Lukt dat niet, dan zonder datum (ongeveer 1 jaar)."""
+    fouten = []
+    for url in (f"{CNN_FNG_URL}/{CNN_FNG_START}", CNN_FNG_URL):
+        try:
+            resp = requests.get(url, headers=CNN_HEADERS, timeout=15)
+            resp.raise_for_status()
+            punten = resp.json()["fear_and_greed_historical"]["data"]
+            df = pd.DataFrame({
+                "datum": [pd.Timestamp(float(p["x"]), unit="ms").normalize() for p in punten],
+                "fng": [float(p["y"]) for p in punten],
+            })
+            if not df.empty:
+                return (df.dropna().sort_values("datum")
+                          .drop_duplicates("datum", keep="last").reset_index(drop=True))
+        except Exception as e:  # noqa: BLE001
+            fouten.append(str(e))
+    raise ValueError("CNN niet bereikbaar (" + "; ".join(fouten) + ")")
+
+
+def _markt_naam(ticker: str) -> str:
+    vast = dict(MARKT_VINKJES)
+    if ticker in vast:
+        return vast[ticker]
+    try:
+        return NAMES.get(ticker) or fetch_meta(ticker)["naam"] or ticker
+    except Exception:  # noqa: BLE001
+        return ticker
+
+
+def render_markt_fng_grafiek(kandidaten: list):
+    """Koersen (start periode = 100) met de CNN Fear & Greed eronder, gedeelde
+    datum-as. Vinkjes voor S&P 500, VWRL en CNDX, plus vrij te kiezen extra's.
+    Haalt pas iets op als 'Grafiek laden' aan staat: een dichtgeklapte expander
+    voert zijn inhoud in Streamlit namelijk wél uit."""
+    import altair as alt  # wordt met Streamlit meegeleverd
+
+    if not st.toggle("Grafiek laden", key="mfng_aan",
+                     help="Staat uit zodat de pagina snel blijft. Data wordt 6 uur (F&G) "
+                          "en 15 minuten (koersen) bewaard."):
+        st.caption("Zet 'Grafiek laden' aan om de grafiek te tonen.")
+        return
+
+    # --- wat staat er in de grafiek --------------------------------------------
+    kolommen = st.columns(len(MARKT_VINKJES) + 1)
+    gekozen = []
+    for kol, (t, naam) in zip(kolommen, MARKT_VINKJES):
+        with kol:
+            if st.checkbox(naam, value=True, key=f"mfng_{t}"):
+                gekozen.append(t)
+    with kolommen[-1]:
+        toon_fng = st.checkbox("Fear & Greed", value=True, key="mfng_fng")
+    vast = {t for t, _ in MARKT_VINKJES}
+    opties = [t for t in dict.fromkeys(SECTOR_TICKERS + list(kandidaten)) if t not in vast]
+    extra = st.multiselect("Meer toevoegen", opties, key="mfng_extra",
+                           format_func=lambda t: f"{_markt_naam(t)} ({t})",
+                           placeholder="Kies uit je lijst of sector-ETF's")
+    los = st.text_input("Andere ticker(s)", key="mfng_los", placeholder="bv. ASML.AS, SXRV.DE",
+                        help="Yahoo-tickers, gescheiden door komma's of spaties.")
+    gekozen += extra + [t for t in re.split(r"[,\s]+", los.upper()) if t and t not in gekozen + extra]
+    periode = st.radio("Periode", list(MARKT_PERIODES), index=1, horizontal=True,
+                       key="mfng_periode", label_visibility="collapsed")
+
+    if not gekozen and not toon_fng:
+        st.info("Vink minstens één lijn aan.")
+        return
+
+    # --- data ------------------------------------------------------------------
+    eind = pd.Timestamp.now().normalize()
+    begin = eind - pd.Timedelta(days=MARKT_PERIODES[periode])
+    rijen, mislukt = [], []
+    with st.spinner("Koersen ophalen…"):
+        resultaten = parallel(_veilige_closes, gekozen) if gekozen else []
+    for t, closes in zip(gekozen, resultaten):
+        if closes is None or closes.empty:
+            mislukt.append(t)
+            continue
+        c = closes.copy()
+        c.index = pd.to_datetime(c.index).normalize()
+        c = c[c.index >= begin]
+        if c.empty:
+            mislukt.append(t)
+            continue
+        rijen.append(pd.DataFrame({"datum": c.index, "koers": c.to_numpy(),
+                                   "index": (c / c.iloc[0] * 100).to_numpy(),
+                                   "naam": _markt_naam(t), "ticker": t}))
+    if mislukt:
+        st.caption("Geen koersdata voor: " + ", ".join(mislukt))
+    prijzen = pd.concat(rijen, ignore_index=True) if rijen else pd.DataFrame()
+
+    fng = pd.DataFrame()
+    if toon_fng:
+        try:
+            fng = fetch_stock_fear_greed_historie()
+            fng = fng[fng["datum"] >= begin]
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"Fear & Greed-geschiedenis niet opgehaald: {e}")
+    if prijzen.empty and fng.empty:
+        st.info("Geen data om te tonen.")
+        return
+
+    # --- grafiek ---------------------------------------------------------------
+    x = alt.X("datum:T", title=None, scale=alt.Scale(domain=[begin.isoformat(), eind.isoformat()]),
+              axis=alt.Axis(grid=False, labelExpr=X_LABEL_EXPR, labelOverlap=True))
+    hover = alt.selection_point(name="mhover", nearest=True, fields=["datum"], empty=False,
+                                on="pointerover", clear="pointerout")
+    panelen = []
+    hover_gezet = False
+
+    if not prijzen.empty:
+        namen = list(dict.fromkeys(prijzen["naam"]))
+        kleur = alt.Color("naam:N", title=None, sort=namen,
+                          scale=alt.Scale(domain=namen, range=MARKT_KLEUREN[:len(namen)]),
+                          legend=alt.Legend(orient="top", direction="horizontal", columns=3))
+        basis = alt.Chart(prijzen).encode(x=x)
+        y = alt.Y("index:Q", title="Start periode = 100", scale=alt.Scale(zero=False),
+                  axis=alt.Axis(orient="right", tickCount=5))
+        tooltip = [alt.Tooltip("datum:T", title="Datum", format="%d-%m-%Y"),
+                   alt.Tooltip("naam:N", title="Naam"),
+                   alt.Tooltip("koers:Q", title="Koers", format=",.2f"),
+                   alt.Tooltip("index:Q", title="Sinds start (=100)", format=".1f")]
+        panelen.append(alt.layer(
+            alt.Chart(pd.DataFrame({"y": [100]})).mark_rule(strokeDash=[4, 3], color="#888",
+                                                             opacity=0.6).encode(y="y:Q"),
+            basis.mark_line(strokeWidth=1.6, clip=True).encode(y=y, color=kleur),
+            basis.mark_point(opacity=0, size=60).encode(y=y, tooltip=tooltip).add_params(hover),
+            basis.mark_rule(color="#888", strokeDash=[3, 3]).encode(
+                opacity=alt.condition(hover, alt.value(0.8), alt.value(0))),
+            basis.mark_circle(size=40).encode(y=y, color=kleur,
+                                              opacity=alt.condition(hover, alt.value(1), alt.value(0))),
+        ).properties(height=260))
+        hover_gezet = True
+
+    if not fng.empty:
+        fbasis = alt.Chart(fng).encode(x=x)
+        schaal = alt.Scale(domain=[0, 100], nice=False)
+        y_f = alt.Y("fng:Q", title="Fear & Greed (CNN)", scale=schaal,
+                    axis=alt.Axis(orient="right", values=[0, 25, 45, 55, 75, 100]))
+        banden = alt.Chart(pd.DataFrame(
+            [{"van": a, "tot": b, "kleur": k} for a, b, _, k in ZONES]
+        )).mark_rect(opacity=0.10).encode(
+            y=alt.Y("van:Q", scale=schaal), y2="tot:Q", color=alt.Color("kleur:N", scale=None, legend=None))
+        ftip = [alt.Tooltip("datum:T", title="Datum", format="%d-%m-%Y"),
+                alt.Tooltip("fng:Q", title="Fear & Greed", format=".0f")]
+        lagen = [banden, fbasis.mark_line(color="#eb6834", strokeWidth=1.4, clip=True).encode(y=y_f)]
+        if hover_gezet:  # zelfde verticale lijn als in de koersgrafiek
+            lagen += [fbasis.mark_point(opacity=0, size=60).encode(y=y_f, tooltip=ftip),
+                      fbasis.mark_rule(color="#888", strokeDash=[3, 3]).encode(
+                          opacity=alt.condition(hover, alt.value(0.8), alt.value(0))),
+                      fbasis.mark_circle(size=40, color="#eb6834").encode(
+                          y=y_f, opacity=alt.condition(hover, alt.value(1), alt.value(0)))]
+        else:
+            lagen += [fbasis.mark_point(opacity=0, size=60).encode(y=y_f, tooltip=ftip)]
+        panelen.append(alt.layer(*lagen).properties(height=150))
+
+    grafiek = alt.vconcat(*panelen, spacing=8).resolve_scale(x="shared")
+    st.altair_chart(grafiek, use_container_width=True)
+    st.caption(
+        "Koersen: Yahoo-dagslotkoersen, per lijn op 100 gezet aan het begin van de periode, "
+        "zodat je ze kunt vergelijken (ook al noteren ze in andere valuta). De echte koers staat "
+        "in de tooltip. Fear & Greed: CNN (onofficieel endpoint), zones 25/45/55/75."
+    )
+
+
+def _veilige_closes(ticker: str):
+    try:
+        return fetch_daily_closes(ticker)
+    except Exception:  # noqa: BLE001
+        return None
+
+# ---------------------------------------------------------------------------
 # PAGINA
 # ---------------------------------------------------------------------------
 
@@ -3919,6 +4104,8 @@ if soort == "aandelen" and lijst:
     # Buiten de fragmenten: ververst niet elke paar seconden (slotkoersen volstaan)
     with st.expander("📊 Aandelenanalyse: waarde, groei, kwaliteit en veiligheid"):
         render_fundamenteel(lijst, weights, modus)
+    with st.expander("📈 Fear & Greed naast S&P 500, VWRL en CNDX"):
+        st.fragment(render_markt_fng_grafiek)(lijst)  # klikken ververst alleen de grafiek
 if soort == "crypto":
     # Buiten de fragmenten: cycluskaart en grafiek verversen niet elke paar
     # seconden mee, zodat inzoomen blijft staan. De data wordt 6 uur bewaard.
